@@ -63,6 +63,14 @@ wait until the reset window.
 - [`internal/github/sync.go`](../internal/github/sync.go) — worker and GraphQL
   call sites that gate work on `ShouldBackoff()` before proceeding.
 
+Archive budget refusals are scheduling waits: retain pending work without new
+failure attempts, and preserve prior failures until successful collection
+(`internal/db/queries_dataset_progress.go::DB.FailArchiveItemSync`).
+
+Budget-wait status includes pending items with future retry times; failed
+items waiting for their own retry do not establish a budget wait
+(`internal/db/queries_archive.go::deriveArchiveProgress`).
+
 Do not wrap these paths in `backoff.Retry`, `RetryAfterError`, or any new retry
 abstraction unless a separate design explicitly changes rate-limit policy.
 
@@ -75,6 +83,8 @@ migrate ticker-driven sync or refresh loops into `backoff/v5`
 The archive worker uses the backoff schedule type only as an idle delay calculator,
 not as a retry wrapper: idle passes double up to a five-minute cap and any wake or
 worked pass resets it (`internal/github/sync.go::runArchiveLoop`).
+Count provider work even if a later quota refusal stops the pass
+(`internal/archive/scheduler.go::Service.finishWork`).
 
 - Manual workflow dispatch is never retried. Track only the run ID returned by
   dispatch, using direct reads until completion or thirty minutes; never infer
