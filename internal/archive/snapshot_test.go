@@ -44,7 +44,7 @@ func TestSnapshotReadsConfiguredCachedWork(t *testing.T) {
 	require.NoError(err)
 	assert.Len(provider.calls, before)
 	require.Len(result.Repositories, 1)
-	assert.Equal(ref.PlatformExternalID, result.Repositories[0].ProviderID)
+	assert.Equal(ref.PlatformID, result.Repositories[0].ProviderID)
 	require.Len(result.PullRequests, 1)
 	pr := result.PullRequests[0]
 	assert.True(pr.Draft)
@@ -126,9 +126,8 @@ func TestSnapshotRetainsStableIdentityAndOneReadView(t *testing.T) {
 			renamed := ref
 			renamed.Name = "after"
 			renamed.RepoPath = "owner/after"
-			entry, accepted, err := database.ReconcileRepositoryObservation(t.Context(), platformdb.DBRepoIdentity(renamed), time.Now().Add(time.Hour))
+			entry, err := database.ObserveRepository(t.Context(), platformdb.DBRepoIdentity(renamed))
 			require.NoError(err)
-			require.True(accepted)
 			assert.Equal(repoID, entry.Repository.ID)
 			second, err := service.snapshot(t.Context(), SnapshotOptions{Start: now.Add(-time.Hour), End: now}, func() error {
 				_, writeErr := database.UpsertIssue(t.Context(), &db.Issue{RepoID: repoID, Number: 2, Title: "Concurrent", State: "open", CreatedAt: now.Add(-time.Minute), UpdatedAt: now})
@@ -146,17 +145,26 @@ func TestSnapshotRetainsStableIdentityAndOneReadView(t *testing.T) {
 			assert.Len(third.Issues, 2)
 
 			replacement := ref
-			replacement.PlatformExternalID = "replacement-id"
-			entry, accepted, err = database.ReconcileRepositoryObservation(t.Context(), platformdb.DBRepoIdentity(replacement), time.Now().Add(2*time.Hour))
+			replacement.PlatformID = ref.PlatformID + 1
+			entry, err = database.ObserveRepository(t.Context(), platformdb.DBRepoIdentity(replacement))
 			require.NoError(err)
-			require.True(accepted)
 			_, err = database.UpsertMergeRequest(t.Context(), &db.MergeRequest{RepoID: entry.Repository.ID, Number: 1, Title: "Different repository", State: db.MergeRequestStateOpen, CreatedAt: now, UpdatedAt: now})
 			require.NoError(err)
 			fourth, err := service.Snapshot(t.Context(), SnapshotOptions{Start: now.Add(-time.Hour), End: now})
 			require.NoError(err)
-			assert.Empty(fourth.Relations, "a reused route cannot establish reference identity")
+			assert.Equal(first.Relations, fourth.Relations,
+				"a reference keeps the repository that held its route when observed, even after the route is reused")
 			require.Len(fourth.PullRequests, 1)
-			assert.Contains(fourth.PullRequests[0].Gaps, "unresolved_issue_reference")
+			assert.NotContains(fourth.PullRequests[0].Gaps, "unresolved_issue_reference")
+			bothService := newArchiveTestService(t, database, registry, []platform.RepoRef{ref, replacement}, nil, now)
+			both, err := bothService.Snapshot(t.Context(), SnapshotOptions{Start: now.Add(-time.Hour), End: now})
+			require.NoError(err)
+			assert.Equal(first.Relations, both.Relations,
+				"the route's new repository never gains the old repository's references")
+			require.Len(both.PullRequests, 2)
+			for _, pull := range both.PullRequests {
+				assert.NotContains(pull.Gaps, "unresolved_issue_reference")
+			}
 			require.NoError(database.UpsertIssueEvents(t.Context(), []db.IssueEvent{{IssueID: issueID, EventType: "cross_referenced", DedupeKey: "reference-1", CreatedAt: now, MetadataJSON: `{"source_type":"PullRequest","source_owner":"owner","source_repo":"after","source_number":1,"source_url":"https://provider.test/owner/after/pull/1"}`}}))
 			refreshed, err := service.Snapshot(t.Context(), SnapshotOptions{Start: now.Add(-time.Hour), End: now})
 			require.NoError(err)

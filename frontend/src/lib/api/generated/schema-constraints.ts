@@ -22,6 +22,9 @@ export const schemaConstraints = {
   DiffDescriptor: {
     snapshot_revision: { minimum: 0 },
   },
+  ExternalContextActionRequest: {
+    platform_repo_id: { minimum: 1 },
+  },
   FederationDiffDescriptorRequest: {
     pull_number: { minimum: 1 },
   },
@@ -33,9 +36,6 @@ export const schemaConstraints = {
   },
   RawSnapshot: {
     generation: { minimum: 0 },
-  },
-  RepositoryDescriptor: {
-    snapshot_revision: { minimum: 0 },
   },
   Snapshot: {
     generation: { minimum: 0 },

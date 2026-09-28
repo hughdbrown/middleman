@@ -61,7 +61,7 @@ export interface DetailRequestOptions {
   workflowApprovalSync?: boolean;
   provider: string;
   platformHost?: string | undefined;
-  platformRepoId?: string | undefined;
+  platformRepoId?: number | undefined;
   repoPath: string;
 }
 
@@ -71,7 +71,7 @@ type DetailRequestRef = {
   number: number;
   provider: string;
   platformHost?: string | undefined;
-  platformRepoId?: string | undefined;
+  platformRepoId?: number | undefined;
   repoPath: string;
 };
 
@@ -255,7 +255,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
   type UnsavedTarget = {
     provider: string;
     platformHost: string | undefined;
-    platformRepoId: string | undefined;
+    platformRepoId: number | undefined;
     owner: string;
     name: string;
     number: number;
@@ -836,8 +836,8 @@ export function createDetailStore(opts: DetailStoreOptions) {
   }
 
   function mergeKey(ref: ProviderRouteRef, number: number): string | undefined {
-    const platformRepoId = ref.platformRepoId?.trim();
-    if (!platformRepoId) return undefined;
+    const platformRepoId = ref.platformRepoId;
+    if (!platformRepoId || platformRepoId <= 0) return undefined;
     return JSON.stringify([
       canonicalProvider(ref.provider),
       resolvedPlatformHost(ref.provider, ref.platformHost),
