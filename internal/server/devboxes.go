@@ -471,6 +471,10 @@ func (s *Server) registerDevboxTerminalAPI(api huma.API) {
 				return
 			}
 			defer local.Close(websocket.StatusNormalClosure, "controller detached")
+			if r.URL.Query().Get("protocol") == "acp" {
+				local.SetReadLimit(terminalwebsocket.ACPCommandReadLimit)
+				peer.SetReadLimit(terminalwebsocket.ACPStateReadLimit)
+			}
 			fleetapi.BridgeWebSocketProxy(r.Context(), local, peer)
 		})
 	}

@@ -107,6 +107,10 @@ type RestoredRuntimeSession struct {
 }
 
 type Options struct {
+	AgentMCPURL        string
+	AgentMCPToken      string
+	ACPPreferencesPath string
+
 	Targets      []LaunchTarget
 	ShellCommand []string
 	TmuxCommand  []string
@@ -144,6 +148,12 @@ type Options struct {
 }
 
 type Manager struct {
+	agentMCPURL        string
+	agentMCPToken      string
+	acpPreferencesMu   sync.Mutex
+	acpPreferencesPath string
+	acpPreferences     map[string]map[string]string
+
 	mu                sync.Mutex
 	targets           map[string]LaunchTarget
 	targetsList       []LaunchTarget
@@ -202,7 +212,8 @@ var (
 )
 
 type session struct {
-	mu sync.Mutex
+	acp *ACP
+	mu  sync.Mutex
 	// inputMu serializes terminal input so an initial-message handoff owns
 	// the PTY from its paste through its Enter keystroke.
 	inputMu                   sync.Mutex
@@ -288,6 +299,11 @@ func NewManager(options Options) *Manager {
 		targetsList = append(targetsList, cloneTarget(cloned))
 	}
 	return &Manager{
+		agentMCPURL:        options.AgentMCPURL,
+		agentMCPToken:      options.AgentMCPToken,
+		acpPreferencesPath: options.ACPPreferencesPath,
+		acpPreferences:     make(map[string]map[string]string),
+
 		targets:           targets,
 		targetsList:       targetsList,
 		sessions:          make(map[string]*session),
@@ -597,6 +613,9 @@ func (m *Manager) restoreRuntimeSession(
 			"tmux_session", tmuxSession,
 		)
 		return nil
+	}
+	if restored.Kind == LaunchTargetACP {
+		return ErrSessionNotFound
 	}
 	if tmuxSession != "" {
 		if err := m.requireTmuxSession(ctx, tmuxSession); err != nil {
@@ -1487,6 +1506,9 @@ func (m *Manager) SubmitAgentMessage(
 	if err := context.Cause(ctx); err != nil {
 		return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
 	}
+	if acp, err := m.ACP(workspaceID, sessionKey); err == nil {
+		return acp.Prompt(message)
+	}
 	attachment, err := m.AttachSession(workspaceID, sessionKey)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
@@ -2066,6 +2088,9 @@ func (m *Manager) startOwnedSession(
 	cwd string,
 	extraStripVars []string,
 ) (*session, error) {
+	if info.Kind == LaunchTargetACP {
+		return m.startACP(ctx, info, command, cwd, extraStripVars)
+	}
 	if info.TmuxSession != "" {
 		return startTmuxAttachSession(info, command, cwd, extraStripVars)
 	}
@@ -2095,6 +2120,20 @@ func (s *session) snapshot() SessionInfo {
 }
 
 func (s *session) watch() SessionInfo {
+	if s.acp != nil {
+		<-s.acp.done
+		s.acp.mu.Lock()
+		exitCode := s.acp.exitCode
+		s.acp.mu.Unlock()
+		s.mu.Lock()
+		s.info.Status = SessionStatusExited
+		s.info.ExitedAt = new(time.Now().UTC())
+		s.info.ExitCode = &exitCode
+		info := s.info
+		s.mu.Unlock()
+		close(s.done)
+		return info
+	}
 	if s.pty != nil {
 		return s.watchPtyOwner()
 	}

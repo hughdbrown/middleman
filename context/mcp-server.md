@@ -12,7 +12,10 @@
 - PR contexts preserve cached label names. Exact label filters run in the
   provider-owned list query before pagination, including across hub transport
   (`internal/server/mcp_backend.go::mcpBackend.ListPulls`).
-- MCP is an optional daemon-owned secondary listener enabled by
+- ACP launches and connection tests use a dedicated authenticated loopback HTTP listener
+  on the execution host, independent of browser Host/proxy policy and companion settings;
+  native harness servers and skills stay agent-owned (`cmd/kenn-forge/agent_mcp.go::newAgentMCPHTTP`).
+- The companion uses an optional daemon-owned listener enabled by
   `[mcp].enabled`; an omitted or zero port uses the backend port plus one, while
   a nonzero port overrides it (`internal/config/config.go::Config.MCPPort`).
 - The listener is startup-bound and loopback-only. Discovery publishes
@@ -27,7 +30,7 @@
 - `kenn-forge mcp quickstart` is the canonical agent discovery path for the
   active connector and saved restart drift; expose token paths and environment
   placeholders there, never bearer contents (`cmd/kenn-forge/mcp_cli.go::newMCPCommand`).
-- MCP serves only `/mcp` over stateless Streamable HTTP. Authentication follows
+- The companion listener serves only `/mcp` over stateless Streamable HTTP. Authentication follows
   `[api].require_auth`; direct loopback peer, exact loopback authority, absent
   forwarding headers, and optional same-origin HTTP Origin are required
   (`internal/mcpserver/server.go::Server.HTTPHandler`,
@@ -133,7 +136,8 @@
   runtime awaiting its first hook from a workspace with no agent runtime
   (`internal/mcpserver/tools_agent.go::Server.listWorkspaceAgentSessions`).
 - Follow-up MCP messages address one existing live agent runtime by workspace ID
-  and runtime session key. They reuse the initial prompt's serialized
+  and runtime session key. MCP agent-management tools include terminal coding-agent
+  runtimes only; ACP chats use their workspace chat transport. Follow-ups reuse the initial prompt's serialized
   bracketed-paste and Enter path, then return without launching, persisting, or
   waiting for hook activity
   (`internal/mcpserver/tools_agent.go::Server.sendAgentMessage`,

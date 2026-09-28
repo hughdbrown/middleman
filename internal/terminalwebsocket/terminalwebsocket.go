@@ -11,6 +11,14 @@ import (
 // HeartbeatMessage is the terminal liveness probe and reply payload.
 const HeartbeatMessage = `{"type":"heartbeat"}`
 
+// ACPCommandReadLimit allows a 64 KiB UTF-8 prompt with six-byte JSON escapes
+// plus its command envelope on every local and relayed chat connection.
+const ACPCommandReadLimit = 512 << 10
+
+// ACPStateReadLimit allows the bounded retained transcript plus JSON escaping,
+// configuration options, and protocol overhead on relay-facing connections.
+const ACPStateReadLimit = 32 << 20
+
 // WriteHeartbeat acknowledges a terminal liveness probe.
 func WriteHeartbeat(ctx context.Context, conn *websocket.Conn) error {
 	return conn.Write(ctx, websocket.MessageText, []byte(HeartbeatMessage))

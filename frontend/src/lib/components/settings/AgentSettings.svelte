@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Checkbox, IconButton } from "@kenn-io/kit-ui";
+  import { Button, Checkbox, IconButton, SelectDropdown } from "@kenn-io/kit-ui";
   import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
   import PlusIcon from "@lucide/svelte/icons/plus";
   import RotateCcwIcon from "@lucide/svelte/icons/rotate-ccw";
@@ -27,6 +27,7 @@
   }
 
   interface AgentDraft {
+    protocol: "terminal" | "acp";
     id: string;
     builtin: boolean;
     key: string;
@@ -50,6 +51,8 @@
   const runtime = getAppRuntime();
   let customID = 0;
   let saving = $state(false);
+  let checks = $state<Record<string, { command: string; status: "testing" | "passed" | "failed"; message: string }>>({});
+  const testing = $derived(Object.values(checks).some((check) => check.status === "testing"));
   // svelte-ignore state_referenced_locally
   let drafts = $state<AgentDraft[]>(initialDrafts(agents));
 
@@ -63,7 +66,7 @@
     JSON.stringify(serializedAgents) !== JSON.stringify(savedAgents),
   );
   const canSave = $derived(
-    !saving && isDirty && !hasInvalidDraft,
+    !saving && !testing && isDirty && !hasInvalidDraft,
   );
 
   function initialDrafts(configured: AgentSettingsType[]): AgentDraft[] {
@@ -99,6 +102,7 @@
       label,
       binary,
       args: stringifyArgs(command.slice(1)),
+      protocol: agent?.protocol === "acp" ? "acp" : "terminal",
       enabled: agent?.enabled ?? true,
       expanded: builtin === null && agent === undefined,
     };
@@ -107,6 +111,7 @@
   function normalizeAgents(configured: AgentSettingsType[]): AgentSettingsType[] {
     return configured
       .map((agent) => ({
+        ...(agent.protocol === "acp" ? { protocol: agent.protocol } : {}),
         key: agent.key.trim().toLowerCase(),
         label: agent.label.trim(),
         command: [...(agent.command ?? [])],
@@ -126,7 +131,7 @@
 
   function isDefaultBuiltinAgent(agent: AgentSettingsType): boolean {
     const builtin = builtins.find((candidate) => candidate.key === agent.key);
-    if (!builtin) return false;
+    if (!builtin || agent.protocol === "acp") return false;
     if (!agent.enabled || agent.label !== builtin.label) return false;
     const command = agent.command ?? [];
     return (
@@ -152,7 +157,7 @@
 
       if (draft.builtin && builtin) {
         const isDefault =
-          enabled &&
+          draft.protocol === "terminal" && enabled &&
           label === builtin.label &&
           binary === builtin.binary &&
           args.length === 0;
@@ -160,6 +165,7 @@
       }
 
       agentsToSave.push({
+        ...(draft.protocol === "acp" ? {protocol: draft.protocol} : {}),
         key,
         label,
         command,
@@ -194,6 +200,7 @@
         label: "",
         binary: "",
         args: "",
+        protocol: "terminal",
         enabled: true,
         expanded: true,
       },
@@ -207,6 +214,7 @@
   function resetBuiltin(draft: AgentDraft): void {
     const builtin = builtins.find((candidate) => candidate.key === draft.key);
     if (!builtin) return;
+    draft.protocol = "terminal";
     draft.label = builtin.label;
     draft.binary = builtin.binary;
     draft.args = "";
@@ -221,6 +229,13 @@
     runtime.runCommand(
       Effect.gen(function* () {
         const workflow = yield* SettingsWorkflow;
+        for (const draft of drafts) {
+          if (draft.protocol !== "acp" || !draft.enabled) continue;
+          const previous = savedAgents.find((agent) => agent.key === draft.key.trim().toLowerCase());
+          const unchanged = previous?.protocol === "acp" && previous.enabled !== false &&
+            JSON.stringify(previous.command) === commandKey(draft);
+          if (!unchanged && currentCheck(draft)?.status !== "passed" && !(yield* checkAgent(draft))) return;
+        }
         return yield* workflow.persist(() => ({ agents: agentsToSave }));
       }).pipe(
         Effect.matchEffect({
@@ -230,6 +245,7 @@
             }),
           onSuccess: (settings) =>
             Effect.sync(() => {
+              if (!settings) return;
               const nextAgents = settings.agents ?? [];
               const nextLaunchTargets = settings.launch_targets ?? [];
               agents = nextAgents;
@@ -248,6 +264,37 @@
         onFailure: () => {},
       },
     );
+  }
+
+  function commandKey(draft: AgentDraft): string {
+    return JSON.stringify([draft.binary.trim(), ...parseArgs(draft.args)]);
+  }
+
+  function currentCheck(draft: AgentDraft) {
+    const check = checks[draft.id];
+    return check?.command === commandKey(draft) ? check : undefined;
+  }
+
+  function checkAgent(draft: AgentDraft) {
+    const command = [draft.binary.trim(), ...parseArgs(draft.args)];
+    const key = JSON.stringify(command);
+    return Effect.gen(function* () {
+      checks[draft.id] = { command: key, status: "testing", message: "Testing ACP connection…" };
+      const workflow = yield* SettingsWorkflow;
+      const result = yield* workflow.testACP(command).pipe(
+        Effect.catch((failure) => Effect.succeed({ valid: false, message: settingsErrorMessage(failure) })),
+      );
+      checks[draft.id] = { command: key, status: result.valid ? "passed" : "failed", message: result.message };
+      if (!result.valid) draft.expanded = true;
+      return result.valid;
+    });
+  }
+
+  function testAgent(draft: AgentDraft): void {
+    if (saving || testing || !draft.binary.trim()) return;
+    runtime.runCommand(checkAgent(draft), {
+      operation: "test ACP connection", safeContext: {}, onFailure: () => {},
+    });
   }
 
   function stringifyArgs(args: string[]): string {
@@ -380,8 +427,18 @@
               </label>
             {/if}
 
+            <div class="field">
+              <span>Experience</span>
+              <SelectDropdown
+                title={`${agentName(draft)} experience`}
+                value={draft.protocol}
+                options={[{value: "terminal", label: "Terminal"}, {value: "acp", label: "ACP chat"}]}
+                disabled={saving}
+                onchange={(value) => { draft.protocol = value === "acp" ? "acp" : "terminal"; }}
+              />
+            </div>
             <label class="field">
-              <span>Binary</span>
+              <span>{draft.protocol === "acp" ? "ACP executable" : "Binary"}</span>
               <input
                 type="text"
                 bind:value={draft.binary}
@@ -401,6 +458,19 @@
                 placeholder="--flag value"
               />
             </label>
+            {#if draft.protocol === "acp"}
+              <div class="acp-check">
+                <Button disabled={saving || testing || !draft.binary.trim()} onclick={() => testAgent(draft)}>
+                  {currentCheck(draft)?.status === "testing" ? "Testing…" : "Test ACP connection"}
+                </Button>
+                <p>Checks this host. New or changed ACP commands are tested before saving.</p>
+                {#if currentCheck(draft)}
+                  <p role="status" class:check-failed={currentCheck(draft)?.status === "failed"}>
+                    {currentCheck(draft)?.message}
+                  </p>
+                {/if}
+              </div>
+            {/if}
           </div>
         {/if}
       </div>
@@ -430,6 +500,10 @@
 </div>
 
 <style>
+  .acp-check { grid-column: 1 / -1; }
+  .acp-check p { margin: var(--space-3) 0 0; color: var(--text-secondary); font-size: var(--font-size-sm); overflow-wrap: anywhere; }
+  .acp-check p.check-failed { color: var(--accent-red); }
+  @media (pointer: coarse) { .acp-check :global(button) { min-height: 44px; } }
   .agent-settings {
     display: flex;
     flex-direction: column;

@@ -87,6 +87,7 @@ type ServerOptions struct {
 	FederationHTTPClient               *http.Client
 	ProviderWriteGate                  *providerplane.ProviderWriteGate
 	MCPURL                             string
+	AgentMCPURL                        string
 	Clones                             *gitclone.Manager // optional clone manager for diff view
 	WorktreeDir                        string            // base dir for workspace worktrees
 	DisableWorkspaceBackgroundMonitors bool
@@ -1198,7 +1199,14 @@ func newServer(
 		// workspace terminal state. Tmux-backed sessions still attach via
 		// tmux; the runtime manager only uses this owner for non-tmux starts.
 		runtimePtyOwner := ptyownerruntime.New(ptyOwnerClient, nil)
+		acpPreferencesPath := ""
+		if cfg != nil && cfg.DataDir != "" {
+			acpPreferencesPath = filepath.Join(cfg.DataDir, "acp-preferences.json")
+		}
 		s.runtime = localruntime.NewManager(localruntime.Options{
+			AgentMCPURL:        options.AgentMCPURL,
+			AgentMCPToken:      options.DaemonAccess.Token,
+			ACPPreferencesPath: acpPreferencesPath,
 			Targets: localruntime.ResolveLaunchTargets(
 				agents, tmuxCmd, nil,
 			),

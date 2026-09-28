@@ -484,6 +484,12 @@ func run(opts serve.Options) error {
 	var mcpSwitcher *server.SwitchHandler
 	mcpRequestsCtx, cancelMCPRequests := context.WithCancel(context.Background())
 	defer cancelMCPRequests()
+	agentMCPLn, agentMCPHTTPSrv, agentMCPSwitcher, err := newAgentMCPHTTP(mcpRequestsCtx, authToken)
+	if err != nil {
+		closeListeners()
+		return fmt.Errorf("listen for agent MCP: %w", err)
+	}
+	defer agentMCPLn.Close()
 	if mcpLn != nil {
 		bind, parseErr := config.ParseHostKey(mcpListenAddr)
 		if parseErr != nil {
@@ -502,7 +508,7 @@ func run(opts serve.Options) error {
 		}
 	}
 
-	readyCount := 1
+	readyCount := 2
 	if mcpLn != nil {
 		readyCount++
 	}
@@ -529,6 +535,16 @@ func run(opts serve.Options) error {
 		}()
 	}
 
+	agentMCPReadyListener := serveReadyListener{
+		Listener:    agentMCPLn,
+		notifyReady: sync.OnceFunc(func() { serveReady <- struct{}{} }),
+	}
+	go func() {
+		if serveErr := agentMCPHTTPSrv.Serve(agentMCPReadyListener); !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("agent MCP HTTP server: %w", serveErr)
+		}
+	}()
+
 	var database *db.DB
 	var srv *server.Server
 	var mcpSrv *mcpserver.Server
@@ -551,19 +567,16 @@ func run(opts serve.Options) error {
 					return backgroundLoops.Stop(ctx)
 				},
 				ShutdownMCPHTTP: func(shutdownCtx context.Context) error {
-					if mcpHTTPSrv == nil {
-						return nil
+					// Both listeners must stop before their shared backend closes.
+					var shutdownErr error
+					for _, httpServer := range []*http.Server{agentMCPHTTPSrv, mcpHTTPSrv} {
+						if httpServer == nil {
+							continue
+						}
+						shutdownErr = errors.Join(shutdownErr, httpServer.Shutdown(shutdownCtx), httpServer.Close())
 					}
-					// Stop admission and wait out the grace period, then
-					// cancel still-running MCP handlers and force-close
-					// their connections so later cleanup never closes
-					// shared services beneath an in-flight handoff.
-					err := mcpHTTPSrv.Shutdown(shutdownCtx)
 					cancelMCPRequests()
-					if closeErr := mcpHTTPSrv.Close(); err == nil {
-						err = closeErr
-					}
-					return err
+					return shutdownErr
 				},
 				ShutdownPrimaryHTTP: func(shutdownCtx context.Context) error {
 					if srv != nil {
@@ -797,6 +810,7 @@ func run(opts serve.Options) error {
 				)
 			},
 			MCPURL:                          mcpURL,
+			AgentMCPURL:                     "http://" + agentMCPLn.Addr().String() + "/mcp",
 			WorktreeDir:                     filepath.Join(cfg.DataDir, "worktrees"),
 			PtyOwnerManagerPath:             os.Getenv("KENN_FORGE_PTY_MANAGER"),
 			Telemetry:                       telemetryReporter,
@@ -853,15 +867,14 @@ func run(opts serve.Options) error {
 	}()
 
 	srv.SetBuildInfo(buildInfo)
-	if mcpSwitcher != nil {
-		mcpSrv, err = mcpserver.New(mcpserver.Options{
-			Backend: srv.MCPBackend(), Version: version,
-			DiffCacheBytes: cfg.MCPDiffCacheBytes(),
-		})
-		if err != nil {
-			return fmt.Errorf("initialize MCP server: %w", err)
-		}
+	mcpSrv, err = mcpserver.New(mcpserver.Options{
+		Backend: srv.MCPBackend(), Version: version,
+		DiffCacheBytes: cfg.MCPDiffCacheBytes(),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize MCP server: %w", err)
 	}
+	agentMCPSwitcher.Swap(mcpSrv.HTTPHandler())
 	switcher.Swap(srv)
 	if mcpSwitcher != nil {
 		mcpSwitcher.Swap(mcpSrv.HTTPHandler())
