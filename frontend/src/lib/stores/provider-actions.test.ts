@@ -25,6 +25,7 @@ afterEach(async () => {
 const routeRef = {
   provider: "github",
   platformHost: "github.com",
+  platformRepoId: "repo-id",
   owner: "octo",
   name: "repo",
   repoPath: "octo/repo",
@@ -37,6 +38,7 @@ function detail() {
     repo: {
       provider: "github",
       platform_host: "github.com",
+      platform_repo_id: "repo-id",
       owner: "octo",
       name: "repo",
       repo_path: "octo/repo",
@@ -70,6 +72,50 @@ function conflict(detail: string) {
 }
 
 describe("provider action mutations", () => {
+  it("keeps merges scoped to their PR across navigation and ignores duplicate submissions", async () => {
+    const merge = Promise.withResolvers<{ data: { merged: boolean } }>();
+    const post = vi.fn(() => merge.promise);
+    const store = createDetailStore({
+      client: {
+        GET: vi.fn(async (_path: string, options: { params: { path: { number: number } } }) => ({
+          data: { ...detail(), merge_request: { Number: options.params.path.number } },
+        })),
+        POST: post,
+        PUT: vi.fn(),
+        DELETE: vi.fn(),
+      } as unknown as GeneratedClient,
+    });
+    store.loadDetail("octo", "repo", 1, { ...routeRef, sync: false });
+    await vi.waitFor(() => expect(store.isDetailLoading()).toBe(false));
+    const input = { commit_message: "", commit_title: "Merge pull request", method: "squash" as const };
+    const onFailure = vi.fn();
+    store.mergePull({ ...routeRef, platformRepoId: undefined }, 1, input, false, { onFailure });
+    expect(onFailure).toHaveBeenCalledWith("Refresh the pull request to verify its repository before merging.");
+    const settled = Promise.withResolvers<void>();
+    store.mergePull(routeRef, 1, input, false, { onSettled: settled.resolve });
+    store.mergePull(routeRef, 1, input, false);
+    const renamed = { ...routeRef, name: "renamed", repoPath: "octo/renamed" };
+    store.mergePull(renamed, 1, input, false);
+    expect(store.isPullMerging(routeRef, 1)).toBe(true);
+    expect(store.isPullMerging(renamed, 1)).toBe(true);
+    expect(store.isPullMerging({ ...routeRef, platformRepoId: "replacement-id" }, 1)).toBe(false);
+    expect(store.isPullMerging({ ...routeRef, platformRepoId: undefined }, 1)).toBe(false);
+    expect(store.isPullMerging({ ...routeRef, platformHost: "git.example.com" }, 1)).toBe(false);
+
+    store.loadDetail("octo", "repo", 2, { ...routeRef, sync: false });
+    await vi.waitFor(() => expect(store.getDetail()?.merge_request.Number).toBe(2));
+    expect(store.isPullMerging(routeRef, 1)).toBe(true);
+    expect(store.isPullMerging(routeRef, 2)).toBe(false);
+    await vi.waitFor(() => expect(post).toHaveBeenCalledOnce());
+
+    merge.resolve({ data: { merged: true } });
+    await settled.promise;
+    expect(store.isPullMerging(routeRef, 1)).toBe(false);
+    expect(store.isPullMerging(renamed, 1)).toBe(false);
+    expect(store.getDetail()?.merge_request.Number).toBe(2);
+    expect(post).toHaveBeenCalledOnce();
+  });
+
   it("rejects a captured route that no longer matches the displayed pull request", async () => {
     const post = vi.fn();
     const store = createDetailStore({

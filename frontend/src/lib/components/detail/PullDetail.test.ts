@@ -244,6 +244,7 @@ function renderPullDetail(
     onDetailTabChange?: ((tab: "conversation" | "files") => void) | undefined;
     runtimeClient?: GeneratedClient;
     actionsModeVisible?: boolean;
+    store?: ReturnType<typeof createDetailStore>;
     detailProps?: Partial<ComponentProps<typeof PullDetailComponent>>;
   } = {},
 ) {
@@ -297,6 +298,7 @@ function renderPullDetail(
     isDetailLoading: () => options.detailLoading ?? false,
     getDetailError: () => null,
     isDetailSyncing: () => options.detailSyncing ?? false,
+    isPullMerging: () => false,
     getDetailLoaded: () => true,
     getDiscussionLoaded: () => true,
     updateKanbanState: vi.fn(),
@@ -400,7 +402,7 @@ function renderPullDetail(
       [
         STORES_KEY,
         {
-          detail: detailStore,
+          detail: options.store ?? detailStore,
           ...(options.diff === undefined ? {} : { diff: options.diff }),
           ...(options.diffReviewDraft === undefined ? {} : { diffReviewDraft: options.diffReviewDraft }),
           pulls: { loadPulls: vi.fn() },
@@ -2155,7 +2157,7 @@ describe("PullDetail approvals", () => {
         error: undefined,
       })),
     };
-    const { detailStore } = renderPullDetail(
+    renderPullDetail(
       detail,
       {
         AllowSquashMerge: true,
@@ -2181,7 +2183,6 @@ describe("PullDetail approvals", () => {
           tone: "warning",
         }),
       );
-      expect(detailStore.loadDetail).toHaveBeenCalled();
     });
     expect(apiClient.POST.mock.calls.at(-1)?.[1]).toMatchObject({ body: { delete_workspace_id: "ws-1" } });
     expect(notifyWorkspaceDeleted).not.toHaveBeenCalled();
@@ -2234,18 +2235,20 @@ describe("PullDetail approvals", () => {
     notifyWorkspaceDeleted.mockRestore();
   });
 
-  it("keeps an in-flight merge modal mounted across transient eligibility refreshes", async () => {
+  it("closes the merge modal immediately, shows progress, and reports a delayed rejection", async () => {
     const detail = pullDetail();
     detail.repo.capabilities.merge_mutation = true;
     let resolveMerge!: (value: unknown) => void;
     const apiClient = {
-      GET: vi.fn(async () => ({
-        data: {
-          AllowSquashMerge: true,
-          AllowMergeCommit: false,
-          AllowRebaseMerge: false,
-          ViewerCanMerge: true,
-        },
+      GET: vi.fn(async (path: string) => ({
+        data: path.startsWith("/repo/")
+          ? {
+              AllowSquashMerge: true,
+              AllowMergeCommit: false,
+              AllowRebaseMerge: false,
+              ViewerCanMerge: true,
+            }
+          : detail,
       })),
       POST: vi.fn(
         () =>
@@ -2254,7 +2257,16 @@ describe("PullDetail approvals", () => {
           }),
       ),
     };
-    const { rerender } = renderPullDetail(
+    detailRuntime = makeTestAppRuntime(apiClient as unknown as GeneratedClient);
+    const store = createDetailStore({ runtime: detailRuntime });
+    store.loadDetail("acme", "widget", 1, {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+      sync: false,
+    });
+    await waitFor(() => expect(store.isDetailLoading()).toBe(false));
+    renderPullDetail(
       detail,
       {
         AllowSquashMerge: true,
@@ -2263,6 +2275,7 @@ describe("PullDetail approvals", () => {
         ViewerCanMerge: true,
       },
       apiClient,
+      { store, detailProps: { autoSync: false } },
     );
 
     await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
@@ -2271,15 +2284,27 @@ describe("PullDetail approvals", () => {
         name: "Squash and merge",
       }),
     );
-    expect(screen.getByRole("button", { name: "Merging..." })).toBeTruthy();
-
-    detail.repo.capabilities.merge_mutation = false;
-    await rerender({ hideWorkspaceAction: false });
-    expect(screen.getByRole("dialog", { name: "Merge Pull Request" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Merging..." })).toBeTruthy();
-
-    resolveMerge({ data: { merged: true, sha: "merge-sha", message: "merged" } });
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Merge Pull Request" })).toBeNull());
+    expect(screen.queryByRole("dialog", { name: "Merge Pull Request" })).toBeNull();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Merging" }).disabled).toBe(true);
+    await waitFor(() => expect(apiClient.POST).toHaveBeenCalledOnce());
+    resolveMerge({
+      error: {
+        code: "conflict",
+        type: "about:blank",
+        status: 409,
+        detail: "merge blocked by provider",
+        details: { reason: "conflict" },
+      },
+    });
+    await waitFor(() =>
+      expect(getFlashes()).toContainEqual(
+        expect.objectContaining({
+          message: expect.stringContaining("merge blocked by provider"),
+          tone: "danger",
+        }),
+      ),
+    );
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Squash and merge" }).disabled).toBe(false);
   });
 
   it("opens the merge modal in deferred mode when aggregate CI is pending without check rows", async () => {
@@ -2484,75 +2509,201 @@ describe("PullDetail approvals", () => {
     expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("ignores a delayed merge conflict after an A-to-B-to-A route cycle", async () => {
-    const detail = pullDetail();
-    detail.repo.capabilities.merge_mutation = true;
-    detail.repo.capabilities.review_mutation = true;
-    let resolveMerge: ((value: unknown) => void) | undefined;
-    const apiClient = {
-      GET: vi.fn(async () => ({
-        data: {
+  it.each(["route cycle", "unmount", "repository replacement", "repository replacement cycle"])(
+    "reports a delayed merge conflict without refreshing an old view after %s",
+    async (navigation) => {
+      const detail = pullDetail();
+      detail.repo.capabilities.merge_mutation = true;
+      detail.repo.capabilities.review_mutation = true;
+      let resolveMerge: ((value: unknown) => void) | undefined;
+      const apiClient = {
+        GET: vi.fn(async () => ({
+          data: {
+            AllowSquashMerge: true,
+            AllowMergeCommit: false,
+            AllowRebaseMerge: false,
+            ViewerCanMerge: true,
+          },
+        })),
+        POST: vi.fn(
+          () =>
+            new Promise((resolve) => {
+              resolveMerge = resolve;
+            }),
+        ),
+      };
+      const { rerender, detailStore, unmount } = renderPullDetail(
+        detail,
+        {
           AllowSquashMerge: true,
           AllowMergeCommit: false,
           AllowRebaseMerge: false,
           ViewerCanMerge: true,
         },
-      })),
-      POST: vi.fn(
-        () =>
-          new Promise((resolve) => {
-            resolveMerge = resolve;
+        apiClient,
+      );
+
+      await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
+      await fireEvent.click(
+        within(screen.getByRole("dialog", { name: "Merge Pull Request" })).getByRole("button", {
+          name: "Squash and merge",
+        }),
+      );
+      expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false);
+      if (navigation === "unmount") {
+        unmount();
+      } else if (navigation.startsWith("repository replacement")) {
+        detail.repo.platform_repo_id = "replacement-id";
+        await rerender({ platformRepoId: "replacement-id" });
+        if (navigation === "repository replacement cycle") {
+          detail.repo.platform_repo_id = "widget-repo-id";
+          await rerender({ platformRepoId: "widget-repo-id" });
+        }
+      } else {
+        await rerender({
+          owner: "acme",
+          name: "other-widget",
+          number: 2,
+          provider: "gitlab",
+          platformHost: "gitlab.example.com",
+          repoPath: "acme/other-widget",
+          hideWorkspaceAction: true,
+        });
+        await rerender({
+          owner: "acme",
+          name: "widget",
+          number: 1,
+          provider: "github",
+          platformHost: "github.com",
+          repoPath: "acme/widget",
+          hideWorkspaceAction: true,
+        });
+      }
+      resolveMerge?.({
+        error: {
+          code: "conflict",
+          type: "about:blank",
+          status: 409,
+          detail: "head changed",
+          details: { reason: "stale_state" },
+        },
+      });
+
+      await vi.waitFor(() =>
+        expect(getFlashes()).toContainEqual(
+          expect.objectContaining({
+            message: "acme/widget #1: head changed",
+            tone: "danger",
           }),
-      ),
+        ),
+      );
+      expect(detailStore.syncDetailNow).not.toHaveBeenCalled();
+      expect(screen.queryByText(/head commit changed since/i)).toBeNull();
+    },
+  );
+
+  it("keeps a delayed merge conflict when a list refresh drops the route repository ID", async () => {
+    const current = pullDetail();
+    current.repo.capabilities.merge_mutation = true;
+    const merge = Promise.withResolvers<unknown>();
+    const refreshedDetail = Promise.withResolvers<{ data: PullDetail }>();
+    let reloading = false;
+    const repoSettings = {
+      AllowSquashMerge: true,
+      AllowMergeCommit: false,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
     };
-    const { rerender, detailStore } = renderPullDetail(
-      detail,
-      {
+    detailRuntime = makeTestAppRuntime({
+      GET: vi.fn(async (path: string) =>
+        path.startsWith("/pulls/") ? (reloading ? refreshedDetail.promise : { data: current }) : { data: repoSettings },
+      ),
+      POST: vi.fn(() => merge.promise),
+    });
+    const store = createDetailStore({ runtime: detailRuntime });
+    const { rerender } = renderPullDetail(current, repoSettings, undefined, {
+      store,
+      detailProps: { autoSync: false, platformRepoId: current.repo.platform_repo_id },
+    });
+    await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
+    await fireEvent.click(
+      within(await screen.findByRole("dialog", { name: "Merge Pull Request" })).getByRole("button", {
+        name: "Squash and merge",
+      }),
+    );
+    await screen.findByText("Merging");
+
+    reloading = true;
+    await rerender({ platformRepoId: undefined });
+    await waitFor(() => expect(store.getDetail()).toBeNull());
+    refreshedDetail.resolve({ data: current });
+    await waitFor(() => expect(store.getDetail()?.repo.platform_repo_id).toBe(current.repo.platform_repo_id));
+    merge.resolve({
+      error: {
+        code: "conflict",
+        type: "about:blank",
+        status: 409,
+        detail: "pull request closed",
+        details: { reason: "not_open" },
+      },
+    });
+    expect(await screen.findByText(/this pull request is no longer open/i)).toBeTruthy();
+  });
+
+  it.each(["open", "submitted"])(
+    "clears %s merge state when refreshed detail identifies a replacement repository",
+    async (phase) => {
+      let current = pullDetail();
+      current.repo.capabilities.merge_mutation = true;
+      const merge = Promise.withResolvers<unknown>();
+      const repoSettings = {
         AllowSquashMerge: true,
         AllowMergeCommit: false,
         AllowRebaseMerge: false,
         ViewerCanMerge: true,
-      },
-      apiClient,
-    );
+      };
+      detailRuntime = makeTestAppRuntime({
+        GET: vi.fn(async (path: string) => ({ data: path.startsWith("/pulls/") ? current : repoSettings })),
+        POST: vi.fn(() => merge.promise),
+      });
+      const store = createDetailStore({ runtime: detailRuntime });
+      const sync = vi.spyOn(store, "syncDetailNow");
+      renderPullDetail(current, repoSettings, undefined, {
+        store,
+        detailProps: { autoSync: false },
+      });
+      await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
+      const modal = await screen.findByRole("dialog", { name: "Merge Pull Request" });
+      if (phase === "submitted") {
+        await fireEvent.click(within(modal).getByRole("button", { name: "Squash and merge" }));
+        await screen.findByText("Merging");
+      }
 
-    await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
-    await fireEvent.click(
-      within(screen.getByRole("dialog", { name: "Merge Pull Request" })).getByRole("button", {
-        name: "Squash and merge",
-      }),
-    );
-    expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false);
-    await rerender({
-      owner: "acme",
-      name: "other-widget",
-      number: 2,
-      provider: "gitlab",
-      platformHost: "gitlab.example.com",
-      repoPath: "acme/other-widget",
-      hideWorkspaceAction: true,
-    });
-    await rerender({
-      owner: "acme",
-      name: "widget",
-      number: 1,
-      provider: "github",
-      platformHost: "github.com",
-      repoPath: "acme/widget",
-      hideWorkspaceAction: true,
-    });
-    resolveMerge?.({
-      error: {
-        status: 409,
-        detail: "head changed",
-        details: { reason: "stale_state" },
-      },
-    });
-
-    await vi.waitFor(() => expect(apiClient.POST).toHaveBeenCalledTimes(1));
-    expect(detailStore.syncDetailNow).not.toHaveBeenCalled();
-    expect(screen.queryByText(/head commit changed since/i)).toBeNull();
-  });
+      current = { ...current, repo: { ...current.repo, platform_repo_id: "replacement-id" } };
+      store.loadDetail("acme", "widget", 1, {
+        provider: "github",
+        platformHost: "github.com",
+        repoPath: "acme/widget",
+        sync: false,
+      });
+      await waitFor(() => expect(store.getDetail()?.repo.platform_repo_id).toBe("replacement-id"));
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: "Merge Pull Request" })).toBeNull());
+      if (phase === "submitted") {
+        merge.resolve({
+          error: {
+            code: "conflict",
+            type: "about:blank",
+            status: 409,
+            detail: "head changed",
+            details: { reason: "stale_state" },
+          },
+        });
+        await waitFor(() => expect(getFlashes()).toContainEqual(expect.objectContaining({ tone: "danger" })));
+        expect(sync).not.toHaveBeenCalled();
+        expect(screen.queryByText(/head commit changed since/i)).toBeNull();
+      }
+    },
+  );
 });
 
 describe("PullDetail inline workspace handoff", () => {

@@ -1,4 +1,5 @@
 import { Effect, Result } from "effect";
+import { SvelteSet } from "svelte/reactivity";
 import type { AppExecution, AppRuntime } from "../app/runtime.js";
 import { ApiProblemError, TransientTransportError } from "../api/effect-errors.js";
 import { executeGeneratedApiRequest, type GeneratedApi } from "../api/generated-api.js";
@@ -215,6 +216,7 @@ function needsWorkflowApprovalSync(detail: PullDetail | null, enabled: boolean):
 }
 
 export function createDetailStore(opts: DetailStoreOptions) {
+  const mergingPulls = new SvelteSet<string>();
   const runtime = opts.runtime;
   const getPage = opts.getPage ?? (() => "");
   const onDetailSynchronized = opts.onDetailSynchronized ?? (() => {});
@@ -833,6 +835,22 @@ export function createDetailStore(opts: DetailStoreOptions) {
     );
   }
 
+  function mergeKey(ref: ProviderRouteRef, number: number): string | undefined {
+    const platformRepoId = ref.platformRepoId?.trim();
+    if (!platformRepoId) return undefined;
+    return JSON.stringify([
+      canonicalProvider(ref.provider),
+      resolvedPlatformHost(ref.provider, ref.platformHost),
+      platformRepoId,
+      number,
+    ]);
+  }
+
+  function isPullMerging(ref: ProviderRouteRef, number: number): boolean {
+    const key = mergeKey(ref, number);
+    return key !== undefined && mergingPulls.has(key);
+  }
+
   function mergePull(
     ref: ProviderRouteRef,
     number: number,
@@ -840,6 +858,14 @@ export function createDetailStore(opts: DetailStoreOptions) {
     deferred: boolean,
     callbacks: MergePullCallbacks = {},
   ): void {
+    const key = mergeKey(ref, number);
+    if (key === undefined) {
+      invokeMutationFailure(callbacks.onFailure, "Refresh the pull request to verify its repository before merging.");
+      callbacks.onSettled?.();
+      return;
+    }
+    if (mergingPulls.has(key)) return;
+    mergingPulls.add(key);
     let workspaceCleanupWarning: string | undefined;
     const commit = (ref: DetailRequestRef) =>
       deferred
@@ -887,7 +913,12 @@ export function createDetailStore(opts: DetailStoreOptions) {
           );
     runPullAction(ref, number, deferred ? "schedule pull request merge" : "merge pull request", commit, {
       ...callbacks,
+      onSettled: () => {
+        mergingPulls.delete(key);
+        callbacks.onSettled?.();
+      },
       onSuccess: () => {
+        onDetailSynchronized();
         if (workspaceCleanupWarning) {
           showFlash(`Pull request merged, but the workspace was not pruned: ${workspaceCleanupWarning}`, {
             tone: "warning",
@@ -2805,6 +2836,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
     markPullReady,
     approvePullWorkflows,
     mergePull,
+    isPullMerging,
     updatePRContent,
     setLocalPRBody,
     savePRBodyInBackground,

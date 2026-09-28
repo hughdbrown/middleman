@@ -138,7 +138,6 @@
 
   const {
     detail: detailStore,
-    pulls,
     activity,
     diff: diffStore,
     detailActivityView,
@@ -469,7 +468,7 @@
     }
     const requestGeneration = mutationRouteGeneration;
     let durableConflict = false;
-    detailStore.applyReviewSuggestions(routeRef, number, input, {
+    detailStore.applyReviewSuggestions(mutationRef, number, input, {
       onConflict: (conflict) => {
         durableConflict = handleStateConflict(
           conflict.reason,
@@ -584,6 +583,11 @@
 
   // A restored snapshot stays readable, but cannot authorize actions until revalidated.
   const stalePR = $derived(detailMismatch || detailStore.isDetailFromCache());
+  // URLs may omit the repository ID; the matching detail supplies its verified identity.
+  const mutationRef = $derived({
+    ...routeRef,
+    platformRepoId: platformRepoId ?? (detailMismatch ? undefined : detailStore.getDetail()?.repo.platform_repo_id),
+  });
 
   // Same comparison shape as PRListView's detailMatchesSelected, but
   // against the inline workspace identity rather than a route ref: the
@@ -737,13 +741,20 @@
   // would discard an in-flight create's success and re-enable the button
   // for a duplicate request.
   let lastResetIdentity: WorkspaceItemIdentity | null = null;
+  let lastResetPlatformRepoId: string | undefined;
   $effect(() => {
-    // Full provider-aware PR identity (via itemIdentity's deps): the same
-    // owner/name/number can exist on another provider or host, and stale
-    // head-conflict state must not leak across that navigation either.
+    // Reset for another provider/host/item or a replacement repository at the same route.
     const current = $state.snapshot(itemIdentity);
-    if (lastResetIdentity !== null && identityEquals(lastResetIdentity, current)) return;
+    const currentPlatformRepoId = mutationRef.platformRepoId;
+    if (lastResetIdentity !== null && identityEquals(lastResetIdentity, current)
+      && (currentPlatformRepoId === undefined || lastResetPlatformRepoId === undefined
+        || lastResetPlatformRepoId === currentPlatformRepoId)) {
+      // Detail hydration and reload gaps do not replace a verified repository.
+      lastResetPlatformRepoId = currentPlatformRepoId ?? lastResetPlatformRepoId;
+      return;
+    }
     lastResetIdentity = current;
+    lastResetPlatformRepoId = currentPlatformRepoId;
     manualRefreshGeneration += 1;
     manualRefreshPending = false;
     mutationRouteGeneration = untrack(() => mutationRouteGeneration) + 1;
@@ -990,6 +1001,7 @@
   const deferredMergePending = $derived(
     detailStore.getDetail()?.deferred_merge_pending ?? false,
   );
+  const mergePending = $derived(!stalePR && detailStore.isPullMerging(mutationRef, number));
   const midStackBlocker = $derived.by(() => {
     const stack = detailStore.getDetail()?.stack;
     if (!stack) return undefined;
@@ -1008,18 +1020,19 @@
     reason: Exclude<ConflictReason, "conflict">,
     context?: string,
     failedHeadSha?: string,
-    failedRef: ProviderRouteRef = routeRef,
+    failedRef: ProviderRouteRef = mutationRef,
     failedNumber: number = number,
     failedGeneration: number = mutationRouteGeneration,
   ): boolean {
     if (
-      failedGeneration !== mutationRouteGeneration
+      componentDestroyed || failedGeneration !== mutationRouteGeneration
       || failedNumber !== number
       || failedRef.provider !== routeRef.provider
       || failedRef.platformHost !== routeRef.platformHost
       || failedRef.owner !== routeRef.owner
       || failedRef.name !== routeRef.name
       || failedRef.repoPath !== routeRef.repoPath
+      || failedRef.platformRepoId !== mutationRef.platformRepoId
     ) return false;
     conflictReviewedHead = failedHeadSha ?? detailHeadSha;
     stateConflict = reason;
@@ -1057,12 +1070,12 @@
     const reason = stateConflict;
     if (!reason || conflictRefreshBusy) return;
     const requestID = ++conflictRefreshRequestID;
-    const routeKey = `${provider}\n${platformHost}\n${repoPath}\n${owner}\n${name}\n${number}`;
+    const routeKey = `${provider}\n${platformHost}\n${repoPath}\n${owner}\n${name}\n${number}\n${mutationRef.platformRepoId}`;
     const reviewedHeadAtConflict = conflictReviewedHead;
     conflictRefreshBusy = true;
     conflictRefreshError = null;
     const finish = (refreshed: boolean): void => {
-      const currentRouteKey = `${provider}\n${platformHost}\n${repoPath}\n${owner}\n${name}\n${number}`;
+      const currentRouteKey = `${provider}\n${platformHost}\n${repoPath}\n${owner}\n${name}\n${number}\n${mutationRef.platformRepoId}`;
       if (requestID !== conflictRefreshRequestID || routeKey !== currentRouteKey) return;
       if (stateConflict !== reason) {
         conflictRefreshBusy = false;
@@ -1081,7 +1094,7 @@
       owner,
       name,
       number,
-      { provider, platformHost, platformRepoId, repoPath },
+      mutationRef,
       { onSuccess: finish, onFailure: () => finish(false) },
     );
   }
@@ -1237,7 +1250,7 @@
       repoSettings,
       // Treat a blocked head as stale for gating: the merge modal must
       // not open while the reviewed head is unknown.
-      stale: stalePR || headActionsBlocked || midStackMergeBlocked,
+      stale: stalePR || headActionsBlocked || midStackMergeBlocked || mergePending,
       stores: { detail: detailStore },
       requireHeadPin: capabilities.mutation_head_binding,
       ...(detailHeadSha !== "" && { expectedHeadSha: detailHeadSha }),
@@ -2597,6 +2610,7 @@
           {number}
           {provider}
           {platformHost}
+          platformRepoId={mutationRef.platformRepoId}
           {repoPath}
           size="sm"
           disabled={stalePR || headActionsBlocked || approveGate.unavailable}
@@ -2632,7 +2646,11 @@
         {@const mergeOp = repoOperations?.merge_pr}
         {@const mergeGate = operationGate(mergeOp)}
         {@const mergeOpUnavailable = mergeGate.unavailable}
-        {#if repoSettings && hasEnabledMergeMethod(repoSettings) && (mergeOp !== undefined
+        {#if mergePending}
+          <Button class="btn--merge" disabled tone="success" surface="soft" size="sm" label="Merging" ariaLabel="Merging">
+            <Spinner size={14} label="Merging" />
+          </Button>
+        {:else if repoSettings && hasEnabledMergeMethod(repoSettings) && (mergeOp !== undefined
             || (capabilities.merge_mutation && repoSettings.viewerCanMerge))}
           {@const mergeSettings = repoSettings}
           {@const mergeDisabledByConflicts = hasMergeConflicts(pr)}
@@ -3231,6 +3249,7 @@
           {number}
           {provider}
           {platformHost}
+          platformRepoId={d.repo.platform_repo_id}
           {repoPath}
           prTitle={p.Title}
           prBody={p.Body}
@@ -3251,28 +3270,6 @@
             : undefined}
           onstateconflict={handleStateConflict}
           onclose={() => { showMergeModal = false; }}
-          onqueued={() => {
-            showMergeModal = false;
-            // Pick up deferred_merge_pending so the merge action renders
-            // as queued until the background worker completes.
-            detailStore.refreshDetailOnly(owner, name, number, {
-              provider,
-              platformHost,
-              platformRepoId,
-              repoPath,
-            });
-          }}
-          onmerged={() => {
-            showMergeModal = false;
-            detailStore.loadDetail(owner, name, number, {
-              provider,
-              platformHost,
-              platformRepoId,
-              repoPath,
-            });
-            pulls.loadPulls();
-            activity.loadActivity();
-          }}
         />
       {/if}
 
