@@ -9,6 +9,7 @@ require (
 	github.com/andybalholm/brotli v1.2.4
 	github.com/aymanbagabas/go-pty v0.2.3
 	github.com/cenkalti/backoff/v7 v7.0.0
+	github.com/coder/acp-go-sdk v0.13.5
 	github.com/coder/websocket v1.8.15
 	github.com/creack/pty/v2 v2.0.1
 	github.com/danielgtaylor/huma/v2 v2.39.1
