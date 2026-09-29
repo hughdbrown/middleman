@@ -17,6 +17,7 @@ import (
 	"go.kenn.io/forge/internal/gitclone"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/providerplane"
+	"go.kenn.io/forge/internal/ptyowner"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/internal/workspace"
@@ -2634,7 +2635,7 @@ func (s *Handler) launchWorkspaceRuntimeSession(
 	input *launchWorkspaceRuntimeSessionInput,
 ) (*workspaceRuntimeSessionOutput, error) {
 	session, err := s.launchWorkspaceRuntimeService(
-		ctx, input.ID, input.Body.TargetKey, input.Body.DisplayRegion,
+		ctx, input.ID, input.Body.TargetKey, input.Body.DisplayRegion, "",
 	)
 	if err != nil {
 		return nil, err
@@ -2643,9 +2644,16 @@ func (s *Handler) launchWorkspaceRuntimeSession(
 }
 
 func (s *Handler) LaunchWorkspaceRuntimeService(
-	ctx context.Context, workspaceID, targetKey string,
+	ctx context.Context, workspaceID, targetKey, initialMessage string,
 ) (localruntime.SessionInfo, error) {
-	return s.launchWorkspaceRuntimeService(ctx, workspaceID, targetKey, "")
+	if initialMessage != "" {
+		message, _, err := normalizeInitialAgentMessage(initialMessage)
+		if err != nil {
+			return localruntime.SessionInfo{}, httpapi.Validation("message", err.Error())
+		}
+		initialMessage = message
+	}
+	return s.launchWorkspaceRuntimeService(ctx, workspaceID, targetKey, "", initialMessage)
 }
 
 func (s *Handler) PreferredWorkspaceAgentTargetService(
@@ -2655,7 +2663,7 @@ func (s *Handler) PreferredWorkspaceAgentTargetService(
 }
 
 func (s *Handler) launchWorkspaceRuntimeService(
-	ctx context.Context, workspaceID, targetKey, displayRegion string,
+	ctx context.Context, workspaceID, targetKey, displayRegion, initialMessage string,
 ) (session localruntime.SessionInfo, err error) {
 	started := time.Now()
 	defer func() {
@@ -2688,7 +2696,7 @@ func (s *Handler) launchWorkspaceRuntimeService(
 			return localruntime.SessionInfo{}, httpapi.Internal("prepare agent context: " + err.Error())
 		}
 	}
-	session, err = s.runtime.Launch(ctx, summary.ID, summary.WorktreePath, targetKey)
+	session, err = s.runtime.LaunchWithInitialMessage(ctx, summary.ID, summary.WorktreePath, targetKey, initialMessage)
 	if err != nil {
 		return localruntime.SessionInfo{}, workspaceRuntimeLaunchError(err)
 	}
@@ -2707,6 +2715,12 @@ func (s *Handler) launchWorkspaceRuntimeService(
 	}
 	s.invalidateWorkspaceEnrichment(summary.ID)
 	s.forgetRecordedRuntimeSessionIfExited(ctx, session)
+	if session.InitialMessageProvided {
+		s.reserveInitialMessageAttempt(summary.ID, session.Key, initialMessageAttempt{
+			TargetKey: targetKey, Message: initialMessage,
+		})
+		s.finishInitialMessageAttempt(summary.ID, session.Key, initialMessageDelivered)
+	}
 	return session, nil
 }
 
@@ -3033,7 +3047,7 @@ func (s *Handler) getReadyRuntimeWorkspace(
 
 func workspaceRuntimeLaunchError(err error) error {
 	msg := err.Error()
-	if errors.Is(err, tokenauth.ErrMissingToken) {
+	if errors.Is(err, tokenauth.ErrMissingToken) || errors.Is(err, ptyowner.ErrCommandLineTooLong) {
 		return httpapi.BadRequest(httpapi.CodeBadRequest, msg, nil)
 	}
 	if strings.Contains(msg, "target not found") {
