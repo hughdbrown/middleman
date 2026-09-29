@@ -111,6 +111,7 @@
   import { watchFleetWorkspaceDiff } from "./fleet-diff-watch.js";
   import { workspaceEventStream } from "./workspace-event-stream.js";
   import { decodeWorkspaceDetail, type WorkspaceDetail } from "./workspace-detail.js";
+  import { pollWhileVisible } from "../../effect/poll-while-visible.js";
   import { createRecentDetails } from "../../stores/recent-details.js";
   import { reconnectSchedule } from "../../api/retry-policy.js";
   import { Button, CollapsibleSidebar, SplitResizeHandle, type SplitResizeEvent } from "@kenn-io/kit-ui";
@@ -155,6 +156,7 @@
     discardWorkspaceLaunch,
     failWorkspaceLaunch,
     isWorkspaceDeletionPending,
+    isWorkspaceIdDeleted,
     pendingWorkspaceCreateLaunch,
     pendingWorkspaceLaunch,
     type WorkspaceLaunchClaim,
@@ -242,6 +244,7 @@
   const appRuntime = getAppRuntime();
   const runtimeOwner = makeWorkspaceRuntimeOwner("workspace-view");
   const runtimePresenterID = makeWorkspaceRuntimePresenterID();
+  let queuedLaunchRead: symbol | undefined;
 
   function runtimeTarget(workspaceId: string, hostKey: string | undefined): WorkspaceRuntimeTarget {
     return { workspaceId, ...(hostKey === undefined ? {} : { hostKey }) };
@@ -253,6 +256,7 @@
     targetKey: string,
     region: "workflow" | "terminal",
     placement: WorkspaceRuntimeLaunchPlacement,
+    admissionRuntime?: WorkspaceRuntimeState,
   ) {
     return Effect.gen(function* () {
       const workflow = yield* WorkspaceRuntimeWorkflow;
@@ -261,6 +265,7 @@
         targetKey,
         region,
         placement,
+        admissionRuntime,
       );
     });
   }
@@ -374,6 +379,7 @@
   );
 
   let workspace = $state<Workspace | null>(null);
+  let workspaceReadinessGeneration = 0;
   let runtime = $state.raw<WorkspaceRuntimeState | null>(null);
   let appliedRuntimeState:
     | {
@@ -391,7 +397,7 @@
   let runtimeForHostKey = $state<string | undefined>(undefined);
   let runtimeSnapshotAuthoritative = $state(false);
   let restoredSessionKeys = $state.raw<Set<SessionHostKey> | null>(null);
-  const recentWorkspaces = createRecentDetails<{ workspace: Workspace; runtime: WorkspaceRuntimeState }>();
+  const recentWorkspaces = createRecentDetails<{ workspace: Workspace; runtime: WorkspaceRuntimeState }>(100);
   let loadError = $state<string | null>(null);
   let retryingSetup = $state(false);
   let refreshingWorkspace = $state(false);
@@ -946,20 +952,20 @@
     launcherState = { workspaceKey: viewWorkspaceKey, auto: false, ...(leaf ? { leaf } : {}) };
   }
 
-  function explicitLaunchIntentPending(): boolean {
+  function explicitLaunchTargetKey(): string | null {
     const identity = workspaceIdentitySnapshot(workspaceId);
     return (
-      (identity !== undefined && pendingWorkspaceCreateLaunch(identity) !== null) ||
-      pendingWorkspaceLaunch(workspaceId, workspaceHostKey) !== null
+      (identity !== undefined ? pendingWorkspaceCreateLaunch(identity) : null) ??
+      pendingWorkspaceLaunch(workspaceId, workspaceHostKey)?.targetKey ?? null
     );
   }
 
   function createOrLaunchPending(): boolean {
-    return explicitLaunchIntentPending() || launchingKey !== null;
+    return explicitLaunchTargetKey() !== null || launchingKey !== null;
   }
 
   const automaticLauncherBlocked = $derived(
-    explicitLaunchIntentPending() ||
+    explicitLaunchTargetKey() !== null ||
       quickActionWorkspaces.has(quickActionWorkspaceKey(workspaceId, workspaceHostKey)),
   );
   const launcherOverlayAllowed = $derived(
@@ -1418,6 +1424,14 @@
   // the destination slot mounts, and opening a launcher in that parked window
   // prevents Focus Terminal from completing the reveal on Firefox.
   const interactionVisible = $derived(hostVisible || externalControlsVisible);
+
+  $effect(() => {
+    if (!interactionVisible) return;
+    untrack(() => {
+      if (workspaceLive && workspace?.status === "ready") startRuntimePolling();
+    });
+    return stopRuntimePolling;
+  });
 
   // Handed to the detail pane's controls popover, which is where the controls live
   // once this view is embedded. Registered with the workspace it acts on, because
@@ -2268,6 +2282,7 @@
     // workspace's data with stale content (causing a perceived flash
     // back to the previous workspace).
     return Effect.gen(function* () {
+      const readinessGeneration = workspaceReadinessGeneration;
       recordWorkspaceSwitchPhase("workspace-request-start", id, hostKey);
       const data = hostKey
         ? yield* executeOpaqueGeneratedApiRequest<unknown>("load fleet workspace", (generatedClient, signal) =>
@@ -2277,11 +2292,14 @@
             generatedClient.WorkspacesService.getWorkspace({ id }, { signal }),
           );
       const nextWorkspace = yield* decodeWorkspaceDetail(data, hostKey);
-      yield* Effect.sync(() => {
+      return yield* Effect.sync(() => {
         recordWorkspaceSwitchPhase("workspace-request-end", id, hostKey, {
           status: 200,
         });
-        if (!isCurrentWorkspace(id, hostKey)) return;
+        if (!isCurrentWorkspace(id, hostKey)) return null;
+        // A pre-readiness snapshot must not restart setup after the ready event.
+        if (nextWorkspace.status === "creating" && workspaceLive && workspace?.status === "ready" &&
+          readinessGeneration !== workspaceReadinessGeneration) return workspace;
         workspace = nextWorkspace;
         syncSidebarTabForWorkspace(nextWorkspace);
         loadError = null;
@@ -2291,14 +2309,14 @@
         }
         if (nextWorkspace.status === "ready") {
           startRuntimePolling();
-          if (!hasAppliedRuntimeFor(id, hostKey)) {
+          if (!hasAppliedRuntimeFor(id, hostKey) && pendingWorkspaceLaunch(id, hostKey)?.phase !== "queued") {
             requestRuntime();
           }
         } else {
           stopRuntimePolling();
         }
+        return nextWorkspace;
       });
-      return nextWorkspace;
     }).pipe(
       Effect.catch((failure) =>
         Effect.sync(() => {
@@ -2332,7 +2350,10 @@
     if (!workspaceId) return Effect.succeed<WorkspaceRuntimeState | null>(null);
     const id = workspaceId;
     const hostKey = workspaceHostKey;
+    const admission = workspaceLive && workspace?.status === "ready" && pendingWorkspaceLaunch(id, hostKey)?.phase === "queued"
+      ? Symbol("queued-launch-read") : undefined;
     return Effect.gen(function* () {
+      if (admission !== undefined) queuedLaunchRead = admission;
       recordWorkspaceSwitchPhase("runtime-request-start", id, hostKey);
       const workflow = yield* WorkspaceRuntimeWorkflow;
       const result = yield* workflow.read(runtimeOwner, id, hostKey, options);
@@ -2359,6 +2380,7 @@
           appliedRuntimeState?.fingerprint === fingerprint
         ) {
           runtimeError = null;
+          if (admission !== undefined) reconcileQueuedWorkspaceLaunch(data);
           return data;
         }
         runtime = data;
@@ -2380,6 +2402,7 @@
         mountedSessionKeys = mountedSessionKeys.filter(
           (key) => data.sessions.some((session) => session.key === key),
         );
+        if (admission !== undefined) reconcileQueuedWorkspaceLaunch(data);
         return data;
       });
     }).pipe(
@@ -2396,6 +2419,9 @@
           return null;
         }),
       ),
+      Effect.ensuring(Effect.sync(() => {
+        if (queuedLaunchRead === admission) queuedLaunchRead = undefined;
+      })),
     );
   }
 
@@ -2589,32 +2615,30 @@
           });
         }
         const placement = state.request.placement;
-        return Effect.gen(function* () {
-          yield* fetchRuntimeProgram({ force: true });
+        return Effect.sync(() => {
           if (!isCurrentWorkspace(id, hostKey)) return false;
-          yield* Effect.sync(() => {
-            const session = state.session;
-            clearClosedSession(session);
-            if (placement.insertIntoTree) {
-              const sessionsWithLaunch = upsertRuntimeSession(session);
-              const groups = addTerminalGroup(terminalLayout.terminalGroups, session.key);
-              const activeGroupID = groups.at(-1)?.id ?? terminalLayout.activeTerminalGroupID;
-              terminalLayout = normalizeLayoutForSessions(
-                sessionsWithLaunch,
-                layoutWithTerminalGroups(
-                  {
-                    ...terminalLayout,
-                    open: true,
-                    sessionRegions: { ...terminalLayout.sessionRegions, [session.key]: "terminal" },
-                  },
-                  groups,
-                  activeGroupID,
-                ),
-              );
-            }
-            if (terminalLayout.dock === "top") selectWorkspaceTab("terminal");
-            clearRuntimeMutationPending(state);
-          });
+          const session = state.session;
+          clearClosedSession(session);
+          const sessionsWithLaunch = upsertRuntimeSession(session);
+          if (placement.insertIntoTree) {
+            const groups = addTerminalGroup(terminalLayout.terminalGroups, session.key);
+            const activeGroupID = groups.at(-1)?.id ?? terminalLayout.activeTerminalGroupID;
+            terminalLayout = normalizeLayoutForSessions(
+              sessionsWithLaunch,
+              layoutWithTerminalGroups(
+                {
+                  ...terminalLayout,
+                  open: true,
+                  sessionRegions: { ...terminalLayout.sessionRegions, [session.key]: "terminal" },
+                },
+                groups,
+                activeGroupID,
+              ),
+            );
+          }
+          if (terminalLayout.dock === "top") selectWorkspaceTab("terminal");
+          clearRuntimeMutationPending(state);
+          requestRuntime({ force: true });
           return true;
         });
       }
@@ -2754,6 +2778,7 @@
     targetKey: string,
     launchClaim?: WorkspaceLaunchClaim,
     leaf?: WorkspaceRuntimeLaunchLeaf,
+    admissionRuntime?: WorkspaceRuntimeState,
   ): void {
     if (!workspaceId || launchingKey || actionsBlocked) return;
     const id = workspaceId;
@@ -2785,7 +2810,7 @@
                 }
               },
             }),
-      }),
+      }, admissionRuntime),
       {
         operation: "workspace.session.launch",
         safeContext: { surface: "workspace" },
@@ -3590,19 +3615,20 @@
   }
 
   function startRuntimePolling(): void {
-    if (!workspaceId) return;
+    if (!workspaceId || !interactionVisible) return;
     const key = JSON.stringify([workspaceHostKey ?? null, workspaceId]);
     if (runtimePolling?.key === key) return;
     stopRuntimePolling();
     const id = workspaceId;
     const hostKey = workspaceHostKey;
     const execution = appRuntime.runCommand(
-      Stream.fromSchedule(Schedule.spaced("3 seconds")).pipe(
-        Stream.runForEach(() =>
+      pollWhileVisible(
+        Effect.suspend(() =>
           isCurrentWorkspace(id, hostKey)
             ? fetchRuntimeProgram().pipe(Effect.asVoid)
             : Effect.void,
         ),
+        "3 seconds",
       ),
       {
         operation: "workspace.runtime.poll",
@@ -3924,6 +3950,7 @@
     const id = workspaceId;
     const hostKey = workspaceHostKey;
     workspacePresentationGeneration += 1;
+    workspaceReadinessGeneration += 1;
     runtimeSnapshotAuthoritative = false;
     restoredSessionKeys = null;
     if (
@@ -4063,9 +4090,22 @@
                   ),
                 );
               case "Status":
-                return signal.workspaceId === undefined || signal.workspaceId === id
-                  ? fetchWorkspaceProgram(id, hostKey).pipe(Effect.asVoid)
-                  : Effect.void;
+                if (signal.workspaceId !== undefined && signal.workspaceId !== id) return Effect.void;
+                return Effect.sync(() => {
+                  // Browser workspace events are local authority, never a Fleet
+                  // peer's. Only advance the live setup, not a deletion or cache.
+                  if (
+                    hostKey === undefined && signal.workspaceId === id && signal.status === "ready" &&
+                    isCurrentWorkspace(id, hostKey) && workspaceLive && workspace?.status === "creating" &&
+                    !actionsBlocked && !isWorkspaceIdDeleted(id)
+                  ) {
+                    workspaceReadinessGeneration += 1;
+                    workspace = { ...workspace, status: "ready" };
+                    stopPolling();
+                    startRuntimePolling();
+                    if (pendingWorkspaceLaunch(id, hostKey)?.phase !== "queued") requestRuntime({ force: true });
+                  }
+                }).pipe(Effect.andThen(fetchWorkspaceProgram(id, hostKey)), Effect.asVoid);
               case "Associated":
                 return signal.workspaceId === id
                   ? fetchWorkspaceProgram(id, hostKey).pipe(Effect.asVoid)
@@ -4109,7 +4149,9 @@
           },
         ).pipe(Effect.retry({ schedule: reconnectSchedule }));
         const eventFiber = yield* Effect.forkChild(events, { startImmediately: true });
-        yield* Effect.forkChild(fetchRuntimeProgram(), { startImmediately: true });
+        if (untrack(() => pendingWorkspaceLaunch(id, hostKey)?.phase) !== "queued") {
+          yield* Effect.forkChild(untrack(() => fetchRuntimeProgram()), { startImmediately: true });
+        }
         const loaded = yield* fetchWorkspaceProgram(id, hostKey);
         yield* Deferred.succeed(initialWorkspace, loaded);
         yield* Effect.sync(() => {
@@ -4182,32 +4224,31 @@
     void loadEmptyLaunchTargets();
   });
 
-  $effect(() => {
-    if (!workspaceId || !runtimeLive || !runtimeSnapshotAuthoritative || workspace?.status !== "ready") return;
-    if (actionsBlocked || launchingKey !== null) return;
-    const pendingLaunch = pendingWorkspaceLaunch(workspaceId, workspaceHostKey);
-    const targetKey = pendingLaunch?.targetKey ?? null;
-    if (targetKey === null) return;
-    if (pendingLaunch?.phase === "awaiting_session") return;
-    if (runtimeSessions.length > 0) {
+  function reconcileQueuedWorkspaceLaunch(admissionRuntime: WorkspaceRuntimeState): void {
+    if (!workspaceLive || workspace?.status !== "ready" || actionsBlocked ||
+      (workspaceHostKey === undefined && isWorkspaceIdDeleted(workspaceId))) return;
+    const pending = pendingWorkspaceLaunch(workspaceId, workspaceHostKey);
+    if (pending?.phase !== "queued") return;
+    if (admissionRuntime.sessions.length > 0) {
       discardWorkspaceLaunch(workspaceId, workspaceHostKey);
       return;
     }
-    const target = launchTargets.find(
-      (candidate) => candidate.key === targetKey,
-    );
+    const target = admissionRuntime.launch_targets.find((candidate) => candidate.key === pending.targetKey);
     if (!target || (target.kind !== "agent" && target.kind !== "acp") || !target.available) {
       if (discardWorkspaceLaunch(workspaceId, workspaceHostKey) === null) return;
-      const reason =
-        target?.disabled_reason ?? "is not available in this workspace";
-      showFlash(`Agent "${targetKey}" could not launch: ${reason}`, {
-        tone: "danger",
-      });
+      showFlash(`Agent "${pending.targetKey}" could not launch: ${target?.disabled_reason ?? "is not available in this workspace"}`, { tone: "danger" });
       return;
     }
     const claim = claimWorkspaceLaunch(workspaceId, workspaceHostKey);
-    if (claim === null) return;
-    handleLaunch(claim.targetKey, claim);
+    if (claim !== null) handleLaunch(claim.targetKey, claim, undefined, admissionRuntime);
+  }
+
+  $effect(() => {
+    if (!workspaceLive || workspace?.status !== "ready" || actionsBlocked || launchingKey !== null) return;
+    if (pendingWorkspaceLaunch(workspaceId, workspaceHostKey)?.phase !== "queued") return;
+    untrack(() => {
+      if (queuedLaunchRead === undefined) requestRuntime({ force: true });
+    });
   });
 </script>
 
@@ -4616,6 +4657,13 @@
                   <div class="state-message">
                     <Spinner size={18} />
                     <span>Loading workspace runtime...</span>
+                  </div>
+                {:else if runtimeSessions.length === 0 && createOrLaunchPending()}
+                  {@const targetKey = explicitLaunchTargetKey() ?? launchingKey}
+                  {@const message = `Launching ${launchTargets.find((target) => target.key === targetKey)?.label ?? targetKey ?? "session"}...`}
+                  <div class="state-message">
+                    <Spinner size={18} label={message} />
+                    <span>{message}</span>
                   </div>
                 {:else}
                   {#if soleEmbeddedSessionHostKey !== null}

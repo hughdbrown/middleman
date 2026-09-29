@@ -130,6 +130,7 @@ type createDevboxWorkspaceInput struct {
 	Body         struct {
 		Provider            string `json:"provider"`
 		PlatformHost        string `json:"platform_host"`
+		PlatformRepoID      int64  `json:"platform_repo_id,omitempty"`
 		Owner               string `json:"owner"`
 		Name                string `json:"name"`
 		MRNumber            int    `json:"mr_number,omitempty"`
@@ -153,7 +154,7 @@ func (s *Server) createDevboxWorkspace(ctx context.Context, input *createDevboxW
 		return nil, httpapi.Conflict(httpapi.CodeConflict, err.Error(), nil)
 	}
 	body := input.Body
-	repo, err := s.repoResolver.LookupRoute(ctx, body.Provider, body.PlatformHost, body.Owner, body.Name)
+	repo, err := s.repoResolver.LookupSelection(ctx, body.Provider, body.PlatformHost, body.Owner, body.Name, body.PlatformRepoID)
 	if err != nil {
 		return nil, httpapi.ProviderRouteLookupError(err)
 	}
@@ -177,8 +178,10 @@ func (s *Server) createDevboxWorkspace(ctx context.Context, input *createDevboxW
 			kind, number = db.WorkspaceItemTypeIssue, body.IssueNumber
 		}
 		spec, err := s.ResolveWorkspaceLaunchSpec(ctx, providerplane.WorkspaceLaunchRequest{
-			Repository: providerplane.RepositoryRoute{Provider: repo.Platform, PlatformHost: repo.PlatformHost, Owner: repo.Owner, Name: repo.Name},
-			ItemType:   kind, ItemNumber: number, GitHeadRef: body.Branch,
+			Repository:     providerplane.RepositoryRoute{Provider: repo.Platform, PlatformHost: repo.PlatformHost, Owner: repo.Owner, Name: repo.Name},
+			PlatformRepoID: repo.PlatformRepoID,
+			ForCreation:    true,
+			ItemType:       kind, ItemNumber: number, GitHeadRef: body.Branch,
 		})
 		if err != nil {
 			return nil, err
@@ -407,8 +410,9 @@ func (s *Server) refreshDevboxContext(ctx context.Context, connections *devbox.C
 		return nil
 	}
 	spec, err := s.ResolveWorkspaceLaunchSpec(ctx, providerplane.WorkspaceLaunchRequest{
-		Repository: providerplane.RepositoryRoute{Provider: current.Repo.Provider, PlatformHost: current.PlatformHost, Owner: current.RepoOwner, Name: current.RepoName},
-		ItemType:   current.ItemType, ItemNumber: current.ItemNumber, ItemKey: current.ItemKey, GitHeadRef: current.GitHeadRef,
+		Repository:     providerplane.RepositoryRoute{Provider: current.Repo.Provider, PlatformHost: current.PlatformHost, Owner: current.RepoOwner, Name: current.RepoName},
+		PlatformRepoID: current.Repo.PlatformRepoID,
+		ItemType:       current.ItemType, ItemNumber: current.ItemNumber, ItemKey: current.ItemKey, GitHeadRef: current.GitHeadRef,
 	})
 	if err != nil {
 		return err

@@ -1782,6 +1782,7 @@
     const requestBody = {
       provider: requestIdentity.provider,
       platform_host: detail.platform_host,
+      ...(detail.repo.platform_repo_id ? { platform_repo_id: detail.repo.platform_repo_id } : {}),
       owner: detail.repo_owner,
       name: detail.repo_name,
       mr_number: detail.merge_request.Number,
@@ -2836,7 +2837,7 @@
             disabled={stalePR || workspaceTarget.reason !== ""}
             disabledReason={stalePR
               ? "Refresh details before creating a workspace."
-              : workspaceTarget.reason || createWorkspaceTitle}
+              : workspaceTarget.reason || workspaceTarget.hint || createWorkspaceTitle}
             descriptionId={createWorkspaceDescriptionId}
             onCreate={(targetKey) => createWorkspace(targetKey)}
             quickActions={settings.getQuickActions()}
@@ -3072,7 +3073,7 @@
       <!-- Approve / Merge / Close / Reopen actions -->
       {#if !workspace}
         <span id={createWorkspaceDescriptionId} class="kit-sr-only">
-          {stalePR ? "Refresh details before creating a workspace." : workspaceTarget.reason || createWorkspaceTitle}
+          {stalePR ? "Refresh details before creating a workspace." : workspaceTarget.reason || workspaceTarget.hint || createWorkspaceTitle}
         </span>
       {/if}
       {#if showActionSurface}
@@ -3390,6 +3391,7 @@
           platformRepoId={detail.repo.platform_repo_id}
           repoPath={detail.repo.repo_path}
           disabled={stalePR || !capabilities.comment_mutation || addCommentGate.unavailable}
+          editorDisabled={detailMismatch || !capabilities.comment_mutation || addCommentGate.unavailable}
           disabledReason={addCommentGate.unavailable ? addCommentGate.reason : undefined}
         />
       </div>

@@ -48619,7 +48619,7 @@ type FederationFilterUnassignedActivitySubjectsBody = FederationUnassignedActivi
 
 type FederationGetDiffDescriptorBody = FederationDiffDescriptorRequest
 
-type FederationGetRepositoryDescriptorBody = RepositoryRoute
+type FederationGetRepositoryDescriptorBody = RepositoryDescriptorRequest
 
 type FederationUpdateProviderSettingsBody = ProviderSettingsUpdate
 
@@ -50718,7 +50718,7 @@ type UpdateRepoWorktreeBaseResponse = SettingsResponse
 
 type UpdateRepoWorktreeBaseErrorResponse = ProblemError
 
-type ListReposResponse []RepoResponse
+type ListReposResponse []RepoCatalogResponse
 
 type ListReposErrorResponse = ProblemError
 
@@ -54578,8 +54578,11 @@ type CreateAdHocWorkspaceHostInputBody struct {
 	Schema *string `json:"$schema,omitempty"`
 
 	// Branch Branch for the new worktree; generated when empty
-	Branch              *string `json:"branch,omitempty"`
-	ReuseExistingBranch *bool   `json:"reuse_existing_branch,omitempty"`
+	Branch *string `json:"branch,omitempty"`
+
+	// PlatformRepoID Expected stable repository ID from the catalog
+	PlatformRepoID      *int64 `json:"platform_repo_id,omitempty"`
+	ReuseExistingBranch *bool  `json:"reuse_existing_branch,omitempty"`
 }
 
 type CreateAdHocWorkspaceInputBody struct {
@@ -54587,8 +54590,11 @@ type CreateAdHocWorkspaceInputBody struct {
 	Schema *string `json:"$schema,omitempty"`
 
 	// Branch Branch for the new worktree; generated when empty
-	Branch              *string `json:"branch,omitempty"`
-	ReuseExistingBranch *bool   `json:"reuse_existing_branch,omitempty"`
+	Branch *string `json:"branch,omitempty"`
+
+	// PlatformRepoID Expected stable repository ID from the catalog
+	PlatformRepoID      *int64 `json:"platform_repo_id,omitempty"`
+	ReuseExistingBranch *bool  `json:"reuse_existing_branch,omitempty"`
 }
 
 type CreateDevboxWorkspaceInputBody struct {
@@ -54600,6 +54606,7 @@ type CreateDevboxWorkspaceInputBody struct {
 	Name                string  `json:"name"`
 	Owner               string  `json:"owner"`
 	PlatformHost        string  `json:"platform_host"`
+	PlatformRepoID      *int64  `json:"platform_repo_id,omitempty"`
 	Provider            string  `json:"provider"`
 	ReuseExistingBranch *bool   `json:"reuse_existing_branch,omitempty"`
 }
@@ -54659,6 +54666,7 @@ type CreateIssueWorkspaceHostInputBody struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema                 *string `json:"$schema,omitempty"`
 	GitHeadRef             *string `json:"git_head_ref,omitempty"`
+	PlatformRepoID         *int64  `json:"platform_repo_id,omitempty"`
 	ReuseExistingBranch    *bool   `json:"reuse_existing_branch,omitempty"`
 	ReuseExistingDirectory *bool   `json:"reuse_existing_directory,omitempty"`
 	SuppressAutoAssign     *bool   `json:"suppress_auto_assign,omitempty"`
@@ -54668,6 +54676,7 @@ type CreateIssueWorkspaceInputBody struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema                 *string `json:"$schema,omitempty"`
 	GitHeadRef             *string `json:"git_head_ref,omitempty"`
+	PlatformRepoID         *int64  `json:"platform_repo_id,omitempty"`
 	ReuseExistingBranch    *bool   `json:"reuse_existing_branch,omitempty"`
 	ReuseExistingDirectory *bool   `json:"reuse_existing_directory,omitempty"`
 	SuppressAutoAssign     *bool   `json:"suppress_auto_assign,omitempty"`
@@ -54680,6 +54689,7 @@ type CreateWorkspaceInputBody struct {
 	Name               string  `json:"name"`
 	Owner              string  `json:"owner"`
 	PlatformHost       string  `json:"platform_host"`
+	PlatformRepoID     *int64  `json:"platform_repo_id,omitempty"`
 	Provider           string  `json:"provider"`
 	SuppressAutoAssign *bool   `json:"suppress_auto_assign,omitempty"`
 }
@@ -56599,10 +56609,11 @@ type ProviderStateWorkflowPayload struct {
 
 type ProviderWorkspaceItemRequest struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema     *string         `json:"$schema,omitempty"`
-	ItemNumber int64           `json:"item_number"`
-	ItemType   string          `json:"item_type"`
-	Repository RepositoryRoute `json:"repository"`
+	Schema         *string         `json:"$schema,omitempty"`
+	ItemNumber     int64           `json:"item_number"`
+	ItemType       string          `json:"item_type"`
+	PlatformRepoID int64           `json:"platform_repo_id"`
+	Repository     RepositoryRoute `json:"repository"`
 }
 
 type PublishChange struct {
@@ -57014,6 +57025,23 @@ type RepoBrowserTreeResponse struct {
 	Truncated bool                   `json:"truncated"`
 }
 
+type RepoCatalogResponse struct {
+	AllowMergeCommit    bool       `json:"AllowMergeCommit"`
+	AllowRebaseMerge    bool       `json:"AllowRebaseMerge"`
+	AllowSquashMerge    bool       `json:"AllowSquashMerge"`
+	CreatedAt           time.Time  `json:"CreatedAt"`
+	ID                  int64      `json:"ID"`
+	LastSyncCompletedAt *time.Time `json:"LastSyncCompletedAt,omitempty"`
+	LastSyncError       string     `json:"LastSyncError"`
+	LastSyncStartedAt   *time.Time `json:"LastSyncStartedAt,omitempty"`
+	Name                string     `json:"Name"`
+	Owner               string     `json:"Owner"`
+	Platform            string     `json:"Platform"`
+	PlatformHost        string     `json:"PlatformHost"`
+	PlatformRepoID      int64      `json:"PlatformRepoID"`
+	ViewerCanMerge      bool       `json:"ViewerCanMerge"`
+}
+
 type RepoLabelsResponse struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema    *string `json:"$schema,omitempty"`
@@ -57212,6 +57240,16 @@ type RepositoryDescriptor struct {
 	Stale           bool      `json:"stale"`
 }
 
+type RepositoryDescriptorRequest struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema         *string `json:"$schema,omitempty"`
+	Name           string  `json:"name"`
+	Owner          string  `json:"owner"`
+	PlatformHost   string  `json:"platform_host"`
+	PlatformRepoID *int64  `json:"platform_repo_id,omitempty"`
+	Provider       string  `json:"provider"`
+}
+
 type RepositoryIdentity struct {
 	Name           *string `json:"name,omitempty"`
 	Owner          *string `json:"owner,omitempty"`
@@ -57221,12 +57259,10 @@ type RepositoryIdentity struct {
 }
 
 type RepositoryRoute struct {
-	// Schema A URL to the JSON Schema for this object.
-	Schema       *string `json:"$schema,omitempty"`
-	Name         string  `json:"name"`
-	Owner        string  `json:"owner"`
-	PlatformHost string  `json:"platform_host"`
-	Provider     string  `json:"provider"`
+	Name         string `json:"name"`
+	Owner        string `json:"owner"`
+	PlatformHost string `json:"platform_host"`
+	Provider     string `json:"provider"`
 }
 
 type RequestChangesPRHostInputBody struct {
@@ -58086,6 +58122,7 @@ type WorkspaceLaunchRepository struct {
 type WorkspaceLaunchRequest struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema          *string         `json:"$schema,omitempty"`
+	ForCreation     *bool           `json:"for_creation,omitempty"`
 	GitHeadRef      *string         `json:"git_head_ref,omitempty"`
 	IssueBranchSlug *bool           `json:"issue_branch_slug,omitempty"`
 	ItemKey         *string         `json:"item_key,omitempty"`

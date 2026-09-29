@@ -20,6 +20,7 @@ import (
 	"go.kenn.io/forge/internal/server/pullapi"
 	"go.kenn.io/forge/internal/server/workspaceapi"
 	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/platform"
 )
 
 type hubProviderSource struct {
@@ -209,6 +210,12 @@ func workspaceProviderName(local workspace.Workspace) string {
 func (s *hubProviderSource) GetRepositoryDescriptor(
 	ctx context.Context, route providerplane.RepositoryRoute,
 ) (providerplane.RepositoryDescriptor, error) {
+	return s.getRepositoryDescriptor(ctx, route, 0)
+}
+
+func (s *hubProviderSource) getRepositoryDescriptor(
+	ctx context.Context, route providerplane.RepositoryRoute, platformRepoID int64,
+) (providerplane.RepositoryDescriptor, error) {
 	route, err := providerplane.CanonicalRepositoryRoute(route)
 	if err != nil {
 		return providerplane.RepositoryDescriptor{}, httpapi.BadRequest(
@@ -216,14 +223,21 @@ func (s *hubProviderSource) GetRepositoryDescriptor(
 		)
 	}
 	var descriptor providerplane.RepositoryDescriptor
-	httpRequest, err := generated.NewFederationGetRepositoryDescriptorRequest(ctx, "/api/v1", &generated.FederationGetRepositoryDescriptorRequestOptions{Body: new(generated.RepositoryRoute{Provider: route.Provider, PlatformHost: route.PlatformHost, Owner: route.Owner, Name: route.Name})})
+	httpRequest, err := generated.NewFederationGetRepositoryDescriptorRequest(ctx, "/api/v1", &generated.FederationGetRepositoryDescriptorRequestOptions{Body: &generated.RepositoryDescriptorRequest{Provider: route.Provider, PlatformHost: route.PlatformHost, Owner: route.Owner, Name: route.Name, PlatformRepoID: optionalProviderQuery(platformRepoID)}})
 	if err != nil {
 		return providerplane.RepositoryDescriptor{}, err
 	}
 	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &descriptor); err != nil {
 		return providerplane.RepositoryDescriptor{}, err
 	}
-	if err := descriptor.ValidateRoute(route); err != nil {
+	if platformRepoID == 0 {
+		err = descriptor.ValidateRoute(route)
+	} else if err = descriptor.Validate(); err == nil && descriptor.Identity() != (platform.RepositoryIdentity{
+		Provider: route.Provider, PlatformHost: route.PlatformHost, PlatformRepoID: platformRepoID,
+	}).Canonical() {
+		err = errors.New("repository descriptor does not match selected repository")
+	}
+	if err != nil {
 		return providerplane.RepositoryDescriptor{}, invalidHubDescriptor(err)
 	}
 	if err := s.observeRepositoryDescriptor(ctx, descriptor); err != nil {
@@ -233,9 +247,9 @@ func (s *hubProviderSource) GetRepositoryDescriptor(
 }
 
 func (s *hubProviderSource) ResolveRepositoryRoute(
-	ctx context.Context, route providerplane.RepositoryRoute,
+	ctx context.Context, route providerplane.RepositoryRoute, platformRepoID int64,
 ) (*db.Repo, error) {
-	descriptor, err := s.GetRepositoryDescriptor(ctx, route)
+	descriptor, err := s.getRepositoryDescriptor(ctx, route, platformRepoID)
 	if err != nil {
 		return nil, err
 	}
@@ -361,7 +375,7 @@ func (s *hubProviderSource) AutoAssignWorkspaceItem(
 	ctx context.Context, request workspaceapi.ProviderWorkspaceItemRequest,
 ) error {
 	var response struct{}
-	httpRequest, err := generated.NewFederationAutoAssignWorkspaceItemRequest(ctx, "/api/v1", &generated.FederationAutoAssignWorkspaceItemRequestOptions{Body: &generated.FederationAutoAssignWorkspaceItemBody{Repository: generated.RepositoryRoute{Provider: request.Repository.Provider, PlatformHost: request.Repository.PlatformHost, Owner: request.Repository.Owner, Name: request.Repository.Name}, ItemType: request.ItemType, ItemNumber: int64(request.ItemNumber)}})
+	httpRequest, err := generated.NewFederationAutoAssignWorkspaceItemRequest(ctx, "/api/v1", &generated.FederationAutoAssignWorkspaceItemRequestOptions{Body: &generated.FederationAutoAssignWorkspaceItemBody{Repository: generated.RepositoryRoute{Provider: request.Repository.Provider, PlatformHost: request.Repository.PlatformHost, Owner: request.Repository.Owner, Name: request.Repository.Name}, PlatformRepoID: request.PlatformRepoID, ItemType: request.ItemType, ItemNumber: int64(request.ItemNumber)}})
 	if err != nil {
 		return err
 	}
@@ -718,6 +732,7 @@ func providerLaunchRequestBody(request providerplane.WorkspaceLaunchRequest) *ge
 		Repository: generated.RepositoryRoute{Provider: request.Repository.Provider, PlatformHost: request.Repository.PlatformHost, Owner: request.Repository.Owner, Name: request.Repository.Name}, ItemType: request.ItemType, ItemNumber: int64(request.ItemNumber),
 		ItemKey: optionalProviderQuery(request.ItemKey), GitHeadRef: optionalProviderQuery(request.GitHeadRef),
 		PlatformRepoID: optionalProviderQuery(request.PlatformRepoID), IssueBranchSlug: optionalProviderQuery(request.IssueBranchSlug),
+		ForCreation: optionalProviderQuery(request.ForCreation),
 	}
 }
 

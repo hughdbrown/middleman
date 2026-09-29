@@ -14,6 +14,8 @@ embedder protocol for arbitrary host state.
 - Materialize that entry as a local Git worktree plus tmux session.
 - Let the UI reopen the same workspace from `/workspaces` or `/terminal/:id`.
 - Carry enough item metadata to render the correct sidebar behavior.
+- Workspace response enrichment must preserve `repo.platform_repo_id` from the catalog summary;
+  frontend detail caches require that permanent identity (`internal/server/workspaceapi/helpers.go::repoRefFromParts`).
 - Persist provider workspaces by the internal repository catalog ID. Route
   requests resolve their current occupant before lookup or creation; a rename
   follows the same repository, while route reuse creates a separate workspace
@@ -94,6 +96,12 @@ embedder protocol for arbitrary host state.
   - Pending recovery uses a Git-invalid branch marker and must adopt that
     directory without create/cleanup fallback; retry/delete preserve it until setup
     publishes the real branch and ready status (`internal/workspace/manager.go::workspaceRequiresExistingDirectory`).
+- Repository selections and loaded PR/issue details carry the provider's stable ID through local, fleet,
+  and devbox creation; validate it before workspace reuse or creation so a reused route cannot redirect the choice
+  (`internal/server/workspaceapi/routes_handlers.go::createIssueWorkspaceRouteCore`).
+- Repository choices use their stable ID after a rename; creation rejects a different active repository
+  at the supplied route and rejects unknown or inactive repository IDs. Route-only callers keep current-route semantics
+  (`internal/server/httpapi/repository_resolver.go::RepositoryResolver.LookupSelection`).
 - `POST /repo/{provider}/{owner}/{name}/workspaces`: create or reuse an ad-hoc
   workspace for new work with no source item. Its branch is its identity: the
   item key is `adhoc:<branch>` and `item_number` stays 0, so item-key fallbacks
@@ -444,7 +452,9 @@ commits use the per-MR snapshot lock
 (`internal/workspace/manager.go::Manager.RefreshWorkspaceHeadRepoSnapshot`,
 `internal/db/queries.go::UpdateWorkspaceMRHeadRepoForSnapshot`).
 Launch-spec refresh preserves the workspace's stable repository and branch
-identity while renewing hub-owned head and visibility facts. A changed
+identity while renewing hub-owned head and visibility facts, even when another
+repository occupies its old route. Creation admission must not constrain existing
+workspace refresh or spoke preparation. A changed
 repository identity conflicts; an expired lease followed by a hub
 outage is retryable, while removed or inaccessible PRs fail closed before generated
 context can expose a branch or push target
@@ -531,6 +541,9 @@ Workspace create endpoints may return 202 with a pre-existing workspace
   workspace is persisted; run it independently of creation/setup under handler
   shutdown ownership. Preserve assignees and never roll back on upstream failure
   (`internal/server/workspaceapi/auto_assign.go::Handler.runWorkspaceAutoAssignment`).
+- Background assignment must retain the launch repository's stable ID locally and
+  through federation; a reused route must never change the assignment target
+  (`internal/server/workspaceapi/auto_assign.go::Handler.AutoAssignProviderWorkspaceItem`).
 - Inspect warm clones locally for branch conflicts; setup owns the fresh fetch
   before checkout. Cold admission still creates the clone so its existing branches
   participate in conflict handling (`internal/workspace/manager.go::Manager.branchInspectionDir`).

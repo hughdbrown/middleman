@@ -1584,6 +1584,10 @@ components:
         branch:
           description: Branch for the new worktree; generated when empty
           type: string
+        platform_repo_id:
+          description: Expected stable repository ID from the catalog
+          format: int64
+          type: integer
         reuse_existing_branch:
           type: boolean
       type: object
@@ -1600,6 +1604,10 @@ components:
         branch:
           description: Branch for the new worktree; generated when empty
           type: string
+        platform_repo_id:
+          description: Expected stable repository ID from the catalog
+          format: int64
+          type: integer
         reuse_existing_branch:
           type: boolean
       type: object
@@ -1627,6 +1635,9 @@ components:
           type: string
         platform_host:
           type: string
+        platform_repo_id:
+          format: int64
+          type: integer
         provider:
           type: string
         reuse_existing_branch:
@@ -1778,6 +1789,9 @@ components:
           type: string
         git_head_ref:
           type: string
+        platform_repo_id:
+          format: int64
+          type: integer
         reuse_existing_branch:
           type: boolean
         reuse_existing_directory:
@@ -1797,6 +1811,9 @@ components:
           type: string
         git_head_ref:
           type: string
+        platform_repo_id:
+          format: int64
+          type: integer
         reuse_existing_branch:
           type: boolean
         reuse_existing_directory:
@@ -1823,6 +1840,9 @@ components:
           type: string
         platform_host:
           type: string
+        platform_repo_id:
+          format: int64
+          type: integer
         provider:
           type: string
         suppress_auto_assign:
@@ -6721,10 +6741,15 @@ components:
           type: integer
         item_type:
           type: string
+        platform_repo_id:
+          format: int64
+          minimum: 1
+          type: integer
         repository:
           $ref: "#/components/schemas/RepositoryRoute"
       required:
         - repository
+        - platform_repo_id
         - item_type
         - item_number
       type: object
@@ -7747,6 +7772,62 @@ components:
         - entries
         - truncated
       type: object
+    RepoCatalogResponse:
+      additionalProperties: false
+      properties:
+        AllowMergeCommit:
+          type: boolean
+        AllowRebaseMerge:
+          type: boolean
+        AllowSquashMerge:
+          type: boolean
+        CreatedAt:
+          format: date-time
+          type: string
+        ID:
+          format: int64
+          type: integer
+        LastSyncCompletedAt:
+          format: date-time
+          type:
+            - string
+            - "null"
+        LastSyncError:
+          type: string
+        LastSyncStartedAt:
+          format: date-time
+          type:
+            - string
+            - "null"
+        Name:
+          type: string
+        Owner:
+          type: string
+        Platform:
+          type: string
+        PlatformHost:
+          type: string
+        PlatformRepoID:
+          format: int64
+          type: integer
+        ViewerCanMerge:
+          type: boolean
+      required:
+        - ID
+        - Platform
+        - PlatformHost
+        - PlatformRepoID
+        - Owner
+        - Name
+        - LastSyncStartedAt
+        - LastSyncCompletedAt
+        - LastSyncError
+        - AllowSquashMerge
+        - AllowMergeCommit
+        - AllowRebaseMerge
+        - ViewerCanMerge
+        - CreatedAt
+      type: object
     RepoLabelsResponse:
       additionalProperties: false
       properties:
@@ -8064,6 +8145,8 @@ components:
         operations:
           $ref: "#/components/schemas/RepoOperations"
       required:
+        - capabilities
+        - operations
         - ID
         - Platform
         - PlatformHost
@@ -8078,8 +8161,6 @@ components:
         - AllowRebaseMerge
         - ViewerCanMerge
         - CreatedAt
-        - capabilities
-        - operations
       type: object
     RepoSummaryAuthorResponse:
       additionalProperties: false
@@ -8306,6 +8387,33 @@ components:
         - observed_at
         - stale
       type: object
+    RepositoryDescriptorRequest:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/RepositoryDescriptorRequest.json
+          format: uri
+          readOnly: true
+          type: string
+        name:
+          type: string
+        owner:
+          type: string
+        platform_host:
+          type: string
+        platform_repo_id:
+          format: int64
+          type: integer
+        provider:
+          type: string
+      required:
+        - provider
+        - platform_host
+        - owner
+        - name
+      type: object
     RepositoryIdentity:
       additionalProperties: false
       properties:
@@ -8328,13 +8436,6 @@ components:
     RepositoryRoute:
       additionalProperties: false
       properties:
-        $schema:
-          description: A URL to the JSON Schema for this object.
-          examples:
-            - /api/v1/schemas/RepositoryRoute.json
-          format: uri
-          readOnly: true
-          type: string
         name:
           type: string
         owner:
@@ -9715,6 +9816,8 @@ components:
           type: number
         retained_sessions:
           format: int64
+          maximum: 100
+          minimum: 0
           type: integer
         scrollback:
           format: int64
@@ -10702,6 +10805,8 @@ components:
           format: uri
           readOnly: true
           type: string
+        for_creation:
+          type: boolean
         git_head_ref:
           type: string
         issue_branch_slug:
@@ -13880,7 +13985,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/RepositoryRoute"
+              $ref: "#/components/schemas/RepositoryDescriptorRequest"
         required: true
       responses:
         "200":
@@ -24834,7 +24939,7 @@ paths:
             application/json:
               schema:
                 items:
-                  $ref: "#/components/schemas/RepoResponse"
+                  $ref: "#/components/schemas/RepoCatalogResponse"
                 type: array
           description: OK
         default:

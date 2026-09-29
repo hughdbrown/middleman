@@ -20,6 +20,7 @@ import (
 	"go.kenn.io/forge/internal/providerplane"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/server/workspaceapi"
+	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
 	"go.kenn.io/forge/internal/workspace"
 	"go.kenn.io/forge/internal/workspace/localruntime"
@@ -145,6 +146,115 @@ func TestMCPPullWorkspaceDuplicateUsesStableConflictCode(t *testing.T) {
 	require.ErrorAs(err, &backendErr)
 	assert.Equal("conflict", backendErr.Kind)
 	assert.Equal(mcpserver.ErrorCodeWorkspaceAlreadyExists, backendErr.Code)
+}
+
+type recordingMCPLaunchResolver struct {
+	*Server
+	requests []providerplane.WorkspaceLaunchRequest
+}
+
+func (r *recordingMCPLaunchResolver) ResolveWorkspaceLaunchSpec(
+	ctx context.Context, request providerplane.WorkspaceLaunchRequest,
+) (db.WorkspaceLaunchSpec, error) {
+	r.requests = append(r.requests, request)
+	return r.Server.ResolveWorkspaceLaunchSpec(ctx, request)
+}
+
+func TestMCPWorkspaceReusePreservesRepositoryIdentity(t *testing.T) {
+	for _, itemType := range []string{db.WorkspaceItemTypePullRequest, db.WorkspaceItemTypeIssue} {
+		t.Run(itemType, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			database := dbtest.Open(t)
+			seedPR(t, database, "acme", "widget", 42)
+			seedIssue(t, database, "acme", "widget", 42, "open")
+			seedWorkspace(t, database, "ws-existing", "acme", "widget", itemType, 42)
+			resolver := httpapi.NewRepositoryResolver(httpapi.RepositoryResolverDeps{DB: database})
+			srv := &Server{db: database, repoResolver: resolver, now: time.Now}
+			spec, err := srv.ResolveWorkspaceLaunchSpec(t.Context(), providerplane.WorkspaceLaunchRequest{
+				Repository: providerplane.RepositoryRoute{
+					Provider: "github", PlatformHost: "github.com", Owner: "acme", Name: "widget",
+				},
+				PlatformRepoID: testutil.FixtureRepoID("acme", "widget"), ItemType: itemType, ItemNumber: 42,
+				GitHeadRef: "feature/ws-existing",
+			})
+			require.NoError(err)
+			require.NoError(database.PutWorkspaceLaunchSpec(t.Context(), "ws-existing", spec))
+			launchResolver := &recordingMCPLaunchResolver{Server: srv}
+			srv.workspaceAPI = workspaceapi.New(workspaceapi.Deps{
+				DB: database, Resolver: resolver, Workspaces: workspace.NewManager(database, t.TempDir()),
+				LaunchSpecResolver: launchResolver, EnrichmentDisabled: true,
+			})
+			t.Cleanup(func() {
+				require.NoError(srv.workspaceAPI.Shutdown(context.WithoutCancel(t.Context())))
+			})
+			item := mcpserver.ItemIdentity{
+				Provider: "github", PlatformHost: "github.com", PlatformRepoID: testutil.FixtureRepoID("acme", "widget"),
+				Owner: "acme", Name: "widget", Number: 42,
+			}
+			if itemType == db.WorkspaceItemTypePullRequest {
+				_, err := srv.MCPBackend().CreatePullWorkspace(t.Context(), item, true)
+				var backendErr *mcpserver.Error
+				require.ErrorAs(err, &backendErr)
+				assert.Equal(mcpserver.ErrorCodeWorkspaceAlreadyExists, backendErr.Code)
+			} else {
+				result, err := srv.MCPBackend().CreateIssueWorkspace(t.Context(), item, true)
+				require.NoError(err)
+				assert.Equal("ws-existing", result.ID)
+			}
+			// Reuse must pass through admission with the identity MCP validated,
+			// even when an existing workspace means no new row is written.
+			require.Len(launchResolver.requests, 1)
+			assert.Equal(testutil.FixtureRepoID("acme", "widget"), launchResolver.requests[0].PlatformRepoID)
+		})
+	}
+}
+
+func TestMCPAdHocWorkspaceRejectsRouteReplacementBeforeReuse(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	database := dbtest.Open(t)
+	identity := verifiedGitHubRepoIdentity("github.com", "acme", "widget")
+	_, err := database.ObserveRepository(ctx, identity)
+	require.NoError(err)
+	resolver := httpapi.NewRepositoryResolver(httpapi.RepositoryResolverDeps{DB: database})
+	srv := &Server{db: database, repoResolver: resolver}
+	srv.workspaceAPI = workspaceapi.New(workspaceapi.Deps{
+		DB: database, Resolver: resolver, Workspaces: workspace.NewManager(database, t.TempDir()),
+		EnrichmentDisabled: true,
+		ResolveRepository: func(requestCtx context.Context, route providerplane.RepositoryRoute, platformRepoID int64) (*db.Repo, error) {
+			// Provider sync can reassign the route after MCP validates it.
+			identity.PlatformRepoID = 1002
+			replacement, observeErr := database.ObserveRepository(ctx, identity)
+			require.NoError(observeErr)
+			require.NoError(database.InsertWorkspace(ctx, &db.Workspace{
+				ID: "ws-replacement", RepoID: replacement.Repository.ID,
+				Platform: "github", PlatformHost: "github.com", RepoOwner: "acme", RepoName: "widget",
+				ItemType: db.WorkspaceItemTypeAdHoc, ItemKey: "adhoc:feature/work",
+				GitHeadRef: "feature/work", WorkspaceBranch: "feature/work",
+				WorktreePath: t.TempDir(), Status: "ready",
+			}))
+			repo, lookupErr := resolver.LookupSelection(requestCtx, route.Provider, route.PlatformHost, route.Owner, route.Name, platformRepoID)
+			if lookupErr != nil {
+				return nil, httpapi.ProviderRouteLookupError(lookupErr)
+			}
+			return repo.Row(), nil
+		},
+	})
+	t.Cleanup(func() {
+		require.NoError(srv.workspaceAPI.Shutdown(context.WithoutCancel(ctx)))
+	})
+
+	result, err := srv.MCPBackend().CreateAdHocWorkspace(ctx, mcpserver.RepositoryIdentity{
+		Provider: "github", PlatformHost: "github.com", PlatformRepoID: testutil.FixtureRepoID("acme", "widget"),
+		Owner: "acme", Name: "widget",
+	}, "feature/work")
+
+	var backendErr *mcpserver.Error
+	require.ErrorAs(err, &backendErr)
+	assert.Equal(string(httpapi.CodeRepoNotFound), backendErr.Code)
+	assert.Empty(result.ID)
 }
 
 func TestMCPBackendRejectsMismatchedStableRepositoryID(t *testing.T) {
