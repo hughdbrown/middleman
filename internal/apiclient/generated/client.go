@@ -47365,7 +47365,7 @@ const (
 	WorkspaceLaunchSpecItemTypePullRequest WorkspaceLaunchSpecItemType = "pull_request"
 )
 
-// WorkspaceRefAgentState Hook-reported state of live agent sessions in the linked workspace.
+// WorkspaceRefAgentState Hook- or ACP-reported state of live agent sessions in the linked workspace.
 type WorkspaceRefAgentState string
 
 const (
@@ -47376,7 +47376,7 @@ const (
 	WorkspaceRefAgentStateWorking  WorkspaceRefAgentState = "working"
 )
 
-// WorkspaceResponseAgentState Hook-reported aggregate state for live agent sessions. Omitted when no live session has reported lifecycle state.
+// WorkspaceResponseAgentState Hook- or ACP-reported aggregate state for live agent sessions. Omitted when no live session has reported lifecycle state.
 type WorkspaceResponseAgentState string
 
 const (
@@ -59143,7 +59143,7 @@ type WorkspaceLaunchSpec struct {
 }
 
 type WorkspaceRef struct {
-	// AgentState Hook-reported state of live agent sessions in the linked workspace.
+	// AgentState Hook- or ACP-reported state of live agent sessions in the linked workspace.
 	AgentState *WorkspaceRefAgentState `json:"agent_state,omitempty"`
 	ID         string                  `json:"id"`
 	Status     string                  `json:"status"`
@@ -59162,10 +59162,10 @@ type WorkspaceResponse struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema *string `json:"$schema,omitempty"`
 
-	// AgentState Hook-reported aggregate state for live agent sessions. Omitted when no live session has reported lifecycle state.
+	// AgentState Hook- or ACP-reported aggregate state for live agent sessions. Omitted when no live session has reported lifecycle state.
 	AgentState *WorkspaceResponseAgentState `json:"agent_state,omitempty"`
 
-	// AgentStateUpdatedAt UTC timestamp of the hook report that produced agent_state.
+	// AgentStateUpdatedAt UTC timestamp of the activity report that produced agent_state.
 	AgentStateUpdatedAt *time.Time `json:"agent_state_updated_at,omitempty"`
 	AssociatedPrNumber  *int64     `json:"associated_pr_number,omitempty"`
 

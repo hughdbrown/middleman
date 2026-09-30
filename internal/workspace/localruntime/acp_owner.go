@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"go.kenn.io/forge/internal/agentactivity"
 	"go.kenn.io/forge/internal/ptyowner"
 	"go.kenn.io/kit/atomicfile"
 )
@@ -27,6 +28,7 @@ type acpOwnerConfig struct {
 	CWD         string
 	Strip       []string
 	Preferences string
+	Activity    string
 	MCP         ACPMCPBinding
 }
 
@@ -47,7 +49,7 @@ func (a *ACP) persistLocked() error {
 	if a.recordPath == "" {
 		return nil
 	}
-	data, err := json.Marshal(acpSavedSession{SessionID: a.sessionID, State: a.state})
+	data, err := json.Marshal(acpSavedSession{SessionID: a.sessionID, State: a.state}, json.Deterministic(true))
 	if err != nil {
 		return err
 	}
@@ -58,23 +60,18 @@ func (a *ACP) persistLocked() error {
 	return err
 }
 
-func (a *ACP) restoreSubmissionIDsLocked(messages []ACPMessage) {
-	// ACP load replays history, but submission IDs belong to Forge. Match the
-	// accepted user messages in order so browser retries stay idempotent.
-	next := 0
-	for i := range a.state.Messages {
-		message := &a.state.Messages[i]
-		if message.Role != "user" {
-			continue
-		}
-		for next < len(messages) {
-			saved := messages[next]
-			next++
-			if saved.Role == "user" && saved.Text == message.Text {
-				message.SubmissionID = saved.SubmissionID
-				break
-			}
-		}
+// restoreTranscriptLocked makes the saved transcript the conversation of
+// record after a reload. A reloaded conversation never starts queued work on
+// its own.
+func (a *ACP) restoreTranscriptLocked(saved ACPState) {
+	a.state.Messages = saved.Messages
+	a.state.Queue = saved.Queue
+	a.state.QueuePaused = len(a.state.Queue) > 0
+	a.state.Plan = saved.Plan
+	// Commands the agent advertised while reloading are current; otherwise
+	// keep the last set until it sends a new one.
+	if a.state.Commands == nil {
+		a.state.Commands = saved.Commands
 	}
 }
 
@@ -89,7 +86,7 @@ func (m *Manager) acpLaunchCommand(ctx context.Context, target LaunchTarget, wor
 	if err := os.MkdirAll(paths.Dir, 0o700); err != nil {
 		return launchCommand{}, err
 	}
-	cfg := acpOwnerConfig{Root: m.acpSessionsDir, Info: SessionInfo{Key: key, WorkspaceID: workspaceID, TargetKey: target.Key, Kind: LaunchTargetACP}, Command: target.Command, CWD: cwd, Strip: m.currentStripEnvVars(), Preferences: m.acpPreferencesPath, MCP: ACPMCPBinding{URL: m.agentMCPURL, Token: m.agentMCPToken}}
+	cfg := acpOwnerConfig{Root: m.acpSessionsDir, Info: SessionInfo{Key: key, WorkspaceID: workspaceID, TargetKey: target.Key, Kind: LaunchTargetACP}, Command: target.Command, CWD: cwd, Strip: m.currentStripEnvVars(), Preferences: m.acpPreferencesPath, Activity: m.agentActivityDir, MCP: ACPMCPBinding{URL: m.agentMCPURL, Token: m.agentMCPToken}}
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return launchCommand{}, err
@@ -274,7 +271,12 @@ func RunACPOwner(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = agent.Stop(context.Background()) }()
+	reported := make(chan struct{})
+	go func() {
+		defer close(reported)
+		reportACPActivity(agentactivity.NewStore(cfg.Activity), agent, cfg.Info.Key, cfg.CWD)
+	}()
+	defer func() { _ = agent.Stop(context.Background()); <-reported }()
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "unix", paths.Socket)
 	if err != nil {
 		return err

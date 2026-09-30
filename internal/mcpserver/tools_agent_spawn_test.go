@@ -198,6 +198,71 @@ func TestSpawnWorkspaceWithAgentResumesExistingRuntimeAfterHookTimeout(t *testin
 	assert.Equal(1, deliveries)
 }
 
+// ACP owners report their session through the activity store rather than a
+// hook, so a spawned ACP chat completes on the same session evidence.
+func TestSpawnWorkspaceWithAgentLaunchesAndResumesACPTarget(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	backend := successfulSpawnBackend("ws-acp", "runtime-acp", "acp-session")
+	acpRuntime := RuntimeSession{
+		Key: "runtime-acp", TargetKey: "chat", Kind: "acp", Status: "running",
+		CreatedAt: time.Date(2026, 8, 7, 15, 0, 0, 0, time.UTC),
+	}
+	backend.listLaunchTargetsFn = func(context.Context) ([]LaunchTarget, error) {
+		return []LaunchTarget{{Key: "chat", Label: "Chat", Kind: "acp", Source: "config", Available: true}}, nil
+	}
+	launches := 0
+	backend.launchWorkspaceRuntimeFn = func(_ context.Context, _ string, target string, _ string) (RuntimeSession, error) {
+		launches++
+		assert.Equal("chat", target)
+		return acpRuntime, nil
+	}
+	backend.getWorkspaceRuntimeFn = func(context.Context, string) (WorkspaceRuntime, error) {
+		return WorkspaceRuntime{Sessions: []RuntimeSession{acpRuntime}}, nil
+	}
+	backend.listWorkspaceAgentSessionsFn = func(context.Context, string) ([]WorkspaceAgentSession, error) {
+		return []WorkspaceAgentSession{{
+			Agent: "acp", SessionID: "acp-session", RuntimeSessionKey: "runtime-acp",
+			TargetKey: "chat", State: "working", UpdatedAt: time.Now().UTC(),
+		}}, nil
+	}
+	// ACP prompts carry no terminal input limits.
+	message := "review\tthis " + strings.Repeat("a", 128<<10)
+	var submitted []string
+	backend.submitInitialMessageFn = func(_ context.Context, req InitialMessageRequest) (InitialMessageStatus, error) {
+		submitted = append(submitted, req.Message)
+		return InitialMessageStatus{State: "delivered", MessageBytes: len(req.Message)}, nil
+	}
+	s := newMCPTestServer(t, backend)
+	input := prSpawnInput(message)
+	input.AgentTarget = ""
+
+	out, err := s.spawnWorkspaceWithAgent(t.Context(), input)
+
+	require.NoError(err)
+	assert.Equal("coding_session_observed", out.Stage)
+	assert.Equal("chat", out.Runtime.TargetKey)
+	require.NotNil(out.CodingSession)
+	assert.Equal("acp", out.CodingSession.Agent)
+	assert.Equal("acp-session", out.CodingSession.SessionID)
+
+	resumed, err := s.spawnWorkspaceWithAgent(t.Context(), spawnWorkspaceWithAgentInput{
+		Resume:      &agentHandoffResume{WorkspaceID: "ws-acp", RuntimeSessionKey: "runtime-acp"},
+		AgentTarget: "chat", InitialMessage: message, Timeout: "2s",
+	})
+
+	require.NoError(err)
+	assert.Equal("coding_session_observed", resumed.Stage)
+	assert.Equal(1, launches)
+	assert.Equal([]string{message, message}, submitted)
+
+	sessions, err := s.listWorkspaceAgentSessions(t.Context(), listWorkspaceAgentSessionsInput{WorkspaceID: "ws-acp"})
+	require.NoError(err)
+	require.Len(sessions.Runtimes, 1)
+	assert.Equal("acp", sessions.Runtimes[0].Protocol)
+	assert.True(sessions.Runtimes[0].HookObserved)
+}
+
 func TestSpawnWorkspaceWithAgentResumesPromptSubmissionOnExistingRuntime(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -581,6 +646,33 @@ func TestSpawnWorkspaceWithAgentReportsRuntimeExitBeforeHookSession(t *testing.T
 	assert.Equal(1, messagePosts)
 }
 
+// A terminal agent's input limits are checked once the target is known, before
+// a workspace is created or a message submitted.
+func TestSpawnWorkspaceWithAgentRefusesTerminalInputLimitsEarly(t *testing.T) {
+	assert := assert.New(t)
+	backend := successfulSpawnBackend("ws-1", "runtime-1", "session-1")
+	created, submitted := 0, 0
+	backend.createPullWorkspaceFn = func(context.Context, ItemIdentity, bool) (Workspace, error) {
+		created++
+		return Workspace{ID: "ws-1", Status: "ready", Created: true}, nil
+	}
+	backend.submitInitialMessageFn = func(context.Context, InitialMessageRequest) (InitialMessageStatus, error) {
+		submitted++
+		return InitialMessageStatus{State: "delivered"}, nil
+	}
+	s := newMCPTestServer(t, backend)
+
+	_, err := s.spawnWorkspaceWithAgent(t.Context(), prSpawnInput(strings.Repeat("a", (64<<10)+1)))
+	require.ErrorContains(t, err, "64 KiB")
+	_, err = s.spawnWorkspaceWithAgent(t.Context(), spawnWorkspaceWithAgentInput{
+		Resume:      &agentHandoffResume{WorkspaceID: "ws-1", RuntimeSessionKey: "runtime-1"},
+		AgentTarget: "codex", InitialMessage: "review\tthis", Timeout: "2s",
+	})
+	require.ErrorContains(t, err, "control character")
+	assert.Zero(created)
+	assert.Zero(submitted)
+}
+
 func TestSpawnWorkspaceWithAgentRejectsInvalidInputBeforeBackendCalls(t *testing.T) {
 	calls := 0
 	backend := &fakeBackend{listLaunchTargetsFn: func(context.Context) ([]LaunchTarget, error) {
@@ -662,6 +754,11 @@ func TestNormalizeSpawnInitialMessage(t *testing.T) {
 	message, err := normalizeSpawnInitialMessage("first\r\nsecond")
 	require.NoError(t, err)
 	assert.Equal(t, "first\nsecond", message)
-	_, err = normalizeSpawnInitialMessage(strings.Repeat("a", (64<<10)+1))
-	require.ErrorContains(t, err, "64 KiB")
+	large := strings.Repeat("a", (64<<10)+1)
+	message, err = normalizeSpawnInitialMessage(large)
+	require.NoError(t, err, "size is a terminal limit, checked once the target is known")
+	require.ErrorContains(t, checkInitialMessageForProtocol(message, "terminal"), "64 KiB")
+	require.ErrorContains(t, checkInitialMessageForProtocol("review\tthis", "terminal"), "control character")
+	require.NoError(t, checkInitialMessageForProtocol(message, "acp"))
+	require.NoError(t, checkInitialMessageForProtocol("review\tthis", "acp"))
 }

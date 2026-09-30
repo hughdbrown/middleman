@@ -1,25 +1,48 @@
 <!-- Copied from the shared console chat; imports and touch sizing adapted for Forge. -->
 <script lang="ts">
-  import { Ban, Check, ChevronDown, Clock, Wrench, X } from "@lucide/svelte"
+  import { Ban, Bot, Check, ChevronDown, Clock, Wrench, X } from "@lucide/svelte"
   import { Spinner } from "@kenn-io/kit-ui"
-  import type { ChatMessage } from "./chat-types.js"
+  import ChatToolDetails from "./ChatToolDetails.svelte"
+  import { toolStatus, type ChatMessage } from "./chat-types.js"
 
-  let { messages }: { messages: ChatMessage[] } = $props()
+  let {
+    messages,
+    childCounts = {},
+  }: {
+    messages: ChatMessage[]
+    /** Tool calls made inside each sub-agent, keyed by its toolCallId. */
+    childCounts?: Readonly<Record<string, number>>
+  } = $props()
   const id = $props.id()
   let open = $state(false)
+  let expanded = $state<Record<number, boolean>>({})
+  function hasDetails(message: ChatMessage): boolean {
+    return !!(
+      message.kind ||
+      message.locations?.length ||
+      message.toolContent?.length ||
+      message.rawInput ||
+      message.rawOutput
+    )
+  }
 
   const failed = $derived(
-    messages.filter((message) => message.status === "failed").length,
+    messages.filter((message) => toolStatus(message) === "failed").length,
   )
   const running = $derived(
     messages.some(
       (message) =>
-        message.status === "pending" || message.status === "in_progress",
+        toolStatus(message) === "pending" ||
+        toolStatus(message) === "in_progress",
     ),
+  )
+  const subagents = $derived(
+    messages.filter((message) => message.subagent).length,
   )
   const summary = $derived(
     [
       `${messages.length} ${messages.length === 1 ? "tool" : "tools"}`,
+      subagents ? `${subagents} ${subagents === 1 ? "sub-agent" : "sub-agents"}` : "",
       failed ? `${failed} failed` : "",
       running ? "running" : "",
     ]
@@ -37,7 +60,10 @@
     aria-controls={`${id}-list`}
     onclick={() => (open = !open)}
   >
-    {#if running}<Spinner size={12} label="Tools running" />{:else}<Wrench
+    {#if running}<Spinner size={12} label="Tools running" />{:else if subagents}<Bot
+        size={12}
+        aria-hidden="true"
+      />{:else}<Wrench
         size={12}
         aria-hidden="true"
       />{/if}
@@ -47,25 +73,55 @@
   {#if open}
     <ul id={`${id}-list`} class="list">
       {#each messages as message, index (index)}
-        <li class={`status-${message.status ?? "completed"}`}>
+        {@const status = toolStatus(message)}
+        {@const expandable = hasDetails(message)}
+        <li class={`status-${status}`}>
+          {#snippet row()}
           <span class="icon" aria-hidden="true">
-            {#if message.status === "failed"}<X size={12} />
-            {:else if message.status === "in_progress"}<Spinner
+            {#if status === "failed"}<X size={12} />
+            {:else if status === "in_progress"}<Spinner
                 size={12}
                 label=""
               />
-            {:else if message.status === "pending"}<Clock size={12} />
-            {:else if message.status === "cancelled"}<Ban size={12} />
+            {:else if status === "pending"}<Clock size={12} />
+            {:else if status === "cancelled"}<Ban size={12} />
             {:else}<Check size={12} />{/if}
           </span>
-          <span class="tool-name">{message.text}</span>
+          <span class="tool-name">
+            {#if message.subagent}
+              {@const children = message.toolCallId ? (childCounts[message.toolCallId] ?? 0) : 0}
+              <span class="subagent"
+                ><Bot size={12} aria-hidden="true" />{children
+                  ? `Sub-agent · ${children} ${children === 1 ? "tool call" : "tool calls"}`
+                  : "Sub-agent"}</span
+              >
+            {/if}
+            {message.text}
+          </span>
           <span
             class="state"
             title={message.createdAt
               ? new Date(message.createdAt).toLocaleString()
               : undefined}
-            >{message.status?.replaceAll("_", " ") ?? "completed"}</span
+            >{status.replaceAll("_", " ")}</span
           >
+          {/snippet}
+          {#if expandable}
+            <button
+              type="button"
+              class="row row--button"
+              aria-expanded={!!expanded[index]}
+              aria-controls={`${id}-tool-${index}`}
+              onclick={() => (expanded[index] = !expanded[index])}
+            >
+              {@render row()}
+            </button>
+            {#if expanded[index]}
+              <ChatToolDetails {message} id={`${id}-tool-${index}`} />
+            {/if}
+          {:else}
+            <div class="row">{@render row()}</div>
+          {/if}
         </li>
       {/each}
     </ul>
@@ -135,12 +191,28 @@
     border-radius: var(--radius-md);
     font-size: var(--font-size-xs);
   }
-  li {
+  .row {
     display: grid;
     grid-template-columns: 14px minmax(0, 1fr) auto;
     align-items: baseline;
     gap: var(--space-4);
     padding: var(--space-3) var(--space-5);
+  }
+  .row--button {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .row--button:hover {
+    background: var(--bg-surface-hover);
+  }
+  .row--button:focus-visible {
+    outline: var(--focus-ring);
+    outline-offset: -2px;
   }
   .icon {
     display: inline-flex;
@@ -161,6 +233,17 @@
     overflow-wrap: anywhere;
     color: var(--text-primary);
   }
+  .subagent {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    margin-right: var(--space-3);
+    padding: 0 var(--space-2);
+    border: 1px solid color-mix(in srgb, var(--accent-purple) 35%, var(--border-default));
+    border-radius: var(--radius-sm);
+    color: var(--accent-purple);
+    white-space: nowrap;
+  }
   .state {
     color: var(--text-secondary);
     white-space: nowrap;
@@ -168,6 +251,7 @@
 
   @media (pointer: coarse) {
     .chip { min-height: 44px; }
+    .row--button { min-height: var(--mobile-chrome-hit-target); }
   }
 
   @media (prefers-reduced-motion: reduce) {

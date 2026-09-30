@@ -46,11 +46,49 @@ Rules:
   into the latest saved preferences (`internal/workspace/localruntime/acp_settings.go`).
 - ACP owners and their SDK connections survive daemon shutdown under tmux/ptyowner;
   retain active turns, permissions, and chat state (`internal/workspace/localruntime/acp_owner.go::RunACPOwner`).
+- Owner-to-client ACP state changes are not bridged across upgrades: an owner started by an
+  older binary may fail under a newer UI until the agent is relaunched. Do not add
+  compatibility fallbacks for it (maintainer decision; `frontend/src/lib/components/acp/chat-types.ts::ChatStateSchema`).
 - Reattach ACP only when its workspace opens, never at daemon startup; load the saved
   ACP session only after its owner exits (`internal/server/workspaceapi/acp.go::Handler.restoreWorkspaceACP`).
-- ACP messages and pending permissions share a 4 MiB JSON budget; retain the latest
-  submitted prompt for reconnect deduplication and disclose removed history in chat
-  (`internal/workspace/localruntime/acp.go::ACP.trimStateToBytesLocked`).
+- A session this daemon saw exit on its own is neither restored nor listed, even before its
+  stored record is forgotten; only an owner that died while no daemon was attached is reloaded
+  (`internal/workspace/localruntime/manager.go::Manager.Exited`).
+- The ACP owner keeps the whole transcript and never deletes messages. State
+  updates carry only the latest message window with its absolute offset and total
+  count; clients page earlier messages in with `history` requests answered to the
+  asking connection (`internal/workspace/localruntime/acp_delivery.go::ACP.publishedStateLocked`).
+- A running ACP turn never rejects input: sends queue, and steering is used only when
+  initialize advertises it. The queue drains one prompt per `end_turn` and pauses on any
+  other stop, error, exit, or reload (`internal/workspace/localruntime/acp_queue.go::ACP.submit`).
+- A turn the agent starts after a steer keeps the chat busy from its first active thread
+  status until the thread goes idle, even when that status arrives after the prompt completed.
+  Once the original prompt has completed, any idle ends that turn, active or not: the SDK
+  handles every status sent before a response before returning it. A stopped or failed
+  original prompt ends the takeover turn at once.
+  Until a status confirms it, the turn ends with the prompt, so an agent that never reports
+  status cannot leave the chat busy (`internal/workspace/localruntime/acp_queue.go::ACP.steerLocked`).
+- ACP owners, not the daemon, write chat activity reports so sidebar state survives
+  daemon downtime; a reloaded session starts idle, never newly done
+  (`internal/workspace/localruntime/acp_activity.go::reportACPActivity`).
+- Sub-agents come from legacy tool-call markers; the Go SDK cannot decode draft native
+  subagent updates (`internal/workspace/localruntime/acp_client.go::toolCallLineage`).
+- Publish streamed ACP text only in finished markdown blocks, paced at 400 ms and released
+  before tool activity, when the agent goes quiet, and at turn end; never per token
+  (`internal/workspace/localruntime/acp_delivery.go::ACP.deliverTextLocked`).
+- The saved ACP transcript is the conversation of record: drop `session/load` replay, and
+  continue in a new session when the agent lacks `loadSession`
+  (`internal/workspace/localruntime/acp.go::startACPSession`).
+- Keep every ACP content type: a changed `messageId` starts a new message, and non-text blocks
+  and thoughts are their own entries (`internal/workspace/localruntime/acp_client.go::ACP.appendContentLocked`).
+- Never cap or truncate ACP data in either direction (prompts, commands, plans, media, tool
+  output, errors, websocket frames, command backlogs); a session too large for the UI pages older
+  history in. The chat socket's reader never waits on queued prompts, so a stop or answer
+  always gets through, and every accepted prompt, including a deduplicated retry, is
+  acknowledged to its sender; clients never infer acceptance only from the transcript window
+  (`internal/server/workspaceapi/acp.go::serveACP`).
+- Command output arrives as Zed terminal tool-call metadata (`terminal_output_delta`,
+  `terminal_exit`), keyed by terminal ID (`internal/workspace/localruntime/acp_content.go::applyTerminalMeta`).
 - Project-worktree runtime APIs expose terminal targets only. ACP targets require
   the workspace chat transport and are neither listed nor launchable
   through project-worktree runtime routes (`internal/server/workspaceapi/projects_handlers.go`).

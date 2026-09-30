@@ -3,6 +3,7 @@ package localruntime
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"net"
 	"net/rpc"
 	"sync"
@@ -31,7 +32,9 @@ type acpOwnerRPC struct {
 func (o *acpOwnerRPC) Snapshot(_ struct{}, reply *ACPUpdate) error {
 	o.agent.mu.Lock()
 	defer o.agent.mu.Unlock()
-	data, err := json.Marshal(o.agent.state)
+	// Sorted map keys keep agent-provided objects, such as form schemas,
+	// stable across snapshots.
+	data, err := json.Marshal(o.agent.publishedStateLocked(), json.Deterministic(true))
 	*reply = ACPUpdate{Revision: o.agent.revision, State: data, ExitCode: o.agent.exitCode}
 	select {
 	case <-o.agent.done:
@@ -68,7 +71,27 @@ func (o *acpOwnerRPC) Watch(request ACPWatch, reply *ACPUpdate) error {
 	}
 }
 
-func (o *acpOwnerRPC) Command(command ACPCommand, _ *struct{}) error { return o.agent.Command(command) }
+// ACPCommandReply types the one command failure callers branch on. net/rpc
+// reduces returned errors to text, so it travels as a successful reply.
+type ACPCommandReply struct{ Unavailable bool }
+
+// ACPHistoryRequest selects transcript messages [Before-Limit, Before).
+type ACPHistoryRequest struct{ Before, Limit int }
+
+func (o *acpOwnerRPC) History(request ACPHistoryRequest, reply *[]byte) error {
+	data, err := o.agent.History(request.Before, request.Limit)
+	*reply = data
+	return err
+}
+
+func (o *acpOwnerRPC) Command(command ACPCommand, reply *ACPCommandReply) error {
+	err := o.agent.Command(command)
+	if errors.Is(err, ErrACPAgentUnavailable) {
+		reply.Unavailable = true
+		return nil
+	}
+	return err
+}
 
 func (o *acpOwnerRPC) Bind(binding ACPMCPBinding, _ *struct{}) error { return o.proxy.Bind(binding) }
 
@@ -106,7 +129,20 @@ func (a *acpAttachment) Snapshot() ([]byte, error) {
 }
 
 func (a *acpAttachment) Command(command ACPCommand) error {
-	return a.client.Call("ACP.Command", command, &struct{}{})
+	var reply ACPCommandReply
+	if err := a.client.Call("ACP.Command", command, &reply); err != nil {
+		return err
+	}
+	if reply.Unavailable {
+		return ErrACPAgentUnavailable
+	}
+	return nil
+}
+
+func (a *acpAttachment) History(before, limit int) ([]byte, error) {
+	var reply []byte
+	err := a.client.Call("ACP.History", ACPHistoryRequest{Before: before, Limit: limit}, &reply)
+	return reply, err
 }
 
 func (a *acpAttachment) Prompt(text string) error {

@@ -94,7 +94,27 @@ func TestACPOwnerSurvivesDaemonShutdown(t *testing.T) {
 	}
 }
 
+// The saved transcript is the conversation of record after a reload. The
+// agent's history replay is dropped, and an agent that cannot load sessions
+// continues the conversation in a new session instead of failing to start.
 func TestACPReloadsSavedSessionOnlyAfterOwnerExit(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		noLoad    string
+		sessions  string
+		errorText string
+	}{
+		{name: "load", sessions: "session/new\nsession/load\n"},
+		{name: "no load capability", noLoad: "1", sessions: "session/new\nsession/new\n", errorText: "cannot reload its previous session"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("KENN_FORGE_ACP_NO_LOAD", tc.noLoad)
+			testACPReloadsSavedSession(t, tc.sessions, tc.errorText)
+		})
+	}
+}
+
+func testACPReloadsSavedSession(t *testing.T, sessions, errorText string) {
 	t.Setenv("KENN_FORGE_LOCALRUNTIME_HELPER", "1")
 	t.Setenv("KENN_FORGE_ACP_FIXTURE", "1")
 	dir := t.TempDir()
@@ -108,6 +128,12 @@ func TestACPReloadsSavedSessionOnlyAfterOwnerExit(t *testing.T) {
 	agent, err := first.ACP("workspace", info.Key)
 	require.NoError(t, err)
 	require.NoError(t, agent.Command(ACPCommand{Type: "prompt", Text: "remember", ID: "saved-submission"}))
+	// The owner saves the transcript when the turn ends.
+	require.Eventually(t, func() bool {
+		data, err := agent.Snapshot()
+		var state ACPState
+		return err == nil && json.Unmarshal(data, &state) == nil && !state.Busy && len(state.Messages) == 2
+	}, 5*time.Second, 10*time.Millisecond)
 	first.Shutdown()
 	pidText, err := os.ReadFile(filepath.Join(dir, "pid"))
 	require.NoError(t, err)
@@ -124,11 +150,24 @@ func TestACPReloadsSavedSessionOnlyAfterOwnerExit(t *testing.T) {
 	data, err := resumed.Snapshot()
 	require.NoError(t, err)
 	assert := assert.New(t)
-	assert.Contains(string(data), "restored answer")
-	assert.Contains(string(data), "saved-submission")
+	var state ACPState
+	require.NoError(t, json.Unmarshal(data, &state))
+	require.Len(t, state.Messages, 2, "the replay must not duplicate the saved transcript")
+	assert.Equal("saved-submission", state.Messages[0].SubmissionID)
+	assert.Equal("remember", state.Messages[0].Text)
+	assert.Equal("Hello workspace", state.Messages[1].Text)
+	assert.NotContains(string(data), "restored answer")
+	if errorText == "" {
+		assert.Empty(state.Error)
+		// Commands the agent advertises during the reload are current state,
+		// not replayed history.
+		assert.Equal([]ACPCommandInfo{{Name: "review", Description: "Review changes"}}, state.Commands)
+	} else {
+		assert.Contains(state.Error, errorText)
+	}
 	log, err := os.ReadFile(filepath.Join(dir, "sessions"))
 	require.NoError(t, err)
-	assert.Equal("session/new\nsession/load\n", string(log))
+	assert.Equal(sessions, string(log))
 	require.NoError(t, resumed.Command(ACPCommand{Type: "prompt", Text: "remember", ID: "saved-submission"}))
 	require.NoError(t, second.Detach("workspace", info.Key))
 	require.NoError(t, second.StopDormantACP(t.Context(), "workspace", info.Key))
@@ -215,4 +254,42 @@ func TestACPReattachesAfterDaemonProcessExits(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal("session/new\n", string(sessions))
 	assert.NotContains(string(data), "restored answer")
+}
+
+// An agent this daemon saw exit on its own is finished: a workspace open that
+// lands before the stored record is forgotten must not relaunch it. (An agent
+// that dies while no daemon is attached is still restored; see
+// TestACPReloadsSavedSessionOnlyAfterOwnerExit.)
+func TestACPDoesNotRestoreAnAgentThatExited(t *testing.T) {
+	t.Setenv("KENN_FORGE_LOCALRUNTIME_HELPER", "1")
+	t.Setenv("KENN_FORGE_ACP_FIXTURE", "1")
+	t.Setenv("KENN_FORGE_ACP_EXIT_ON_PROMPT", "7")
+	dir := t.TempDir()
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	exits := make(chan SessionInfo, 1)
+	options := withTestPtyOwnerRuntime(t, Options{
+		ACPSessionsDir: filepath.Join(dir, "acp"),
+		Targets:        ResolveLaunchTargets([]config.Agent{{Key: "chat", Protocol: "acp", Command: []string{executable, "-test.run=^TestACPStdioHelper$"}}}, nil, nil),
+		OnSessionExit:  func(info SessionInfo) { exits <- info },
+	})
+	manager := newACPTestManager(t, options)
+	info, err := manager.Launch(t.Context(), "workspace", dir, "chat")
+	require.NoError(t, err)
+	agent, err := manager.ACP("workspace", info.Key)
+	require.NoError(t, err)
+	require.NoError(t, agent.Command(ACPCommand{Type: "prompt", Text: "exit"}))
+	select {
+	case <-exits:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "ACP exit was not reported")
+	}
+	assert.True(t, manager.Exited(info.Key))
+	// The owner is fully gone, as when the reopen comes a moment later.
+	require.Eventually(t, func() bool { return !options.PtyOwnerRuntime.HasState(info.Key) }, 10*time.Second, 10*time.Millisecond)
+
+	err = manager.RestoreRuntimeSessions(t.Context(), []RestoredRuntimeSession{{WorkspaceID: "workspace", SessionKey: info.Key, TargetKey: "chat", Kind: LaunchTargetACP, TmuxSession: info.TmuxSession, CWD: dir, CreatedAt: info.CreatedAt}})
+	require.ErrorIs(t, err, ErrSessionUnavailable)
+	_, err = manager.ACP("workspace", info.Key)
+	assert.Error(t, err, "the exited chat was relaunched")
 }

@@ -150,6 +150,27 @@ Interactive surfaces must agree on which item is selected.
   (`frontend/src/lib/stores/workspace-quick-actions.ts::sortQuickActionsByLabel`).
 - Workspace quick actions use one lightning icon beside Play, without a visible label
   or chevron, to preserve tab-strip space (`frontend/src/lib/components/terminal/LaunchMenu.svelte`).
+- The session launcher groups ACP chat targets in their own section apart from terminal
+  targets (`frontend/src/lib/components/terminal/WorkspaceHome.svelte`).
+- The ACP composer never blocks while a turn runs; only a disconnected chat disables it.
+  Busy input steers when the agent supports it, otherwise queues
+  (`frontend/src/lib/components/acp/ACPWorkspace.svelte`).
+- ACP message time and copy live in a hover/focus gutter left of the message in panes wide
+  enough to reserve it; the gutter never shifts layout. Narrower panes (including phones)
+  show them instead as one always-visible muted line under each message on its text edge,
+  with no rule or stripe (`frontend/src/lib/components/acp/ChatMessageView.svelte`).
+- The ACP chat holds only a window of the transcript; earlier messages page in from the top
+  (button or scroll) without moving the message the reader is looking at
+  (`frontend/src/lib/components/acp/chat-session.ts::makeChatSession`).
+- Everything in the ACP pane (conversation, questions, notices, composer) shares one reading
+  column; agent questions render inline in it. Turn status above the composer is one line of
+  chips that expand on demand (`frontend/src/lib/components/acp/ChatDockRail.svelte`).
+- Composer popovers such as the slash menu are kit popover cards sized to their content and
+  anchored to the composer edge, never composer-wide; rows are one line
+  (`frontend/src/lib/components/acp/ChatCommandMenu.svelte`).
+- Agent-provided ACP content reaches the page only as text, sanitized markdown, or checked
+  image/audio data URLs; only http(s) and mailto links are clickable
+  (`frontend/src/lib/components/acp/chat-content.ts`).
 - Inline surface claims come only from live selection effects (the list
   views' claim effects, which react to recorded overrides); async responses
   record overrides and tombstones but never claim a surface themselves, and

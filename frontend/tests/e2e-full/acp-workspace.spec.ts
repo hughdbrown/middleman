@@ -144,18 +144,23 @@ test("ACP workspace streams, approves tools, and reconnects on desktop and phone
     await chat.getByRole("button", { name: "Agent settings", exact: true }).click();
     await chat.getByRole("textbox", { name: "Message agent" }).fill("Inspect the workspace");
     await chat.getByRole("button", { name: "Send", exact: true }).click();
-    await expect(chat.getByText("I am working in the", { exact: false })).toBeVisible();
+    await expect(
+      chat.getByRole("log", { name: "Conversation" }).getByText("I am working in the", { exact: false }),
+    ).toBeVisible();
     await expect(chat.getByRole("button", { name: "Allow once" })).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath("acp-desktop.png") });
     await chat.getByRole("button", { name: "Allow once" }).click();
-    await expect(chat.getByText("Permission received. The turn is complete.")).toBeVisible();
+    // An answered permission prompt leaves the conversation.
+    await expect(chat.getByRole("button", { name: "Allow once" })).toHaveCount(0);
+    await expect(
+      chat.getByRole("log", { name: "Conversation" }).getByText("Permission received. The turn is complete."),
+    ).toBeVisible();
     await page.reload();
-    await expect(chat.getByText("Permission received. The turn is complete.")).toBeVisible();
-    await chat.getByRole("textbox", { name: "Message agent" }).fill("é".repeat(32769));
-    await expect(chat.getByText("Message must not exceed 65,536 bytes.")).toBeVisible();
-    await expect(chat.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
-    // An accepted 64 KiB prompt exceeds 128 KiB once JSON escapes are included.
-    await chat.getByRole("textbox", { name: "Message agent" }).fill('"'.repeat(65536));
+    await expect(
+      chat.getByRole("log", { name: "Conversation" }).getByText("Permission received. The turn is complete."),
+    ).toBeVisible();
+    // Prompts have no size limit, even once JSON escapes double their frame.
+    await chat.getByRole("textbox", { name: "Message agent" }).fill('"'.repeat(256 * 1024));
     await chat.getByRole("button", { name: "Send", exact: true }).click();
     await expect(chat.getByRole("button", { name: "Allow once" })).toBeVisible();
     await chat.getByRole("button", { name: "Allow once" }).click();
@@ -179,8 +184,10 @@ test("ACP workspace streams, approves tools, and reconnects on desktop and phone
       await mobileChat.getByRole("button", { name: "Send", exact: true }).tap();
       await expect(mobileChat.getByRole("button", { name: "Allow once" })).toBeVisible();
       expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-      const send = await mobileChat.getByRole("button", { name: "Send", exact: true }).boundingBox();
-      expect(send?.height).toBe(40);
+      // A running turn never locks the composer; its primary action queues instead.
+      await expect(mobileChat.getByRole("textbox", { name: "Message agent" })).toBeEnabled();
+      const queue = await mobileChat.getByRole("button", { name: "Queue message", exact: true }).boundingBox();
+      expect(queue?.height).toBe(40);
       await expect(mobileChat.getByRole("textbox", { name: "Message agent" })).toHaveCSS("font-size", "16px");
       await expect(mobileChat.locator(".message-body").last()).toHaveCSS("font-size", "14px");
       await mobile.screenshot({ path: testInfo.outputPath("acp-phone.png") });

@@ -2,6 +2,7 @@ package localruntime
 
 import (
 	"context"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -12,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	acpsdk "github.com/coder/acp-go-sdk"
 
@@ -22,6 +22,9 @@ import (
 // ACPChat is the daemon attachment to an execution-host-owned conversation.
 type ACPChat interface {
 	Snapshot() ([]byte, error)
+	// History returns earlier transcript messages [before-limit, before) as
+	// a {"history": ...} client frame.
+	History(before, limit int) ([]byte, error)
 	Subscribe() (<-chan struct{}, func())
 	Command(ACPCommand) error
 	Prompt(string) error
@@ -44,6 +47,7 @@ type ACP struct {
 	promptWritten  chan error
 	nextPermission int
 	permissions    map[string]chan acpsdk.RequestPermissionOutcome
+	elicitations   map[string]chan acpsdk.UnstableCreateElicitationResponse
 	subscribers    map[chan struct{}]struct{}
 	state          ACPState
 	saveConfig     func(map[string]string) error
@@ -52,9 +56,47 @@ type ACP struct {
 	promptIndex    *int
 	recordPath     string
 	revision       uint64
+	// turnCompleted records a finished prompt turn in this process. A loaded
+	// session starts idle so reopening it never announces a new completion.
+	turnCompleted bool
+	// heldBytes is the unpublished suffix of the last assistant message; see
+	// acp_delivery.go. heldSeq changes whenever a new message starts holding.
+	heldBytes        int
+	heldSeq          uint64
+	lastTextDelivery time.Time
+	textDelivery     *time.Timer
+	// replaying drops the agent's history replay during session/load: the
+	// saved transcript, not the replay, is the conversation of record.
+	replaying bool
+	// external is a turn the agent started itself after a steering request.
+	// It ends when the agent reports an idle thread after an active one.
+	external     *acpExternalTurn
+	threadStatus string
+	// reportsThreadStatus records that the agent reports Codex thread
+	// status, the only signal for when a turn it started itself ends.
+	reportsThreadStatus bool
+	// takeoverPending records a turn the agent started after a steer that
+	// no thread status has confirmed yet; the next active status claims it.
+	takeoverPending bool
 }
 
-const maxACPStateBytes = 4 << 20
+// acpExternalTurn is a turn the agent started after a steer. Until it reports
+// active, an idle status may still belong to the original turn; once the
+// original prompt has completed, any idle is this turn's, because the SDK
+// handles every status the agent sent before a response before returning it.
+type acpExternalTurn struct {
+	active     bool
+	promptDone bool
+}
+
+// ErrACPAgentUnavailable rejects a prompt before anything is written to a
+// disconnected agent. The owner RPC carries only its text, so attachments
+// restore the sentinel. A running turn is never a reason to reject input.
+var ErrACPAgentUnavailable = errors.New("ACP agent is disconnected")
+
+// errACPNotIdle stops a turn from starting over another turn, a steering
+// request, or a settings change; callers queue the prompt instead.
+var errACPNotIdle = errors.New("ACP agent is not idle")
 
 type ACPMessage struct {
 	SubmissionID string `json:"submissionId,omitempty"`
@@ -63,6 +105,20 @@ type ACPMessage struct {
 	CreatedAt    string `json:"createdAt"`
 	ToolCallID   string `json:"toolCallId,omitempty"`
 	Status       string `json:"status,omitempty"`
+	// Subagent marks a tool call that runs a delegated agent. ParentToolCallID
+	// links a tool call made inside such a subagent back to it.
+	Subagent         bool   `json:"subagent,omitempty"`
+	ParentToolCallID string `json:"parentToolCallId,omitempty"`
+	// MessageID is the agent's message identity; a new ID starts a new message.
+	MessageID string `json:"messageId,omitempty"`
+	// Content is a non-text block the agent sent, shown as its own entry.
+	Content *ACPContent `json:"content,omitempty"`
+	// Tool call details.
+	Kind        string            `json:"kind,omitempty"`
+	ToolContent []ACPToolContent  `json:"toolContent,omitempty"`
+	Locations   []ACPToolLocation `json:"locations,omitempty"`
+	RawInput    string            `json:"rawInput,omitempty"`
+	RawOutput   string            `json:"rawOutput,omitempty"`
 }
 type ACPPermissionOption struct {
 	OptionID string `json:"optionId"`
@@ -73,6 +129,28 @@ type ACPPermission struct {
 	ID      string                `json:"id"`
 	Title   string                `json:"title"`
 	Options []ACPPermissionOption `json:"options"`
+}
+
+// ACPElicitation is a pending form-mode elicitation. Its schema is the
+// restricted primitive-property JSON Schema the agent sent.
+type ACPElicitation struct {
+	ID      string               `json:"id"`
+	Message string               `json:"message"`
+	Schema  ACPElicitationSchema `json:"schema"`
+}
+type ACPElicitationSchema struct {
+	Title       string         `json:"title,omitempty"`
+	Description string         `json:"description,omitempty"`
+	Properties  map[string]any `json:"properties"`
+	Required    []string       `json:"required,omitempty"`
+}
+
+// ACPCommandInfo is one slash command the agent currently advertises. Users
+// invoke it by sending "/name" followed by any input as a prompt.
+type ACPCommandInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	InputHint   string `json:"inputHint,omitempty"`
 }
 type ACPConfigChoice struct {
 	Value   string            `json:"value,omitempty"`
@@ -90,21 +168,55 @@ type ACPConfigOption struct {
 	Options      []ACPConfigChoice `json:"options"`
 }
 type ACPState struct {
-	ConfigOptions    []ACPConfigOption `json:"configOptions"`
-	Configuring      bool              `json:"configuring"`
-	Messages         []ACPMessage      `json:"messages"`
-	Permissions      []ACPPermission   `json:"permissions"`
-	HistoryTruncated bool              `json:"historyTruncated"`
-	Busy             bool              `json:"busy"`
-	Connected        bool              `json:"connected"`
-	Error            string            `json:"error"`
+	ConfigOptions []ACPConfigOption `json:"configOptions"`
+	Commands      []ACPCommandInfo  `json:"commands"`
+	// Plan is the agent's current plan; each update replaces it.
+	Plan        []ACPPlanEntry `json:"plan"`
+	Configuring bool           `json:"configuring"`
+	Messages    []ACPMessage   `json:"messages"`
+	// MessageOffset is the transcript index of Messages[0] in a published
+	// update; MessageCount is the length of the whole transcript.
+	MessageOffset int              `json:"messageOffset"`
+	MessageCount  int              `json:"messageCount"`
+	Permissions   []ACPPermission  `json:"permissions"`
+	Elicitations  []ACPElicitation `json:"elicitations"`
+	Busy          bool             `json:"busy"`
+	// Stopping is true from a stop request until the turn ends.
+	Stopping  bool   `json:"stopping"`
+	Connected bool   `json:"connected"`
+	Error     string `json:"error"`
+	// ErrorCode and ErrorData keep an agent's JSON-RPC error details.
+	ErrorCode *int   `json:"errorCode,omitempty"`
+	ErrorData string `json:"errorData,omitempty"`
+	// Queue holds prompts waiting for the running turn to end. It drains one
+	// prompt per completed turn and pauses when a turn does not end normally.
+	Queue       []ACPQueuedPrompt `json:"queue"`
+	QueuePaused bool              `json:"queuePaused"`
+	// SteeringSupported reports the agent's steering extension. Steering is
+	// true while a steering request is in flight.
+	SteeringSupported bool `json:"steeringSupported"`
+	Steering          bool `json:"steering"`
+}
+type ACPQueuedPrompt struct {
+	ID   string `json:"id"`
+	Text string `json:"text"`
 }
 type ACPCommand struct {
-	Type     string `json:"type"`
+	Type string `json:"type"`
+	// Mode chooses how a prompt is submitted: send (the default), queue, or
+	// steer. A send while a turn is running queues instead of failing.
+	Mode     string `json:"mode,omitempty"`
 	Text     string `json:"text,omitempty"`
 	ID       string `json:"id,omitempty"`
 	OptionID string `json:"optionId,omitempty"`
 	Value    string `json:"value,omitempty"`
+	// Before and Limit select a history page.
+	Before int `json:"before,omitempty"`
+	Limit  int `json:"limit,omitempty"`
+	// Action and Content answer an elicitation. Content is the accepted form
+	// values as a JSON object; it stays raw so the owner RPC can carry it.
+	Action  string         `json:"action,omitempty"`
+	Content jsontext.Value `json:"content,omitempty"`
 }
 
 func startACPSession(ctx context.Context, command []string, cwd string, extraStrip []string, mcpServers []acpsdk.McpServer, saved *acpSavedSession) (*ACP, error) {
@@ -127,7 +239,7 @@ func startACPSession(ctx context.Context, command []string, cwd string, extraStr
 	}
 	// Diagnostics are not protocol messages and must never enter the chat stream.
 	cmd.Stderr = os.Stderr
-	a := &ACP{cmd: cmd, stdin: stdin, stdout: stdout, done: make(chan struct{}), permissions: make(map[string]chan acpsdk.RequestPermissionOutcome), subscribers: make(map[chan struct{}]struct{}), exitCode: -1}
+	a := &ACP{cmd: cmd, stdin: stdin, stdout: stdout, done: make(chan struct{}), permissions: make(map[string]chan acpsdk.RequestPermissionOutcome), elicitations: make(map[string]chan acpsdk.UnstableCreateElicitationResponse), subscribers: make(map[chan struct{}]struct{}), exitCode: -1}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
@@ -140,6 +252,12 @@ func startACPSession(ctx context.Context, command []string, cwd string, extraStr
 	initialized, err := a.client.Initialize(initCtx, acpsdk.InitializeRequest{
 		ProtocolVersion: acpsdk.ProtocolVersionNumber,
 		ClientInfo:      &acpsdk.Implementation{Name: "kenn-forge", Version: "1"},
+		// Forge renders form elicitations in chat; URL mode is not offered.
+		// Command output streams as terminal_output_delta tool call metadata.
+		ClientCapabilities: acpsdk.ClientCapabilities{
+			Elicitation: &acpsdk.ElicitationCapabilities{Form: &acpsdk.ElicitationFormCapabilities{}},
+			Meta:        map[string]any{"terminal_output_delta": true},
+		},
 	})
 	if err == nil && initialized.ProtocolVersion != acpsdk.ProtocolVersionNumber {
 		err = fmt.Errorf("unsupported ACP protocol version %d (expected %d)", initialized.ProtocolVersion, acpsdk.ProtocolVersionNumber)
@@ -148,26 +266,38 @@ func startACPSession(ctx context.Context, command []string, cwd string, extraStr
 		err = errors.New("this ACP agent does not accept HTTP MCP servers required by Forge")
 	}
 	if err == nil {
-		if saved == nil {
+		steering, _ := initialized.Meta["steering"].(map[string]any)
+		a.state.SteeringSupported = steering["supported"] == true
+		// An agent that cannot load sessions continues the saved conversation in
+		// a new session rather than failing to start.
+		if saved == nil || !initialized.AgentCapabilities.LoadSession {
 			var created acpsdk.NewSessionResponse
 			created, err = a.client.NewSession(initCtx, acpsdk.NewSessionRequest{Cwd: cwd, McpServers: mcpServers})
 			if err == nil && created.SessionId == "" {
 				err = errors.New("ACP agent returned no session ID")
 			}
-			a.sessionID = string(created.SessionId)
 			a.mu.Lock()
+			a.sessionID = string(created.SessionId)
 			a.state.ConfigOptions = acpConfigOptions(created.ConfigOptions)
+			if saved != nil {
+				a.restoreTranscriptLocked(saved.State)
+				a.state.Error = "This agent cannot reload its previous session, so it continues in a new session without that context."
+			}
 			a.mu.Unlock()
 		} else {
+			a.mu.Lock()
 			a.sessionID = saved.SessionID
+			a.replaying = true
+			a.mu.Unlock()
 			var loaded acpsdk.LoadSessionResponse
 			loaded, err = a.client.LoadSession(initCtx, acpsdk.LoadSessionRequest{Cwd: cwd, McpServers: mcpServers, SessionId: acpsdk.SessionId(saved.SessionID)})
+			a.mu.Lock()
+			a.replaying = false
 			if err == nil {
-				a.mu.Lock()
 				a.state.ConfigOptions = acpConfigOptions(loaded.ConfigOptions)
-				a.restoreSubmissionIDsLocked(saved.State.Messages)
-				a.mu.Unlock()
+				a.restoreTranscriptLocked(saved.State)
 			}
+			a.mu.Unlock()
 		}
 	}
 	if err != nil {
@@ -249,8 +379,15 @@ func (a *ACP) wait() {
 	a.exitCode = exitCode
 	a.state.Connected = false
 	a.state.Busy = false
+	a.state.Stopping = false
 	a.state.Permissions = nil
-	a.changedLocked()
+	a.state.Elicitations = nil
+	a.state.Steering = false
+	a.external = nil
+	a.takeoverPending = false
+	a.state.QueuePaused = len(a.state.Queue) > 0
+	a.releaseHeldTextLocked()
+	a.publishProgressLocked()
 	a.mu.Unlock()
 	close(a.done)
 }
@@ -268,7 +405,7 @@ func (a *ACP) changedLocked() {
 func (a *ACP) Snapshot() ([]byte, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return json.Marshal(a.state)
+	return json.Marshal(a.publishedStateLocked(), json.Deterministic(true))
 }
 
 func (a *ACP) Subscribe() (<-chan struct{}, func()) {
@@ -285,17 +422,19 @@ func (a *ACP) Command(command ACPCommand) error {
 	case "config":
 		return a.configure(command.ID, command.Value)
 	case "prompt":
-		return a.prompt(command.Text, command.ID)
+		return a.submit(command)
+	case "unqueue":
+		return a.unqueue(command.ID)
+	case "resume":
+		return a.resumeQueue()
 	case "cancel":
-		a.turnMu.Lock()
-		defer a.turnMu.Unlock()
+		// Stop never waits for a prompt write, steering request, or settings
+		// change; a prompt written concurrently is cancelled after its write.
 		a.mu.Lock()
 		a.cancelling = true
-		for id, response := range a.permissions {
-			response <- acpsdk.NewRequestPermissionOutcomeCancelled()
-			delete(a.permissions, id)
-		}
-		a.state.Permissions = nil
+		a.state.QueuePaused = true
+		a.state.Stopping = a.state.Busy || a.state.Steering
+		a.clearPendingLocked()
 		a.changedLocked()
 		a.mu.Unlock()
 		return a.client.Cancel(context.Background(), acpsdk.CancelNotification{SessionId: acpsdk.SessionId(a.sessionID)})
@@ -322,55 +461,54 @@ func (a *ACP) Command(command ACPCommand) error {
 		a.changedLocked()
 		a.mu.Unlock()
 		return nil
+	case "elicitation":
+		return a.answerElicitation(command)
 	default:
 		return errors.New("unknown ACP command")
 	}
 }
-func (a *ACP) Prompt(text string) error { return a.prompt(text, "") }
-func (a *ACP) prompt(text, submissionID string) error {
-	a.turnMu.Lock()
-	defer a.turnMu.Unlock()
-	if strings.TrimSpace(text) == "" || len(text) > 64<<10 {
-		return errors.New("message must contain between 1 and 65536 bytes")
-	}
+
+// Prompt submits text as a send: it starts a turn when idle and queues behind
+// a running one.
+func (a *ACP) Prompt(text string) error { return a.submit(ACPCommand{Type: "prompt", Text: text}) }
+
+// startPromptLocked starts a turn. The caller holds turnMu. A queued prompt
+// leaves the queue in the same persisted update that records it as sent.
+func (a *ACP) startPromptLocked(text, submissionID string) error {
 	a.mu.Lock()
-	if submissionID != "" {
-		for _, message := range a.state.Messages {
-			if message.SubmissionID == submissionID {
-				a.mu.Unlock()
-				if message.Text != text {
-					return errors.New("submission ID already belongs to another message")
-				}
-				return nil
-			}
-		}
-	}
-	if !a.state.Connected || a.state.Busy || a.state.Configuring {
+	if !a.state.Connected {
 		a.mu.Unlock()
-		return errors.New("ACP agent is disconnected or busy")
+		return ErrACPAgentUnavailable
+	}
+	if a.state.Busy || a.state.Configuring || a.state.Steering {
+		a.mu.Unlock()
+		return errACPNotIdle
 	}
 	a.state.Busy = true
 	a.cancelling = false
-	a.state.Error = ""
+	// Status from here on describes this prompt, not an earlier takeover.
+	a.takeoverPending = false
+	a.setErrorLocked(nil)
 	a.promptIndex = new(len(a.state.Messages))
 	written := make(chan error, 1)
 	a.promptWritten = written
 	a.mu.Unlock()
-	completed := make(chan error, 1)
+	completed := make(chan acpTurnResult, 1)
 	go func() {
-		_, err := a.client.Prompt(context.Background(), acpsdk.PromptRequest{
+		response, err := a.client.Prompt(context.Background(), acpsdk.PromptRequest{
 			SessionId: acpsdk.SessionId(a.sessionID), Prompt: []acpsdk.ContentBlock{acpsdk.TextBlock(text)},
 		})
-		completed <- err
+		completed <- acpTurnResult{stopReason: response.StopReason, err: err}
 	}()
 	var err error
 	select {
 	case err = <-written:
-	case err = <-completed:
+	case result := <-completed:
+		err = result.err
 		// A disconnected SDK can reject a request without attempting a write.
 		select {
 		case writeErr := <-written:
-			completed <- err
+			completed <- result
 			err = writeErr
 		default:
 		}
@@ -380,117 +518,33 @@ func (a *ACP) prompt(text, submissionID string) error {
 		a.state.Busy = false
 		a.promptIndex = nil
 		a.promptWritten = nil
-		a.state.Error = err.Error()
+		a.setErrorLocked(err)
 		a.changedLocked()
 		a.mu.Unlock()
 		return err
 	}
 	a.mu.Lock()
+	if a.cancelling {
+		// Stop arrived while the prompt was being written, so the agent may
+		// have received that cancel before this turn existed.
+		go func() {
+			_ = a.client.Cancel(context.Background(), acpsdk.CancelNotification{SessionId: acpsdk.SessionId(a.sessionID)})
+		}()
+	}
 	message := ACPMessage{Role: "user", Text: text, SubmissionID: submissionID, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 	messageIndex := *a.promptIndex
 	a.promptIndex = nil
 	a.state.Messages = append(a.state.Messages, ACPMessage{})
 	copy(a.state.Messages[messageIndex+1:], a.state.Messages[messageIndex:])
 	a.state.Messages[messageIndex] = message
-	a.trimStateLocked()
+	if submissionID != "" {
+		a.state.Queue = slices.DeleteFunc(a.state.Queue, func(queued ACPQueuedPrompt) bool { return queued.ID == submissionID })
+	}
 	persistErr := a.persistLocked()
 	a.changedLocked()
 	a.mu.Unlock()
-	go func() {
-		err := <-completed
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		a.state.Busy = false
-		if err != nil {
-			a.state.Error = err.Error()
-		}
-		a.changedLocked()
-	}()
+	go a.finishTurn(completed)
 	return persistErr
-}
-
-// Include wire overhead and escaping so even many tiny tool updates or control
-// characters stay within the retained history budget.
-func acpMessageBytes(message ACPMessage) int {
-	data, _ := json.Marshal(message)
-	return len(data) + 1
-}
-
-func acpPermissionBytes(permission ACPPermission) int {
-	data, _ := json.Marshal(permission)
-	return len(data) + 1
-}
-
-func (a *ACP) retainedStateBytesLocked() int {
-	size := 0
-	for _, message := range a.state.Messages {
-		size += acpMessageBytes(message)
-	}
-	for _, permission := range a.state.Permissions {
-		size += acpPermissionBytes(permission)
-	}
-	return size
-}
-
-func (a *ACP) trimStateLocked() {
-	a.trimStateToBytesLocked(maxACPStateBytes)
-}
-
-func (a *ACP) trimStateToBytesLocked(limit int) {
-	size := a.retainedStateBytesLocked()
-	// Keep the latest accepted prompt so reconnects can acknowledge/deduplicate
-	// it even when the agent produces more output than the history budget.
-	latestUser := -1
-	for i, message := range slices.Backward(a.state.Messages) {
-		if message.Role == "user" {
-			latestUser = i
-			break
-		}
-	}
-	last := len(a.state.Messages) - 1
-	index := -1
-	removedBeforePrompt := 0
-	a.state.Messages = slices.DeleteFunc(a.state.Messages, func(message ACPMessage) bool {
-		index++
-		if size <= limit || index == latestUser || index == last {
-			return false
-		}
-		size -= acpMessageBytes(message)
-		if a.promptIndex != nil && index < *a.promptIndex {
-			removedBeforePrompt++
-		}
-		a.state.HistoryTruncated = true
-		return true
-	})
-	if a.promptIndex != nil {
-		*a.promptIndex -= removedBeforePrompt
-	}
-	for size > limit && len(a.state.Messages) > 0 {
-		last = len(a.state.Messages) - 1
-		message := &a.state.Messages[last]
-		if message.Role == "user" {
-			break
-		}
-		messageBytes := acpMessageBytes(*message)
-		if len(message.Text) > 0 {
-			// Removing this many UTF-8 bytes removes at least as many JSON bytes.
-			// Cap each cut at half the remaining text: JSON escaping can
-			// make the wire overflow larger than the entire raw string.
-			start := min(size-limit, max(len(message.Text)/2, 1))
-			for start < len(message.Text) && !utf8.RuneStart(message.Text[start]) {
-				start++
-			}
-			message.Text = strings.Clone(message.Text[start:])
-			size += acpMessageBytes(*message) - messageBytes
-		} else {
-			size -= messageBytes
-			a.state.Messages = slices.Delete(a.state.Messages, last, last+1)
-			if a.promptIndex != nil {
-				*a.promptIndex = min(*a.promptIndex, len(a.state.Messages))
-			}
-		}
-		a.state.HistoryTruncated = true
-	}
 }
 
 func (m *Manager) ACP(workspaceID, key string) (ACPChat, error) {

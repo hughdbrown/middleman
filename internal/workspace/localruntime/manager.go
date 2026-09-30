@@ -114,7 +114,10 @@ type Options struct {
 	AgentMCPToken      string
 	ACPPreferencesPath string
 	ACPSessionsDir     string
-	ACPOwnerCommand    []string
+	// AgentActivityDir is where ACP owners report turn state for the
+	// workspace activity views, alongside hook-reported agents.
+	AgentActivityDir string
+	ACPOwnerCommand  []string
 
 	Targets      []LaunchTarget
 	ShellCommand []string
@@ -158,13 +161,18 @@ type Manager struct {
 	acpPreferencesMu   sync.Mutex
 	acpPreferencesPath string
 	acpSessionsDir     string
+	agentActivityDir   string
 	acpOwnerCommand    []string
 	acpPreferences     map[string]map[string]string
 
-	mu                sync.Mutex
-	targets           map[string]LaunchTarget
-	targetsList       []LaunchTarget
-	sessions          map[string]*session
+	mu          sync.Mutex
+	targets     map[string]LaunchTarget
+	targetsList []LaunchTarget
+	sessions    map[string]*session
+	// exited holds the keys of sessions this manager saw exit on their own.
+	// Their stored records are forgotten in the background, and a restore in
+	// the meantime must not relaunch an agent that already finished.
+	exited            map[string]struct{}
 	labelReservations map[string]map[string]int
 	shellCommand      []string
 	tmuxCommand       []string
@@ -310,12 +318,14 @@ func NewManager(options Options) *Manager {
 		agentMCPToken:      options.AgentMCPToken,
 		acpPreferencesPath: options.ACPPreferencesPath,
 		acpSessionsDir:     options.ACPSessionsDir,
+		agentActivityDir:   options.AgentActivityDir,
 		acpOwnerCommand:    slices.Clone(options.ACPOwnerCommand),
 		acpPreferences:     make(map[string]map[string]string),
 
 		targets:           targets,
 		targetsList:       targetsList,
 		sessions:          make(map[string]*session),
+		exited:            make(map[string]struct{}),
 		labelReservations: make(map[string]map[string]int),
 		shellCommand:      slices.Clone(options.ShellCommand),
 		tmuxCommand:       slices.Clone(options.TmuxCommand),
@@ -546,6 +556,7 @@ func (m *Manager) launch(ctx context.Context, workspaceID, cwd, targetKey string
 		return SessionInfo{}, errManagerShutdown
 	}
 	m.sessions[key] = started
+	delete(m.exited, key)
 	m.mu.Unlock()
 	go m.watchSession(started)
 	slog.Debug(
@@ -637,6 +648,9 @@ func (m *Manager) restoreRuntimeSession(
 			"tmux_session", tmuxSession,
 		)
 		return nil
+	}
+	if m.Exited(key) {
+		return fmt.Errorf("%w: %q already exited", ErrSessionUnavailable, key)
 	}
 	if restored.Kind != LaunchTargetACP && tmuxSession != "" {
 		if err := m.requireTmuxSession(ctx, tmuxSession); err != nil {
@@ -752,6 +766,7 @@ func (m *Manager) restoreRuntimeSession(
 		return errManagerShutdown
 	}
 	m.sessions[key] = started
+	delete(m.exited, key)
 	m.mu.Unlock()
 	// startSession already starts drainOutput; restored tmux attach
 	// sessions only need the process watcher here.
@@ -904,6 +919,7 @@ func (m *Manager) ReattachTmuxClients(ctx context.Context) error {
 			continue
 		}
 		m.sessions[key] = replacement
+		delete(m.exited, key)
 		m.mu.Unlock()
 		go m.watchSession(replacement)
 		startMu.Unlock()
@@ -1528,8 +1544,10 @@ func (m *Manager) SubmitInitialMessage(
 }
 
 // SubmitAgentMessage writes one bounded, already-normalized prompt through a
-// live agent runtime. It requires observed bracketed-paste mode and sends the
-// complete paste frame and Enter in one serialized terminal operation.
+// live agent runtime. ACP runtimes receive it as a chat prompt, queued behind
+// any running turn, and reject it unwritten only while disconnected. Terminal
+// runtimes require observed bracketed-paste mode and receive the complete
+// paste frame and Enter in one serialized terminal operation.
 func (m *Manager) SubmitAgentMessage(
 	ctx context.Context,
 	workspaceID string,
@@ -1540,7 +1558,11 @@ func (m *Manager) SubmitAgentMessage(
 		return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
 	}
 	if acp, err := m.ACP(workspaceID, sessionKey); err == nil {
-		return acp.Prompt(message)
+		err := acp.Prompt(message)
+		if errors.Is(err, ErrACPAgentUnavailable) {
+			return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
+		}
+		return err
 	}
 	attachment, err := m.AttachSession(workspaceID, sessionKey)
 	if err != nil {
@@ -2102,6 +2124,15 @@ func (m *Manager) watchSession(
 	}
 }
 
+// Exited reports whether this manager saw the session exit on its own. Such a
+// session is finished even while its stored record is still being forgotten.
+func (m *Manager) Exited(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, exited := m.exited[key]
+	return exited
+}
+
 func (m *Manager) removeExitedSession(
 	info SessionInfo,
 	s *session,
@@ -2114,6 +2145,7 @@ func (m *Manager) removeExitedSession(
 		return false
 	}
 	delete(m.sessions, info.Key)
+	m.exited[info.Key] = struct{}{}
 	return true
 }
 

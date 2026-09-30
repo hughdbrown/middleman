@@ -2553,6 +2553,10 @@ func (s *Handler) workspaceRuntimeSessions(
 	if err != nil {
 		return nil, err
 	}
+	// A session that exited is gone even before its record is forgotten.
+	stored = slices.DeleteFunc(stored, func(session db.WorkspaceRuntimeSession) bool {
+		return s.runtime.Exited(session.SessionKey)
+	})
 	return mergeStoredRuntimeSessions(sessions, stored), nil
 }
 
@@ -2647,7 +2651,7 @@ func (s *Handler) LaunchWorkspaceRuntimeService(
 	ctx context.Context, workspaceID, targetKey, initialMessage string,
 ) (localruntime.SessionInfo, error) {
 	if initialMessage != "" {
-		message, _, err := normalizeInitialAgentMessage(initialMessage)
+		message, _, err := normalizeAgentMessage(initialMessage, workspaceRuntimeTargetKind(s.runtime, strings.TrimSpace(targetKey)))
 		if err != nil {
 			return localruntime.SessionInfo{}, httpapi.Validation("message", err.Error())
 		}
@@ -2729,6 +2733,20 @@ func (s *Handler) LaunchWorkspaceRuntimeSession(
 	ctx context.Context, input *LaunchWorkspaceRuntimeSessionInput,
 ) (*workspaceRuntimeSessionOutput, error) {
 	return s.launchWorkspaceRuntimeSession(ctx, input)
+}
+
+// workspaceRuntimeTargetKind is the kind of a configured launch target, or
+// empty when there is none.
+func workspaceRuntimeTargetKind(runtime *localruntime.Manager, targetKey string) localruntime.LaunchTargetKind {
+	if runtime == nil {
+		return ""
+	}
+	for _, target := range runtime.LaunchTargets() {
+		if target.Key == targetKey {
+			return target.Kind
+		}
+	}
+	return ""
 }
 
 func workspaceRuntimeTargetIsAgent(runtime *localruntime.Manager, targetKey string) bool {

@@ -97,8 +97,12 @@
   prompt only in daemon memory. Same-daemon retries must match the live runtime
   target and prompt; daemon restart permits a fresh attempt
   (`internal/server/workspaceapi/initial_message.go::initialMessageAttempt`).
-- Terminal initial input requires an exact live agent runtime and matching target, LF or
-  printable Unicode, and tracked bracketed paste for multiline text. Hook
+- Agent messages must be non-blank valid UTF-8; only terminal agents also limit them to LF or
+  printable Unicode within 64 KiB. ACP prompts have no further limits, so validate against
+  the target's protocol before creating anything
+  (`internal/server/workspaceapi/initial_message.go::normalizeAgentMessage`).
+- Terminal initial input requires an exact live agent runtime and matching target
+  and tracked bracketed paste for multiline text. Hook
   observation is not a submission precondition. If safe paste mode is not
   observed yet, release the no-write reservation and retry only that typed
   condition on the same runtime until the handoff deadline. Terminal writes
@@ -134,14 +138,15 @@
   must remain launchable and handoffs match the live runtime and target key
   (`internal/mcpserver/tools_agent_spawn.go::Server.waitForCodingSession`).
 - Agent-session inspection returns live agent runtimes separately from
-  hook-authoritative sessions. `hook_observed=false` distinguishes a launched
-  runtime awaiting its first hook from a workspace with no agent runtime
+  reported sessions. `hook_observed=false` distinguishes a launched
+  runtime awaiting its first report from a workspace with no agent runtime
   (`internal/mcpserver/tools_agent.go::Server.listWorkspaceAgentSessions`).
+- MCP agent tools cover terminal and ACP agents; ACP sessions come only from `agent=acp`
+  owner reports on ACP runtimes, never hooks (`internal/server/workspaceapi/agent_sessions.go::reportedAgent`).
 - Follow-up MCP messages address one existing live agent runtime by workspace ID
-  and runtime session key. MCP agent-management tools include terminal coding-agent
-  runtimes only; ACP chats use their workspace chat transport. Follow-ups reuse the initial prompt's serialized
-  bracketed-paste and Enter path, then return without launching, persisting, or
-  waiting for hook activity
+  and runtime session key, then return without launching, persisting, or
+  waiting for activity. Terminal follow-ups reuse the serialized bracketed-paste
+  and Enter path; ACP follow-ups queue behind a running turn
   (`internal/mcpserver/tools_agent.go::Server.sendAgentMessage`,
   `internal/workspace/localruntime/manager.go::Manager.SubmitAgentMessage`).
 - An omitted MCP agent target selects the most-used available workspace agent
