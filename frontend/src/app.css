@@ -101,16 +101,41 @@
   --bg-row-selected: color-mix(in srgb, var(--sidebar-row-hover-bg) 38%, var(--bg-surface));
 }
 
-/* Separate inset controls and selected surface pills in the quiet palette.
-   Keep kit's high-contrast palette authoritative when explicitly enabled. */
+/* Soft quiet light palette: cool gray chrome and a gray reading surface
+   instead of pure white, with the same small elevation steps as dark.
+   Muted text stays AA on the hover step. Accent text also sits on its own
+   color-mix tint (up to 16%), so each accent darkens until it stays AA on
+   that tint over the inset step. Keep kit's high-contrast palette
+   authoritative when enabled. */
+:root[data-kit-theme="quiet"]:not(.dark):not(.high-contrast) {
+  --bg-primary: #e3e6ea; /* kit-ui-check-ignore: soft light chrome canvas */
+  --bg-surface: #eceef1; /* kit-ui-check-ignore: soft reading surface without glare */
+  --bg-inset: #e5e8ec; /* kit-ui-check-ignore: one step below the surface */
+  --bg-surface-hover: #dee1e6; /* kit-ui-check-ignore: two steps below the surface */
+  --border-default: #cbd0d7; /* kit-ui-check-ignore: control edges on the gray surface */
+  --border-muted: #dadde2; /* kit-ui-check-ignore: dividers on the gray surface */
+  --text-muted: #5c636d; /* kit-ui-check-ignore: AA on the hover step */
+  --accent-blue: #0052b5; /* kit-ui-check-ignore: AA on its 16% tint */
+  --accent-amber: #8c4107; /* kit-ui-check-ignore: AA on its 16% tint */
+  --accent-purple: #5f40ba; /* kit-ui-check-ignore: AA on its 16% tint */
+  --accent-green: #036448; /* kit-ui-check-ignore: AA on its 16% tint */
+  --accent-red: #a42121; /* kit-ui-check-ignore: AA on its 16% tint */
+  --accent-teal: #0b5f76; /* kit-ui-check-ignore: AA on its 16% tint */
+  --status-waiting: #685632; /* kit-ui-check-ignore: AA on its 16% tint */
+  --diff-stale-text: #785000; /* kit-ui-check-ignore: AA on the amber stale tint */
+}
+
+/* Darker quiet reading surfaces with small, even elevation steps: inset
+   and hover sit just above the surface so tabs, group headers, and chips
+   read as structure, not gray blocks. Kit's muted text stays AA on every
+   step. Keep kit's high-contrast palette authoritative when enabled. */
 :root.dark[data-kit-theme="quiet"]:not(.high-contrast) {
-  --bg-primary: #111214; /* kit-ui-check-ignore: quiet canvas contrast override */
-  --bg-surface: #141518; /* kit-ui-check-ignore: darken the main panels, lists, and reading background */
-  --bg-inset: #303338; /* kit-ui-check-ignore: quiet control contrast override */
-  --bg-surface-hover: #383c43; /* kit-ui-check-ignore: quiet hover contrast override */
-  --border-default: #555b65; /* kit-ui-check-ignore: quiet control edge contrast override */
-  --border-muted: #393e46; /* kit-ui-check-ignore: quiet divider contrast override */
-  --text-muted: #a0a6af; /* kit-ui-check-ignore: retains AA text contrast on the brighter controls */
+  --bg-primary: #0f1012; /* kit-ui-check-ignore: quiet dark canvas */
+  --bg-surface: #141518; /* kit-ui-check-ignore: quiet dark reading surface */
+  --bg-inset: #1c1e22; /* kit-ui-check-ignore: one step above the surface */
+  --bg-surface-hover: #24272c; /* kit-ui-check-ignore: two steps above the surface */
+  --border-default: #33363c; /* kit-ui-check-ignore: control edges on the darker surface */
+  --border-muted: #26292e; /* kit-ui-check-ignore: dividers on the darker surface */
   --sidebar-row-hover-bg: var(--bg-surface-hover);
 }
 
