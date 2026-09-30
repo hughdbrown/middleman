@@ -20,13 +20,20 @@ import (
 	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 
 	"go.kenn.io/forge/internal/apiclient/generated"
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
+
 	ghclient "go.kenn.io/forge/internal/github"
+
 	ptyownerruntime "go.kenn.io/forge/internal/ptyowner/runtime"
 	"go.kenn.io/forge/internal/ptysize"
+	"go.kenn.io/forge/internal/server/authapi"
+	"go.kenn.io/forge/internal/server/configreload"
+	"go.kenn.io/forge/internal/server/settingsapi"
+	"go.kenn.io/forge/internal/server/spokeapi"
 	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
 	"go.kenn.io/forge/internal/testutil/reposeed"
@@ -83,7 +90,7 @@ func atomicRenameConfigToml(t *testing.T, path string, content string) {
 type configEventStream struct {
 	resp   *http.Response
 	cancel context.CancelFunc
-	events chan configChangedEvent
+	events chan configreload.ConfigChangedEvent
 }
 
 func (s *configEventStream) Close() {
@@ -120,15 +127,15 @@ func streamConfigEvents(t *testing.T, srv *Server) *configEventStream {
 	stream := &configEventStream{
 		resp:   resp,
 		cancel: cancel,
-		events: make(chan configChangedEvent, 8),
+		events: make(chan configreload.ConfigChangedEvent, 8),
 	}
 
 	// Wait for the handler to register before returning, so the test
 	// does not race the watcher's first event against subscriber setup.
 	require.Eventually(t, func() bool {
-		srv.hub.mu.Lock()
-		defer srv.hub.mu.Unlock()
-		return len(srv.hub.subscribers) >= 1
+		srv.hub.Mu.Lock()
+		defer srv.hub.Mu.Unlock()
+		return len(srv.hub.Subscribers) >= 1
 	}, 2*time.Second, 10*time.Millisecond)
 
 	go func() {
@@ -154,7 +161,7 @@ func streamConfigEvents(t *testing.T, srv *Server) *configEventStream {
 				continue
 			}
 			if eventType == "config.changed" && dataLine != "" {
-				var ev configChangedEvent
+				var ev configreload.ConfigChangedEvent
 				if err := json.Unmarshal([]byte(dataLine), &ev); err == nil {
 					select {
 					case stream.events <- ev:
@@ -174,7 +181,7 @@ func waitForConfigEvent(
 	t *testing.T,
 	stream *configEventStream,
 	timeout time.Duration,
-) configChangedEvent {
+) configreload.ConfigChangedEvent {
 	t.Helper()
 	select {
 	case ev, ok := <-stream.events:
@@ -182,7 +189,7 @@ func waitForConfigEvent(
 		return ev
 	case <-time.After(timeout):
 		require.FailNow(t, "timed out waiting for config.changed event")
-		return configChangedEvent{}
+		return configreload.ConfigChangedEvent{}
 	}
 }
 
@@ -405,8 +412,8 @@ path = %q
 func TestConfigReload_WatcherFiresOnInPlaceEdit(t *testing.T) {
 	assert := assert.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -429,7 +436,7 @@ func TestConfigReload_WatcherFiresOnInPlaceEdit(t *testing.T) {
 func TestConfigReloadAppliesMouseToDedicatedTmuxServer(t *testing.T) {
 	require := require.New(t)
 	record := installSettingsTmuxRecorder(t)
-	srv, _, cfgPath := setupTestServerWithConfigContentAndOptions(t, validReloadConfig, &mockGH{}, ServerOptions{
+	srv, _, cfgPath, _ := setupTestServerWithConfigContentAndOptions(t, validReloadConfig, &serverfake.MockGH{}, ServerOptions{
 		HostCheckAllowLoopbackAnyPort: true,
 		WorktreeDir:                   t.TempDir(),
 	})
@@ -454,7 +461,7 @@ tmux_mouse = false
 func TestConfigReloadAppliesGraphicsToDedicatedTmuxServer(t *testing.T) {
 	require := require.New(t)
 	record := installSettingsTmuxRecorder(t)
-	srv, _, cfgPath := setupTestServerWithConfigContentAndOptions(t, validReloadConfig, &mockGH{}, ServerOptions{
+	srv, _, cfgPath, _ := setupTestServerWithConfigContentAndOptions(t, validReloadConfig, &serverfake.MockGH{}, ServerOptions{
 		HostCheckAllowLoopbackAnyPort: true,
 		WorktreeDir:                   t.TempDir(),
 	})
@@ -480,8 +487,8 @@ graphics = false
 
 func TestConfigReloadPublishesPullConfigOnlyAfterSuccessfulReload(t *testing.T) {
 	require := require.New(t)
-	srv, _, _ := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, _, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	require.False(srv.pullAPI.ConfigSnapshot().AllowMidStackMerges)
 	require.False(srv.pullAPI.ConfigSnapshot().UseWorkspaceActivityForRecency)
@@ -496,14 +503,14 @@ allow_mid_stack_merges = true
 [activity]
 use_workspace_activity_for_recency = true
 `)
-	event := srv.applyConfigChange(t.Context())
+	event := srv.configreload.ApplyConfigChange(t.Context())
 	require.True(event.Valid, event.Error)
 	require.True(srv.pullAPI.ConfigSnapshot().AllowMidStackMerges)
 	require.True(srv.pullAPI.ConfigSnapshot().UseWorkspaceActivityForRecency)
 	require.True(srv.issueAPI.ConfigSnapshot().UseWorkspaceActivityForRecency)
 
 	writeConfigToml(t, reloadPath, malformedTomlConfig)
-	event = srv.applyConfigChange(t.Context())
+	event = srv.configreload.ApplyConfigChange(t.Context())
 	require.False(event.Valid)
 	require.True(
 		srv.pullAPI.ConfigSnapshot().AllowMidStackMerges,
@@ -528,7 +535,7 @@ func TestConfigReload_NilSyncerAppliesHotReloadWithoutPanic(t *testing.T) {
 	require.NoError(err)
 
 	srv := NewWithConfig(
-		openTestDB(t), nil, nil, nil, cfg, cfgPath, ServerOptions{},
+		serverfake.OpenTestDB(t), nil, nil, nil, cfg, cfgPath, ServerOptions{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -559,12 +566,12 @@ func TestConfigReloadPreservesCanonicalDataDirIdentity(t *testing.T) {
 		t.Skipf("symlink unavailable: %v", err)
 	}
 	content := fmt.Sprintf("data_dir = %q\n", link) + validReloadConfig
-	srv, _, cfgPath := setupTestServerWithConfigContent(t, content, &mockGH{})
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(t, content, &serverfake.MockGH{})
 	canonicalDir, err := filepath.EvalSymlinks(realDir)
 	require.NoError(err)
 
 	writeConfigToml(t, cfgPath, content)
-	event := srv.applyConfigChange(t.Context())
+	event := srv.configreload.ApplyConfigChange(t.Context())
 
 	require.True(event.Valid, event.Error)
 	assert.False(event.RestartRequired)
@@ -577,8 +584,8 @@ func TestConfigReload_UpdatesBranchActivityLimits(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, syncer := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -590,7 +597,7 @@ func TestConfigReload_UpdatesBranchActivityLimits(t *testing.T) {
 	require.True(ev.Valid)
 	assert.False(ev.RestartRequired)
 
-	retention, maxCommits := srv.syncer.BranchActivityLimits()
+	retention, maxCommits := syncer.BranchActivityLimits()
 	assert.Equal(14*24*time.Hour, retention)
 	assert.Equal(2, maxCommits)
 }
@@ -599,8 +606,8 @@ func TestConfigReload_UpdatesModes(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -613,7 +620,7 @@ func TestConfigReload_UpdatesModes(t *testing.T) {
 	assert.False(ev.RestartRequired)
 
 	srv.cfgMu.Lock()
-	gotModes := cloneModeVisibility(srv.cfg.Modes)
+	gotModes := spokeapi.CloneModeVisibility(srv.cfg.Modes)
 	originalActions := srv.cfg.Modes.Actions
 	srv.cfgMu.Unlock()
 	assert.True(*gotModes.Docs)
@@ -639,8 +646,8 @@ func TestConfigReload_UpdatesDocFoldersAndRegistry(t *testing.T) {
 	initialConfig := validReloadConfigWithDocFolder("notes", "Notes", initialRoot)
 	updatedConfig := validReloadConfigWithDocFolder("handbook", "Handbook", updatedRoot)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, initialConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, initialConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -711,10 +718,10 @@ func TestConfigReloadSerializesDocsFolderMutation(t *testing.T) {
 	initialRoot := t.TempDir()
 	reloadedRoot := t.TempDir()
 	createdRoot := t.TempDir()
-	srv, _, cfgPath := setupTestServerWithConfigContent(
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
 		t,
 		validReloadConfigWithDocFolder("initial", "Initial", initialRoot),
-		&mockGH{},
+		&serverfake.MockGH{},
 	)
 	writeConfigToml(t, cfgPath, validReloadConfigWithDocFolder("reloaded", "Reloaded", reloadedRoot))
 
@@ -729,7 +736,7 @@ func TestConfigReloadSerializesDocsFolderMutation(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		srv.handleConfigFileChanged()
+		srv.configreload.HandleConfigFileChanged()
 	}()
 	go func() {
 		defer wg.Done()
@@ -759,8 +766,8 @@ func TestConfigReloadSerializesDocsFolderMutation(t *testing.T) {
 func TestConfigReload_WatcherFiresOnAtomicRename(t *testing.T) {
 	assert := assert.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -776,8 +783,8 @@ func TestConfigReload_WatcherFiresOnAtomicRename(t *testing.T) {
 func TestConfigReload_RestartRequiredOnStartupFieldChange(t *testing.T) {
 	assert := assert.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -793,8 +800,8 @@ func TestConfigReload_RestartRequiredOnStartupFieldChange(t *testing.T) {
 func TestConfigReload_RestartRequiredOnHostCheckPolicyChange(t *testing.T) {
 	assert := assert.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -813,8 +820,8 @@ func TestConfigReload_TokenSourceChangeForExistingHostUpdatesSource(t *testing.T
 	t.Setenv("KENN_FORGE_GITHUB_TOKEN", "old")
 	t.Setenv("KENN_FORGE_REPO_TOKEN", "new")
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	sourceSet := tokenauth.NewSourceSet(tokenauth.Options{})
 	srv.cfgMu.Lock()
@@ -847,8 +854,8 @@ func TestConfigReload_GitHubTokenEnvChangeUpdatesConfigSnapshot(t *testing.T) {
 	t.Setenv("KENN_FORGE_GITHUB_TOKEN", "old")
 	t.Setenv("KENN_FORGE_NEW_GITHUB_TOKEN", "new")
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	sourceSet := tokenauth.NewSourceSet(tokenauth.Options{})
 	srv.cfgMu.Lock()
@@ -890,14 +897,14 @@ func TestConfigReload_GitHubTokenEnvChangeUpdatesConfigSnapshot(t *testing.T) {
 func TestConfigReloadPublishesCommittedWorkspaceSnapshot(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	srv, database, cfgPath := setupTestServerWithConfigContent(t, `
+	srv, database, cfgPath, _ := setupTestServerWithConfigContent(t, `
 host = "127.0.0.1"
 port = 8091
 
 [[agents]]
 key = "before"
 command = ["sh"]
-`, &mockGH{})
+`, &serverfake.MockGH{})
 	project, err := database.CreateProject(t.Context(), db.CreateProjectInput{
 		DisplayName: "Workspace config snapshot",
 		LocalPath:   t.TempDir(),
@@ -912,7 +919,7 @@ port = 8091
 key = "after"
 command = ["sh"]
 `), 0o644))
-	event := srv.applyConfigChange(t.Context())
+	event := srv.configreload.ApplyConfigChange(t.Context())
 	require.True(event.Valid, event.Error)
 
 	rr := testutil.DoJSON(
@@ -937,8 +944,8 @@ func TestConfigReload_InvalidTokenSourceKeepsLastKnownGoodSource(t *testing.T) {
 	t.Setenv("KENN_FORGE_GITHUB_TOKEN", "")
 	t.Setenv("KENN_FORGE_REPO_TOKEN", "old")
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfigRepoTokenEnv, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfigRepoTokenEnv, &serverfake.MockGH{},
 	)
 	sourceSet := tokenauth.NewSourceSet(tokenauth.Options{})
 	srv.cfgMu.Lock()
@@ -984,7 +991,7 @@ func TestConfigReload_AirplaneModeOmitsUnresolvedPinnedRepository(t *testing.T) 
 	require := require.New(t)
 	initialConfig := "airplane_mode = true\n" + validReloadConfig +
 		"platform_repo_id = 1001\n"
-	mock := &mockGH{getRepositoryFn: func(
+	mock := &serverfake.MockGH{GetRepositoryFn: func(
 		_ context.Context, owner, name string,
 	) (*gh.Repository, error) {
 		return &gh.Repository{
@@ -992,20 +999,20 @@ func TestConfigReload_AirplaneModeOmitsUnresolvedPinnedRepository(t *testing.T) 
 			Archived: new(false),
 		}, nil
 	}}
-	srv, _, cfgPath := setupTestServerWithConfigContentAndOptions(
+	srv, _, cfgPath, syncer := setupTestServerWithConfigContentAndOptions(
 		t, initialConfig, mock, ServerOptions{
 			HostCheckAllowLoopbackAnyPort:      true,
 			WorktreeDir:                        t.TempDir(),
 			DisableWorkspaceBackgroundMonitors: true,
 		},
 	)
-	previous := srv.syncer.TrackedRepos()
+	previous := syncer.TrackedRepos()
 	require.Len(previous, 1)
 	require.Equal(int64(1001), previous[0].PlatformRepoID)
 	previous[0].Name = "widget-next"
 	previous[0].RepoPath = "acme/widget-next"
 	previous[0].ConfiguredRepoPath = ""
-	srv.syncer.SetRepos(previous)
+	syncer.SetRepos(previous)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
 	defer stream.Close()
@@ -1024,16 +1031,16 @@ platform_repo_id = 1002
 	require.Len(configured, 2)
 	require.Equal(int64(1002), configured[1].PlatformRepoID)
 	previous[0].ConfiguredRepoPath = "acme/widget"
-	assert.Equal(t, previous, srv.syncer.TrackedRepos(),
+	assert.Equal(t, previous, syncer.TrackedRepos(),
 		"keep the verified repository without adopting the unresolved pinned route")
-	_, err := srv.deleteConfiguredRepo(t.Context(), &repoConfigInput{
+	_, err := srv.settingsapi.DeleteConfiguredRepo(t.Context(), &settingsapi.RepoConfigInput{
 		Provider: "github", PlatformHost: "github.com",
 		Owner: "acme", Name: "replacement",
 	})
 	require.NoError(err)
 	event = waitForConfigEvent(t, stream, 2*time.Second)
 	require.True(event.Valid, event.Error)
-	require.Equal(previous, srv.syncer.TrackedRepos(),
+	require.Equal(previous, syncer.TrackedRepos(),
 		"removing another entry must keep the renamed pinned repository")
 }
 
@@ -1062,8 +1069,8 @@ owner = "acme"
 name = "service-*"
 `
 
-	srv, database, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig+failedProvider, &mockGH{},
+	srv, database, cfgPath, syncer := setupTestServerWithConfigContent(
+		t, validReloadConfig+failedProvider, &serverfake.MockGH{},
 	)
 	set := tokenauth.NewSourceSet(tokenauth.Options{})
 	for _, plan := range srv.cfg.ProviderTokenSources() {
@@ -1081,9 +1088,9 @@ name = "service-*"
 			Owner: "acme", Name: "service-api", RepoPath: "acme/service-api",
 		},
 	}
-	srv.syncer.SetRepos(append(srv.syncer.TrackedRepos(), startupFallbacks...))
+	syncer.SetRepos(append(syncer.TrackedRepos(), startupFallbacks...))
 	for i, repo := range startupFallbacks {
-		seedVerifiedRepo(t, database, db.RepoIdentity{
+		serverfake.SeedVerifiedRepo(t, database, db.RepoIdentity{
 			Platform: string(repo.Platform), PlatformHost: repo.PlatformHost,
 			PlatformRepoID: int64(42 + i),
 			Owner:          repo.Owner, Name: repo.Name, RepoPath: repo.RepoPath,
@@ -1092,113 +1099,15 @@ name = "service-*"
 	assert.ElementsMatch([]string{"backend", "service-api"}, listRepoNames(t, srv))
 
 	writeConfigToml(t, cfgPath, validReloadConfigChangedActivity+failedProvider)
-	event := srv.applyConfigChange(t.Context())
+	event := srv.configreload.ApplyConfigChange(t.Context())
 	require.True(event.Valid, "unrelated reload failed: %s", event.Error)
 	assert.True(event.RestartRequired)
-	tracked := srv.syncer.TrackedRepos()
+	tracked := syncer.TrackedRepos()
 	startupFallbacks[0].ConfiguredRepoPath = "acme/backend"
 	for _, repo := range startupFallbacks {
 		assert.Contains(tracked, repo)
 	}
 	assert.ElementsMatch([]string{"backend", "service-api"}, listRepoNames(t, srv))
-}
-
-func TestValidateReloadCloneTokenSourcesUsesRepoDescriptorForProviderHost(t *testing.T) {
-	cfgPath := filepath.Join(t.TempDir(), "config.toml")
-	writeConfigToml(t, cfgPath, `
-github_token_env = "KENN_FORGE_GITHUB_TOKEN"
-
-[[platforms]]
-type = "github"
-host = "github.com"
-token_env = "PLATFORM_TOKEN"
-
-[[repos]]
-owner = "acme"
-name = "widget"
-platform = "github"
-platform_host = "github.com"
-token_env = "REPO_TOKEN"
-`)
-	cfg, err := config.Load(cfgPath)
-	require.NoError(t, err)
-
-	require.NoError(t, validateReloadCloneTokenSources(cfg))
-}
-
-func TestValidateReloadCloneTokenSourcesAllowsDifferentProviderFallbacksOnSharedHost(t *testing.T) {
-	// Credentials are provider-scoped, so providers sharing one hostname may
-	// carry different fallback tokens; the ownerless host fallback is
-	// disabled in that case rather than the reload being rejected.
-	cfg := &config.Config{Platforms: []config.PlatformConfig{
-		{Type: "github", Host: "code.example.com", TokenEnv: "GITHUB_PAT"},
-		{Type: "forgejo", Host: "code.example.com", TokenEnv: "FORGEJO_PAT"},
-	}}
-
-	require.NoError(t, validateReloadCloneTokenSources(cfg))
-}
-
-func TestValidateReloadCloneTokenSourcesRejectsConflictingRepoOverrides(t *testing.T) {
-	cfg := &config.Config{Repos: []config.Repo{
-		{Platform: "gitlab", PlatformHost: "gitlab.com", Owner: "group", Name: "one", TokenEnv: "TOKEN_A"},
-		{Platform: "gitlab", PlatformHost: "gitlab.com", Owner: "group", Name: "two", TokenEnv: "TOKEN_B"},
-	}}
-
-	err := validateReloadCloneTokenSources(cfg)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "conflicting token source")
-}
-
-func TestValidateReloadCloneTokenSourcesAllowsEquivalentChainsOnSameHost(t *testing.T) {
-	cfgPath := filepath.Join(t.TempDir(), "config.toml")
-	// Two providers share a self-hosted host. The forgejo repo's token_env
-	// repeats its platform fallback, producing the chain env:SHARED ->
-	// env:SHARED, while gitlab resolves to a plain env:SHARED. They name the
-	// same token, so the per-host clone-token check must compare canonical
-	// chains and accept the reload rather than flag a conflict.
-	writeConfigToml(t, cfgPath, `
-[[platforms]]
-type = "forgejo"
-host = "code.example.com"
-token_env = "SHARED"
-
-[[platforms]]
-type = "gitlab"
-host = "code.example.com"
-token_env = "SHARED"
-
-[[repos]]
-owner = "acme"
-name = "widget"
-platform = "forgejo"
-platform_host = "code.example.com"
-token_env = "SHARED"
-`)
-	cfg, err := config.Load(cfgPath)
-	require.NoError(t, err)
-
-	require.NoError(t, validateReloadCloneTokenSources(cfg))
-}
-
-func TestValidateReloadCloneTokenSourcesIgnoresCredentiallessPlatformHosts(t *testing.T) {
-	cfgPath := filepath.Join(t.TempDir(), "config.toml")
-	// The forgejo entry has no token config and a non-default host, so its
-	// candidate chain is empty. It imposes no clone credential and must not
-	// conflict with the tokened gitlab entry on the same host.
-	writeConfigToml(t, cfgPath, `
-[[platforms]]
-type = "forgejo"
-host = "code.example.com"
-
-[[platforms]]
-type = "gitlab"
-host = "code.example.com"
-token_env = "SHARED"
-`)
-	cfg, err := config.Load(cfgPath)
-	require.NoError(t, err)
-
-	require.NoError(t, validateReloadCloneTokenSources(cfg))
 }
 
 // reloadTestTokenSources registers every provider token plan of the config
@@ -1251,7 +1160,7 @@ sync_interval = "5m"
 host = "127.0.0.1"
 port = 8091
 `
-	srv, _, cfgPath := setupTestServerWithConfigContent(t, withOwner, &mockGH{})
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(t, withOwner, &serverfake.MockGH{})
 	key := tokenauth.Key{
 		Platform: "github", Host: "github.com", Scope: "owner:acme",
 	}
@@ -1259,7 +1168,7 @@ port = 8091
 	srv.tokenSources = sourceSet
 	bootCfg, err := config.Load(cfgPath)
 	require.NoError(err)
-	srv.bootCfgSnapshot = snapshotStartupConfig(bootCfg)
+	srv.bootCfgSnapshot = configreload.SnapshotStartupConfig(bootCfg)
 	token, err := src.Token(t.Context())
 	require.NoError(err)
 	require.Equal("owner-token", token)
@@ -1293,7 +1202,7 @@ owner = "acme"
 token_env = "OWNER_PAT"
 `
 	changedConfig := strings.ReplaceAll(bootConfig, "OWNER_PAT", "NEW_OWNER_PAT")
-	srv, _, cfgPath := setupTestServerWithConfigContent(t, bootConfig, &mockGH{})
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(t, bootConfig, &serverfake.MockGH{})
 	key := tokenauth.Key{
 		Platform: "github", Host: "github.com", Scope: "owner:acme",
 	}
@@ -1301,7 +1210,7 @@ token_env = "OWNER_PAT"
 	srv.tokenSources = sourceSet
 	bootCfg, err := config.Load(cfgPath)
 	require.NoError(err)
-	srv.bootCfgSnapshot = snapshotStartupConfig(bootCfg)
+	srv.bootCfgSnapshot = configreload.SnapshotStartupConfig(bootCfg)
 
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -1354,8 +1263,8 @@ func TestConfigReload_RemovingPlatformTokenClearsLiveSource(t *testing.T) {
 	t.Setenv("KENN_FORGE_GITHUB_TOKEN", "github-token")
 	t.Setenv("KENN_FORGE_PLATFORM_TOKEN", "platform-token")
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, reloadPlatformTokenConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, reloadPlatformTokenConfig, &serverfake.MockGH{},
 	)
 	sourceSet, src := reloadTestTokenSources(t, cfgPath, tokenauth.Key{
 		Platform: "gitlab", Host: "gitlab.example.com",
@@ -1386,8 +1295,8 @@ func TestConfigReload_TokenAddedForUnbuiltClientRequiresRestart(t *testing.T) {
 	t.Setenv("KENN_FORGE_GITHUB_TOKEN", "github-token")
 	t.Setenv("KENN_FORGE_PLATFORM_TOKEN", "platform-token")
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, reloadPlatformTokenlessConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, reloadPlatformTokenlessConfig, &serverfake.MockGH{},
 	)
 	sourceSet, src := reloadTestTokenSources(t, cfgPath, tokenauth.Key{
 		Platform: "gitlab", Host: "gitlab.example.com",
@@ -1418,8 +1327,8 @@ func TestConfigReload_GitHubAppAddedRequiresRestart(t *testing.T) {
 	require := require.New(t)
 	t.Setenv("KENN_FORGE_GITHUB_TOKEN", "github-token")
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -1497,8 +1406,8 @@ selected_repos = ["acme/widget-one", "acme/widget-two"]
 		set.Upsert(plan.Descriptor)
 	}
 
-	srv := &Server{tokenSources: set}
-	require.NoError(srv.validateReloadProviderTokenSources(t.Context(), cfg))
+	srv := wiredServer(&Server{tokenSources: set})
+	require.NoError(srv.configreload.ValidateReloadProviderTokenSources(t.Context(), cfg))
 	require.Len(minted, 1)
 	assert.Equal(t, int64(4242), minted[0].AppID)
 	assert.Equal(t, "acme", minted[0].InstallationAccount)
@@ -1533,8 +1442,8 @@ func TestValidateReloadProviderSourcesUsesArchiveDescriptorForArchiveOnlyRoute(t
 			set.Upsert(plan.ArchiveDescriptor)
 		}
 	}
-	srv := &Server{tokenSources: set}
-	require.NoError(srv.validateReloadProviderTokenSources(t.Context(), cfg))
+	srv := wiredServer(&Server{tokenSources: set})
+	require.NoError(srv.configreload.ValidateReloadProviderTokenSources(t.Context(), cfg))
 }
 
 // newReloadServerWithTokenSources mirrors startup: one source per
@@ -1546,7 +1455,7 @@ func newReloadServerWithTokenSources(
 	t.Helper()
 	database := dbtest.Open(t)
 	syncer := ghclient.NewSyncer(
-		map[string]ghclient.Client{"github.com": &mockGH{}},
+		map[string]ghclient.Client{"github.com": &serverfake.MockGH{}},
 		database, nil, nil, time.Minute, nil, nil,
 	)
 	t.Cleanup(syncer.Stop)
@@ -1561,7 +1470,7 @@ func newReloadServerWithTokenSources(
 		database, syncer, nil, nil, cfg, cfgPath,
 		ServerOptions{TokenSources: set},
 	)
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
 	return srv, set
 }
 
@@ -1600,8 +1509,8 @@ repository_selection = "all"
 
 		// RestartRequired must fire, and the live chain must not flip
 		// reads onto the app token while write trackers are missing.
-		assert.True(srv.bootCfgSnapshot.restartRequiredFor(newCfg))
-		srv.updateTokenSourcesForReload(newCfg)
+		assert.True(srv.bootCfgSnapshot.RestartRequiredFor(newCfg))
+		srv.configreload.UpdateTokenSourcesForReload(newCfg)
 		src, ok := set.Get(githubKey)
 		require.True(t, ok)
 		assert.False(src.Descriptor().HasActiveGitHubApp(),
@@ -1620,9 +1529,9 @@ repository_selection = "all"
 		srv, set := newReloadServerWithTokenSources(t, bootCfg, bootPath)
 		newCfg, _ := loadCfg(t, "new-no-app.toml", validReloadConfig)
 
-		assert.True(srv.bootCfgSnapshot.restartRequiredFor(newCfg),
+		assert.True(srv.bootCfgSnapshot.RestartRequiredFor(newCfg),
 			"removing an app changes split topology and must flag a restart")
-		srv.updateTokenSourcesForReload(newCfg)
+		srv.configreload.UpdateTokenSourcesForReload(newCfg)
 		src, ok := set.Get(ownerKey)
 		require.True(t, ok)
 		assert.True(src.Descriptor().HasActiveGitHubApp(),
@@ -1643,7 +1552,7 @@ repository_selection = "all"
 		srv, set := newReloadServerWithTokenSources(t, bootCfg, bootPath)
 		newCfg, _ := loadCfg(t, "new-env.toml", validReloadConfigChangedGitHubTokenEnv)
 
-		srv.updateTokenSourcesForReload(newCfg)
+		srv.configreload.UpdateTokenSourcesForReload(newCfg)
 		src, ok := set.Get(githubKey)
 		require.True(t, ok)
 		assert.Contains(t, src.Descriptor().SafeString(), "KENN_FORGE_NEW_GITHUB_TOKEN",
@@ -1676,8 +1585,8 @@ func TestConfigReload_ForgejoHostCloneSourceFollowsRotatedToken(t *testing.T) {
 	t.Setenv("KENN_FORGE_FORGEJO_TOKEN_A", "forgejo-token")
 	t.Setenv("KENN_FORGE_FORGEJO_TOKEN_B", "rotated-token")
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, reloadForgejoHostConfig(`token_env = "KENN_FORGE_FORGEJO_TOKEN_A"`), &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, reloadForgejoHostConfig(`token_env = "KENN_FORGE_FORGEJO_TOKEN_A"`), &serverfake.MockGH{},
 	)
 	sourceSet, cloneSrc := reloadTestTokenSources(
 		t, cfgPath, tokenauth.CloneKey("code.example.com"),
@@ -1713,8 +1622,8 @@ func TestConfigReload_ForgejoHostCloneSourceClearsWhenTokenRemoved(t *testing.T)
 	t.Setenv("KENN_FORGE_GITHUB_TOKEN", "github-token")
 	t.Setenv("KENN_FORGE_FORGEJO_TOKEN_A", "forgejo-token")
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, reloadForgejoHostConfig(`token_env = "KENN_FORGE_FORGEJO_TOKEN_A"`), &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, reloadForgejoHostConfig(`token_env = "KENN_FORGE_FORGEJO_TOKEN_A"`), &serverfake.MockGH{},
 	)
 	sourceSet, cloneSrc := reloadTestTokenSources(
 		t, cfgPath, tokenauth.CloneKey("code.example.com"),
@@ -1745,8 +1654,8 @@ func TestConfigReload_RepoTokenOverrideWithPlatformFallbackUpdatesSource(t *test
 	t.Setenv("KENN_FORGE_PLATFORM_TOKEN", "platform-token")
 	t.Setenv("KENN_FORGE_REPO_TOKEN", "repo-token")
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfigPlatformTokenEnv, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfigPlatformTokenEnv, &serverfake.MockGH{},
 	)
 	sourceSet := tokenauth.NewSourceSet(tokenauth.Options{})
 	srv.cfgMu.Lock()
@@ -1854,8 +1763,8 @@ label = "Helper"
 command = ["/bin/echo"]
 `
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, initialConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, initialConfig, &serverfake.MockGH{},
 	)
 	owner := &fakeRuntimeOwner{}
 	srv.runtime = localruntime.NewManager(localruntime.Options{
@@ -1893,8 +1802,8 @@ command = ["/bin/echo"]
 func TestConfigReload_InvalidConfigKeepsLastKnownGood(t *testing.T) {
 	assert := assert.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -1924,8 +1833,8 @@ func TestConfigReload_InvalidConfigKeepsLastKnownGood(t *testing.T) {
 func TestConfigReload_MalformedTomlDoesNotCrash(t *testing.T) {
 	assert := assert.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -1939,29 +1848,15 @@ func TestConfigReload_MalformedTomlDoesNotCrash(t *testing.T) {
 		"parse error should reference the sanitized config path")
 }
 
-func TestSanitizeConfigErrorRedactsTokenMaterial(t *testing.T) {
-	assert := assert.New(t)
-
-	got := sanitizeConfigError(
-		errors.New("open /home/me/.kenn/forge/config.toml: https://x-access-token:ghp_config_secret@github.com/acme/widgets.git failed"),
-		"/home/me/.kenn/forge/config.toml",
-	)
-
-	assert.Contains(got, "config.toml")
-	assert.Contains(got, "[REDACTED]")
-	assert.NotContains(got, "ghp_config_secret")
-	assert.NotContains(got, "x-access-token")
-}
-
 func TestConfigReload_NewRepoEntersSyncerTrackedSet(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, syncer := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	archiveLifecycle := &reloadArchiveLifecycleRecorder{}
-	srv.syncer.SetArchiveService(archiveLifecycle)
+	syncer.SetArchiveService(archiveLifecycle)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
 	defer stream.Close()
@@ -1971,7 +1866,7 @@ func TestConfigReload_NewRepoEntersSyncerTrackedSet(t *testing.T) {
 	ev := waitForConfigEvent(t, stream, 2*time.Second)
 	require.True(ev.Valid)
 
-	tracked := srv.syncer.TrackedRepos()
+	tracked := syncer.TrackedRepos()
 	owners := make(map[string]struct{}, len(tracked))
 	for _, r := range tracked {
 		owners[strings.ToLower(r.Owner)+"/"+strings.ToLower(r.Name)] = struct{}{}
@@ -1989,17 +1884,17 @@ func TestConfigReload_ResolvedArchivedStateReplacesFallbackDuplicate(t *testing.
 	require := require.New(t)
 
 	var listedRepos sync.Map
-	srv, database, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{
+	srv, database, cfgPath, syncer := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{
 			// The exact entry cannot resolve, so it falls back to the
 			// previously tracked (stale, live) ref.
-			getRepositoryFn: func(
+			GetRepositoryFn: func(
 				context.Context, string, string,
 			) (*gh.Repository, error) {
 				return nil, errors.New("temporary repo lookup failure")
 			},
 			// The overlapping glob resolves the same repo as archived.
-			listReposByOwnerFn: func(
+			ListReposByOwnerFn: func(
 				_ context.Context, owner string,
 			) ([]*gh.Repository, error) {
 				return []*gh.Repository{{
@@ -2009,7 +1904,7 @@ func TestConfigReload_ResolvedArchivedStateReplacesFallbackDuplicate(t *testing.
 					Archived: new(true),
 				}}, nil
 			},
-			listNotificationsFn: func(
+			ListNotificationsFn: func(
 				_ context.Context, opts ghclient.NotificationListOptions,
 			) ([]ghclient.NotificationThread, bool, error) {
 				if opts.RepoName != "" {
@@ -2028,7 +1923,7 @@ func TestConfigReload_ResolvedArchivedStateReplacesFallbackDuplicate(t *testing.
 	stream := streamConfigEvents(t, srv)
 	defer stream.Close()
 
-	srv.syncer.SetRepos([]ghclient.RepoRef{{
+	syncer.SetRepos([]ghclient.RepoRef{{
 		Owner:        "acme",
 		Name:         "widget",
 		PlatformHost: "github.com",
@@ -2040,10 +1935,10 @@ func TestConfigReload_ResolvedArchivedStateReplacesFallbackDuplicate(t *testing.
 	ev := waitForConfigEvent(t, stream, 2*time.Second)
 	require.True(ev.Valid)
 
-	require.True(trackedRepoArchived(srv, "acme", "widget"),
+	require.True(trackedRepoArchived(syncer, "acme", "widget"),
 		"resolved archived metadata must replace the fallback duplicate")
 
-	require.NoError(srv.syncer.SyncNotifications(t.Context()))
+	require.NoError(syncer.SyncNotifications(t.Context()))
 	_, listedWidget := listedRepos.Load("widget")
 	assert.False(listedWidget,
 		"repo resolved as archived must be excluded from notification polling")
@@ -2052,12 +1947,12 @@ func TestConfigReload_ResolvedArchivedStateReplacesFallbackDuplicate(t *testing.
 func TestConfigReload_FallbackKeepsRenamedArchivedTrackedRepo(t *testing.T) {
 	require := require.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{
+	srv, _, cfgPath, syncer := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{
 			// The exact entry cannot resolve during the reload; the
 			// previously tracked repo was renamed provider-side, so its
 			// route no longer matches the configured path.
-			getRepositoryFn: func(
+			GetRepositoryFn: func(
 				context.Context, string, string,
 			) (*gh.Repository, error) {
 				return nil, errors.New("temporary repo lookup failure")
@@ -2068,7 +1963,7 @@ func TestConfigReload_FallbackKeepsRenamedArchivedTrackedRepo(t *testing.T) {
 	stream := streamConfigEvents(t, srv)
 	defer stream.Close()
 
-	srv.syncer.SetRepos([]ghclient.RepoRef{{
+	syncer.SetRepos([]ghclient.RepoRef{{
 		Owner:              "acme",
 		Name:               "widget-next",
 		PlatformHost:       "github.com",
@@ -2083,10 +1978,10 @@ func TestConfigReload_FallbackKeepsRenamedArchivedTrackedRepo(t *testing.T) {
 	ev := waitForConfigEvent(t, stream, 2*time.Second)
 	require.True(ev.Valid)
 
-	require.True(trackedRepoArchived(srv, "acme", "widget-next"),
+	require.True(trackedRepoArchived(syncer, "acme", "widget-next"),
 		"fallback must keep the renamed archived tracked repo, not"+
 			" synthesize a live duplicate under the stale configured route")
-	for _, repo := range srv.syncer.TrackedRepos() {
+	for _, repo := range syncer.TrackedRepos() {
 		require.NotEqual("widget", repo.Name,
 			"stale configured route must not be tracked as a duplicate")
 	}
@@ -2100,8 +1995,8 @@ func TestConfigReload_RouteReuseRefreshThenFailedReloadTracksRenamedRepoOnce(t *
 	// widget to widget-next and a different repository reused the old route;
 	// exact lookups fail transiently while the glob still lists both.
 	renamed := atomic.Bool{}
-	mock := &mockGH{
-		getRepositoryFn: func(
+	mock := &serverfake.MockGH{
+		GetRepositoryFn: func(
 			_ context.Context, owner, repo string,
 		) (*gh.Repository, error) {
 			if renamed.Load() {
@@ -2114,7 +2009,7 @@ func TestConfigReload_RouteReuseRefreshThenFailedReloadTracksRenamedRepoOnce(t *
 				Archived: new(false),
 			}, nil
 		},
-		listReposByOwnerFn: func(
+		ListReposByOwnerFn: func(
 			_ context.Context, owner string,
 		) ([]*gh.Repository, error) {
 			if !renamed.Load() {
@@ -2141,10 +2036,10 @@ func TestConfigReload_RouteReuseRefreshThenFailedReloadTracksRenamedRepoOnce(t *
 			}, nil
 		},
 	}
-	srv, _, cfgPath := setupTestServerWithConfigContent(
+	srv, _, cfgPath, syncer := setupTestServerWithConfigContent(
 		t, validReloadConfigExactPlusGlob, mock,
 	)
-	require.True(srv.syncer.IsTrackedRepo("acme", "widget"))
+	require.True(syncer.IsTrackedRepo("acme", "widget"))
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
 	defer stream.Close()
@@ -2160,7 +2055,7 @@ func TestConfigReload_RouteReuseRefreshThenFailedReloadTracksRenamedRepoOnce(t *
 	ev := waitForConfigEvent(t, stream, 2*time.Second)
 	require.True(ev.Valid)
 
-	tracked := srv.syncer.TrackedRepos()
+	tracked := syncer.TrackedRepos()
 	require.Len(tracked, 2,
 		"renamed repo and route successor, no synthetic duplicate")
 	byName := make(map[string]ghclient.RepoRef, len(tracked))
@@ -2180,9 +2075,9 @@ func TestConfigReload_GlobFailureKeepsPreviouslyTrackedMatches(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{
-			listReposByOwnerFn: func(context.Context, string) ([]*gh.Repository, error) {
+	srv, _, cfgPath, syncer := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{
+			ListReposByOwnerFn: func(context.Context, string) ([]*gh.Repository, error) {
 				return nil, errors.New("temporary repo listing failure")
 			},
 		},
@@ -2191,7 +2086,7 @@ func TestConfigReload_GlobFailureKeepsPreviouslyTrackedMatches(t *testing.T) {
 	stream := streamConfigEvents(t, srv)
 	defer stream.Close()
 
-	srv.syncer.SetRepos([]ghclient.RepoRef{{
+	syncer.SetRepos([]ghclient.RepoRef{{
 		Owner:        "acme",
 		Name:         "widget-api",
 		PlatformHost: "github.com",
@@ -2203,7 +2098,7 @@ func TestConfigReload_GlobFailureKeepsPreviouslyTrackedMatches(t *testing.T) {
 	ev := waitForConfigEvent(t, stream, 2*time.Second)
 	require.True(ev.Valid)
 
-	tracked := srv.syncer.TrackedRepos()
+	tracked := syncer.TrackedRepos()
 	require.Len(tracked, 1)
 	assert.Equal("acme", tracked[0].Owner)
 	assert.Equal("widget-api", tracked[0].Name)
@@ -2212,8 +2107,8 @@ func TestConfigReload_GlobFailureKeepsPreviouslyTrackedMatches(t *testing.T) {
 func TestConfigReload_DebouncesBurstedWrites(t *testing.T) {
 	assert := assert.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -2253,8 +2148,8 @@ func TestConfigReload_DebouncesBurstedWrites(t *testing.T) {
 func TestConfigReload_SubscriberAfterParseErrorGetsCachedEvent(t *testing.T) {
 	assert := assert.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 
@@ -2274,82 +2169,27 @@ func TestConfigReload_SubscriberAfterParseErrorGetsCachedEvent(t *testing.T) {
 	assert.NotEmpty(cached.Error)
 }
 
-// TestRestartRequiredForAuthFleetRoleAndSessions pins startup-bound settings
-// while member and timeout edits remain live.
-func TestRestartRequiredForAuthFleetRoleAndSessions(t *testing.T) {
-	require := require.New(t)
-	base := func() *config.Config {
-		cfg := &config.Config{}
-		cfg.API.RequireAuth = true
-		cfg.Fleet.BaseURL = "https://hub.example"
-		cfg.Fleet.Sessions.IncludeUnmanagedDetails = false
-		cfg.Fleet.Members = []config.FleetMember{
-			{NodeID: "fedcba9876543210fedcba9876543210", BaseURL: "https://spoke.example", State: "active"},
-		}
-		return cfg
-	}
-	snap := snapshotStartupConfig(base())
-
-	require.False(snap.restartRequiredFor(base()),
-		"identical config must not demand a restart")
-
-	enabledFlipped := base()
-	enabledFlipped.Fleet.Enabled = true
-	require.False(snap.restartRequiredFor(enabledFlipped),
-		"fleet.enabled changes apply without restart")
-
-	timeoutChanged := base()
-	timeoutChanged.Fleet.PeerTimeout = "4s"
-	require.False(snap.restartRequiredFor(timeoutChanged),
-		"fleet.peer_timeout changes apply without restart")
-
-	memberAdded := base()
-	memberAdded.Fleet.Members = append(memberAdded.Fleet.Members, config.FleetMember{
-		NodeID: "0123456789abcdef0123456789abcdef", BaseURL: "https://mini.example", State: "active",
-	})
-	require.False(snap.restartRequiredFor(memberAdded),
-		"federation member changes apply without restart")
-
-	authFlipped := base()
-	authFlipped.API.RequireAuth = false
-	require.True(snap.restartRequiredFor(authFlipped))
-
-	fleetSessionsFlipped := base()
-	fleetSessionsFlipped.Fleet.Sessions.IncludeUnmanagedDetails = true
-	require.True(snap.restartRequiredFor(fleetSessionsFlipped))
-
-	originChanged := base()
-	originChanged.Fleet.BaseURL = "https://new-hub.example"
-	require.True(snap.restartRequiredFor(originChanged))
-
-	tailscaleServeChanged := base()
-	tailscaleServeChanged.API.TailscaleServe = config.TailscaleServeAPI{
-		Enabled: true, AllowedUsers: []string{"user@example.com"},
-	}
-	require.True(snap.restartRequiredFor(tailscaleServeChanged))
-}
-
 func TestActiveFleetConfigSnapshotDefersHotEnableUntilRuntimeAuth(t *testing.T) {
 	assert := assert.New(t)
 	boot := &config.Config{}
-	srv := &Server{
+	srv := wiredServer(&Server{
 		cfg: &config.Config{
 			API:   config.API{RequireAuth: true},
 			Fleet: config.Fleet{Enabled: true, Role: config.FleetRoleHub},
 		},
-		bootCfgSnapshot: snapshotStartupConfig(boot),
-	}
+		bootCfgSnapshot: configreload.SnapshotStartupConfig(boot),
+	})
 
-	assert.False(srv.activeFleetConfigSnapshotLocked().Fleet.Enabled)
-	assert.False(srv.federationEnabled())
+	assert.False(srv.streamapi.ActiveFleetConfigSnapshotLocked().Fleet.Enabled)
+	assert.False(srv.streamapi.FederationEnabled())
 
 	// A restart installs the requested API authentication policy before
 	// federation becomes active.
-	srv.daemonRequests = newDaemonRequestPolicy(DaemonAccessOptions{
+	srv.daemonRequests = authapi.NewDaemonRequestPolicy(authapi.DaemonAccessOptions{
 		Token: "local-secret", RequireAPIAuth: true,
 	})
-	assert.True(srv.activeFleetConfigSnapshotLocked().Fleet.Enabled)
-	assert.True(srv.federationEnabled())
+	assert.True(srv.streamapi.ActiveFleetConfigSnapshotLocked().Fleet.Enabled)
+	assert.True(srv.streamapi.FederationEnabled())
 }
 
 func TestActiveFleetConfigSnapshotKeepsBootIdentity(t *testing.T) {
@@ -2361,7 +2201,7 @@ func TestActiveFleetConfigSnapshotKeepsBootIdentity(t *testing.T) {
 			Name:   "Hub", BaseURL: "https://hub.example",
 		},
 	}}
-	srv := &Server{
+	srv := wiredServer(&Server{
 		cfg: &config.Config{Fleet: config.Fleet{
 			Role: config.FleetRoleHub, BaseURL: "https://new-spoke.example",
 			Hub: &config.FleetHub{
@@ -2374,10 +2214,10 @@ func TestActiveFleetConfigSnapshotKeepsBootIdentity(t *testing.T) {
 			}},
 			PeerTimeout: "4s",
 		}},
-		bootCfgSnapshot: snapshotStartupConfig(boot),
-	}
+		bootCfgSnapshot: configreload.SnapshotStartupConfig(boot),
+	})
 
-	snapshot := srv.activeFleetConfigSnapshotLocked()
+	snapshot := srv.streamapi.ActiveFleetConfigSnapshotLocked()
 
 	assert.Equal(config.FleetRoleSpoke, snapshot.Fleet.Role)
 	assert.Equal(boot.Fleet.BaseURL, snapshot.Fleet.BaseURL)
@@ -2391,7 +2231,7 @@ func TestActiveFleetConfigSnapshotKeepsBootIdentity(t *testing.T) {
 
 func TestFleetMemberPersistenceUsesBootIdentityAfterReload(t *testing.T) {
 	require := require.New(t)
-	srv, _, cfgPath := setupTestServerWithConfigContent(t, `
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(t, `
 host = "127.0.0.1"
 port = 8091
 
@@ -2402,7 +2242,7 @@ require_auth = true
 enabled = true
 role = "hub"
 base_url = "https://hub.example"
-`, &mockGH{})
+`, &serverfake.MockGH{})
 
 	writeConfigToml(t, cfgPath, `
 host = "127.0.0.1"
@@ -2420,10 +2260,10 @@ base_url = "https://spoke.example"
 node_id = "11111111111111111111111111111111"
 base_url = "https://replacement-hub.example"
 `)
-	event := srv.applyConfigChange(t.Context())
+	event := srv.configreload.ApplyConfigChange(t.Context())
 	require.True(event.Valid, event.Error)
 	require.True(event.RestartRequired)
-	fleetCfg := srv.activeFleetConfigSnapshotLocked().Fleet
+	fleetCfg := srv.streamapi.ActiveFleetConfigSnapshotLocked().Fleet
 	require.Equal(config.FleetRoleHub, fleetCfg.RoleOrDefault())
 
 	member := config.FleetMember{
@@ -2431,7 +2271,7 @@ base_url = "https://replacement-hub.example"
 		BaseURL: "https://spoke-a.example",
 		State:   "active",
 	}
-	require.NoError(srv.persistFleetMember(t.Context(), member))
+	require.NoError(srv.settingsapi.PersistFleetMember(t.Context(), member))
 
 	persisted, err := config.Load(cfgPath)
 	require.NoError(err)
@@ -2442,190 +2282,13 @@ base_url = "https://replacement-hub.example"
 
 	persisted.Fleet.Members[0].OutboundDisabled = true
 	require.NoError(persisted.Save(cfgPath))
-	require.True(srv.applyConfigChange(t.Context()).Valid)
+	require.True(srv.configreload.ApplyConfigChange(t.Context()).Valid)
 	member.Name = "Renamed spoke"
-	require.NoError(srv.persistFleetMember(t.Context(), member))
+	require.NoError(srv.settingsapi.PersistFleetMember(t.Context(), member))
 	persisted, err = config.Load(cfgPath)
 	require.NoError(err)
 	require.True(persisted.Fleet.Members[0].OutboundDisabled)
 	require.Equal(member.Name, persisted.Fleet.Members[0].Name)
-}
-
-func TestRestartRequiredForFleetRoleAndHubBinding(t *testing.T) {
-	require := require.New(t)
-	base := &config.Config{
-		Fleet: config.Fleet{
-			Role: config.FleetRoleHub,
-			Members: []config.FleetMember{{
-				NodeID: "fedcba9876543210fedcba9876543210", Name: "Spoke A", BaseURL: "https://spoke.test", State: "active",
-			}},
-		},
-	}
-	snap := snapshotStartupConfig(base)
-
-	roleChanged := *base
-	roleChanged.Fleet = base.Fleet
-	roleChanged.Fleet.Role = config.FleetRoleSpoke
-	roleChanged.Fleet.Hub = &config.FleetHub{
-		NodeID:  "0123456789abcdef0123456789abcdef",
-		BaseURL: "https://hub.test",
-	}
-	require.True(snap.restartRequiredFor(&roleChanged))
-
-	bound := roleChanged
-	boundSnap := snapshotStartupConfig(&bound)
-	bindingChanged := bound
-	bindingChanged.Fleet = bound.Fleet
-	bindingChanged.Fleet.Hub = &config.FleetHub{
-		NodeID:  bound.Fleet.Hub.NodeID,
-		BaseURL: "https://new-hub.test",
-	}
-	require.True(boundSnap.restartRequiredFor(&bindingChanged))
-
-	hubNameChanged := bound
-	hubNameChanged.Fleet = bound.Fleet
-	hubNameChanged.Fleet.Hub = &config.FleetHub{
-		NodeID:  bound.Fleet.Hub.NodeID,
-		Name:    "Renamed hub",
-		BaseURL: bound.Fleet.Hub.BaseURL,
-	}
-	require.False(boundSnap.restartRequiredFor(&hubNameChanged))
-
-	displayChanged := *base
-	displayChanged.Fleet = base.Fleet
-	displayChanged.Fleet.Members = slices.Clone(base.Fleet.Members)
-	displayChanged.Fleet.Members[0].Name = "Renamed spoke"
-	require.False(snap.restartRequiredFor(&displayChanged))
-}
-
-func TestRestartRequiredForMCPConfig(t *testing.T) {
-	assert := assert.New(t)
-	base := &config.Config{MCP: config.MCP{Enabled: true, Port: 8092, DiffCacheMB: 128}}
-	snap := snapshotStartupConfig(base)
-
-	assert.False(snap.restartRequiredFor(&config.Config{
-		MCP: config.MCP{Enabled: true, Port: 8092, DiffCacheMB: 128},
-	}))
-	assert.True(snap.restartRequiredFor(&config.Config{
-		MCP: config.MCP{Enabled: false, Port: 8092, DiffCacheMB: 128},
-	}))
-	assert.True(snap.restartRequiredFor(&config.Config{
-		MCP: config.MCP{Enabled: true, Port: 9192, DiffCacheMB: 128},
-	}))
-	assert.True(snap.restartRequiredFor(&config.Config{
-		MCP: config.MCP{Enabled: true, Port: 8092, DiffCacheMB: 256},
-	}))
-}
-
-func TestRestartRequiredForGitHubArchiveRoutes(t *testing.T) {
-	assert := assert.New(t)
-	base := &config.Config{
-		Repos: []config.Repo{{Owner: "acme", Name: "widget"}},
-		GitHubApps: []config.GitHubAppConfig{{
-			Host: "github.com", Role: "archive", AppID: 1,
-			PrivateKeyPath: "archive.pem", InstallationID: 2,
-			InstallationAccount: "acme", RepositorySelection: "all",
-		}},
-	}
-	snap := snapshotStartupConfig(base)
-	assert.False(snap.restartRequiredFor(base))
-
-	changed := *base
-	changed.GitHubApps = slices.Clone(base.GitHubApps)
-	changed.GitHubApps[0].InstallationID = 3
-	assert.True(snap.restartRequiredFor(&changed))
-}
-
-func TestRestartRequiredForPlatformTransportChange(t *testing.T) {
-	require := require.New(t)
-	base := func() *config.Config {
-		return &config.Config{Platforms: []config.PlatformConfig{
-			{
-				Type:          "gitea",
-				Host:          "gitea.example.test:3000",
-				BaseURL:       "http://gitea.example.test:3000",
-				AllowInsecure: true,
-			},
-		}}
-	}
-	snapshot := snapshotStartupConfig(base())
-
-	require.False(snapshot.restartRequiredFor(base()))
-
-	baseURLChanged := base()
-	baseURLChanged.Platforms[0].BaseURL = "https://gitea.example.test:3000"
-	require.True(snapshot.restartRequiredFor(baseURLChanged))
-
-	allowInsecureChanged := base()
-	allowInsecureChanged.Platforms[0].AllowInsecure = false
-	require.True(snapshot.restartRequiredFor(allowInsecureChanged))
-}
-
-func TestRestartRequiredForRoborevEndpointButNotManagedCloneInit(t *testing.T) {
-	assert := assert.New(t)
-	base := &config.Config{Roborev: config.Roborev{
-		Endpoint: "http://127.0.0.1:7373",
-	}}
-	snap := snapshotStartupConfig(base)
-
-	toggleChanged := *base
-	toggleChanged.Roborev.InitManagedClones = true
-	assert.False(snap.restartRequiredFor(&toggleChanged))
-
-	endpointChanged := *base
-	endpointChanged.Roborev.Endpoint = "http://localhost:7474"
-	assert.True(snap.restartRequiredFor(&endpointChanged))
-}
-
-func TestRestartRequiredForNotificationIntervals(t *testing.T) {
-	require := require.New(t)
-	base := func() *config.Config {
-		cfg := &config.Config{}
-		cfg.SyncInterval = "5m"
-		cfg.ActivePRRefreshInterval = "2m"
-		cfg.ActivePRWindow = "4h"
-		cfg.Notifications.SyncInterval = "30s"
-		cfg.Notifications.PropagationInterval = "1m"
-		cfg.Notifications.BatchSize = 25
-		return cfg
-	}
-	snap := snapshotStartupConfig(base())
-
-	require.False(snap.restartRequiredFor(base()),
-		"identical notification loop config must not demand a restart")
-
-	syncIntervalChanged := base()
-	syncIntervalChanged.Notifications.SyncInterval = "2m"
-	require.True(snap.restartRequiredFor(syncIntervalChanged),
-		"notification sync_interval is bound to the startup ticker")
-
-	propagationIntervalChanged := base()
-	propagationIntervalChanged.Notifications.PropagationInterval = "5m"
-	require.True(snap.restartRequiredFor(propagationIntervalChanged),
-		"notification propagation_interval is bound to the startup ticker")
-
-	batchSizeChanged := base()
-	batchSizeChanged.Notifications.BatchSize = 50
-	require.True(snap.restartRequiredFor(batchSizeChanged),
-		"notification batch_size is snapped by the loop")
-
-	activeRefreshChanged := base()
-	activeRefreshChanged.ActivePRRefreshInterval = "30s"
-	require.False(snap.restartRequiredFor(activeRefreshChanged),
-		"active PR refresh interval is hot-reloadable by the syncer")
-
-	activeHotWindowChanged := base()
-	activeHotWindowChanged.ActivePRHotWindow = "30m"
-	require.False(snap.restartRequiredFor(activeHotWindowChanged))
-
-	activeWarmRefreshChanged := base()
-	activeWarmRefreshChanged.ActivePRWarmRefreshInterval = "5m"
-	require.False(snap.restartRequiredFor(activeWarmRefreshChanged))
-
-	activeWindowChanged := base()
-	activeWindowChanged.ActivePRWindow = "8h"
-	require.False(snap.restartRequiredFor(activeWindowChanged),
-		"active PR window is hot-reloadable by the syncer")
 }
 
 const validReloadConfigAuthGate = `
@@ -2697,8 +2360,8 @@ func TestConfigReload_RestartRequiredOnAuthGateChange(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -2710,7 +2373,7 @@ func TestConfigReload_RestartRequiredOnAuthGateChange(t *testing.T) {
 	assert.True(ev.Valid)
 	assert.True(ev.RestartRequired,
 		"[api].require_auth change should mark restart_required")
-	assert.False(srv.federationEnabled(),
+	assert.False(srv.streamapi.FederationEnabled(),
 		"fleet activation must wait for the requested auth policy to install")
 
 	srv.cfgMu.Lock()
@@ -2728,8 +2391,8 @@ func TestConfigReload_RestartRequiredOnFleetSessionsChange(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -2757,8 +2420,8 @@ func TestConfigReload_SettingsSavePreservesRestartRequiredFields(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	srv, _, cfgPath := setupTestServerWithConfigContent(
-		t, validReloadConfig, &mockGH{},
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &serverfake.MockGH{},
 	)
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
@@ -2770,7 +2433,7 @@ func TestConfigReload_SettingsSavePreservesRestartRequiredFields(t *testing.T) {
 	require.True(ev.Valid, "reload error: %s", ev.Error)
 	require.True(ev.RestartRequired)
 
-	rr := testutil.DoJSON(t, srv, http.MethodPut, "/api/v1/settings", updateSettingsRequest{
+	rr := testutil.DoJSON(t, srv, http.MethodPut, "/api/v1/settings", spokeapi.UpdateSettingsRequest{
 		Activity: &config.Activity{
 			ViewMode:  "flat",
 			TimeRange: "30d",
@@ -2812,8 +2475,8 @@ func TestConfigReloadRejectedCandidateStillStripsItsTokenNames(t *testing.T) {
 	t.Setenv("KENN_FORGE_GITHUB_TOKEN", "")
 	t.Setenv("KENN_FORGE_REPO_TOKEN", "old")
 
-	srv, _, cfgPath := setupTestServerWithConfigContentAndOptions(
-		t, validReloadConfigRepoTokenEnv, &mockGH{}, ServerOptions{
+	srv, _, cfgPath, _ := setupTestServerWithConfigContentAndOptions(
+		t, validReloadConfigRepoTokenEnv, &serverfake.MockGH{}, ServerOptions{
 			HostCheckAllowLoopbackAnyPort:      true,
 			WorktreeDir:                        t.TempDir(),
 			DisableWorkspaceBackgroundMonitors: true,
@@ -2837,7 +2500,7 @@ owner = "acme"
 name = "widget"
 token_env = "WKSP_CANDIDATE_ONLY_TOKEN"
 `)
-	event := srv.applyConfigChange(t.Context())
+	event := srv.configreload.ApplyConfigChange(t.Context())
 	require.False(event.Valid, "reload with an unset token env must be rejected")
 	assert.Contains(srv.workspaces.TmuxStripEnvVars(),
 		"WKSP_CANDIDATE_ONLY_TOKEN",
@@ -2853,8 +2516,8 @@ func TestConfigReloadStructurallyInvalidCandidateStillStripsItsTokenNames(
 ) {
 	assert := assert.New(t)
 	require := require.New(t)
-	srv, _, cfgPath := setupTestServerWithConfigContentAndOptions(
-		t, validReloadConfig, &mockGH{}, ServerOptions{
+	srv, _, cfgPath, _ := setupTestServerWithConfigContentAndOptions(
+		t, validReloadConfig, &serverfake.MockGH{}, ServerOptions{
 			HostCheckAllowLoopbackAnyPort:      true,
 			WorktreeDir:                        t.TempDir(),
 			DisableWorkspaceBackgroundMonitors: true,
@@ -2870,7 +2533,7 @@ port = 8091
 owner = "acme"
 name = "widget"
 `)
-	event := srv.applyConfigChange(t.Context())
+	event := srv.configreload.ApplyConfigChange(t.Context())
 	require.False(event.Valid, "structurally invalid candidate must be rejected")
 	assert.Contains(srv.workspaces.TmuxStripEnvVars(),
 		"WKSP_INVALID_CANDIDATE_TOKEN",
@@ -2885,8 +2548,8 @@ func TestConfigReloadDeprecatedKeyCandidateStillStripsItsTokenNames(
 ) {
 	assert := assert.New(t)
 	require := require.New(t)
-	srv, _, cfgPath := setupTestServerWithConfigContentAndOptions(
-		t, validReloadConfig, &mockGH{}, ServerOptions{
+	srv, _, cfgPath, _ := setupTestServerWithConfigContentAndOptions(
+		t, validReloadConfig, &serverfake.MockGH{}, ServerOptions{
 			HostCheckAllowLoopbackAnyPort:      true,
 			WorktreeDir:                        t.TempDir(),
 			DisableWorkspaceBackgroundMonitors: true,
@@ -2902,7 +2565,7 @@ port = 8091
 id = "notes"
 path = "/tmp/notes"
 `)
-	event := srv.applyConfigChange(t.Context())
+	event := srv.configreload.ApplyConfigChange(t.Context())
 	require.False(event.Valid, "deprecated keys must reject the reload")
 	assert.Contains(srv.workspaces.TmuxStripEnvVars(),
 		"WKSP_DEPRECATED_CANDIDATE_TOKEN",
@@ -2918,8 +2581,8 @@ func TestConfigReloadRejectedCollisionDoesNotPoisonStripSets(
 ) {
 	assert := assert.New(t)
 	require := require.New(t)
-	srv, _, cfgPath := setupTestServerWithConfigContentAndOptions(
-		t, validReloadConfig, &mockGH{}, ServerOptions{
+	srv, _, cfgPath, _ := setupTestServerWithConfigContentAndOptions(
+		t, validReloadConfig, &serverfake.MockGH{}, ServerOptions{
 			HostCheckAllowLoopbackAnyPort:      true,
 			WorktreeDir:                        t.TempDir(),
 			DisableWorkspaceBackgroundMonitors: true,
@@ -2935,7 +2598,7 @@ port = 8091
 owner = "acme"
 name = "widget"
 `)
-	event := srv.applyConfigChange(t.Context())
+	event := srv.configreload.ApplyConfigChange(t.Context())
 	require.False(event.Valid, "terminal-variable token names must be rejected")
 	assert.NotContains(srv.workspaces.TmuxStripEnvVars(), "TMUX_TMPDIR",
 		"rejected collisions must never enter the strip sets")
@@ -2943,7 +2606,7 @@ name = "widget"
 
 func TestInitializeProviderRepositoriesKeepsHTTPReadyDuringDiscovery(t *testing.T) {
 	require := require.New(t)
-	srv, _, _ := setupTestServerWithConfigContent(t, validReloadConfig, &mockGH{})
+	srv, _, _, syncer := setupTestServerWithConfigContent(t, validReloadConfig, &serverfake.MockGH{})
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	done := make(chan error, 1)
@@ -2965,14 +2628,14 @@ func TestInitializeProviderRepositoriesKeepsHTTPReadyDuringDiscovery(t *testing.
 	assert.Equal(t, http.StatusOK, response.Code)
 	close(release)
 	require.NoError(<-done)
-	repos := srv.syncer.TrackedRepos()
+	repos := syncer.TrackedRepos()
 	require.Len(repos, 1)
 	require.Equal(int64(12345), repos[0].PlatformRepoID)
 }
 
 func TestInitializeProviderRepositoriesKeepsRepoAddedDuringDiscovery(t *testing.T) {
 	require := require.New(t)
-	srv, _, _ := setupTestServerWithConfigContent(t, validReloadConfig, &mockGH{})
+	srv, _, _, syncer := setupTestServerWithConfigContent(t, validReloadConfig, &serverfake.MockGH{})
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	done := make(chan error, 1)
@@ -3000,7 +2663,7 @@ func TestInitializeProviderRepositoriesKeepsRepoAddedDuringDiscovery(t *testing.
 	require.NoError(<-done)
 	require.Equal(http.StatusCreated, <-added)
 	var names []string
-	for _, repo := range srv.syncer.TrackedRepos() {
+	for _, repo := range syncer.TrackedRepos() {
 		names = append(names, repo.Owner+"/"+repo.Name)
 	}
 	require.ElementsMatch([]string{"acme/widget", "other-org/other-repo"}, names)

@@ -25,6 +25,7 @@ import (
 	"go.kenn.io/forge/internal/testutil/dbtest"
 	"go.kenn.io/forge/internal/testutil/gitfixture"
 	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/workspace"
 )
 
@@ -130,11 +131,11 @@ func TestDevboxReadsRenewExpiredContextOnce(t *testing.T) {
 		CreatedAt: issuedAt, UpdatedAt: issuedAt, LastActivityAt: issuedAt,
 	})
 	require.NoError(err)
-	controller := &Server{
+	controller := wiredServer(&Server{
 		options: ServerOptions{Devboxes: connections}, db: controllerDB,
 		repoResolver: httpapi.NewRepositoryResolver(httpapi.RepositoryResolverDeps{DB: controllerDB}),
 		now:          func() time.Time { return issuedAt.Add(time.Duration(elapsed.Load())) },
-	}
+	})
 	mux := http.NewServeMux()
 	controller.registerDevboxAPI(humago.New(mux, huma.DefaultConfig("controller", "1")))
 	request := func(path string) *httptest.ResponseRecorder {
@@ -221,7 +222,7 @@ func TestDevboxReadsRenewExpiredContextOnce(t *testing.T) {
 	replacement.PlatformRepoID = 1002
 	entry, err := controllerDB.ObserveRepository(ctx, replacement)
 	require.NoError(err)
-	seedPRForRepo(t, controllerDB, entry.Repository.ID, "github.com", "example-org", "project", 7)
+	serverfake.SeedPRForRepo(t, controllerDB, entry.Repository.ID, "github.com", "example-org", "project", 7)
 	routeReused.Store(true)
 	require.NoError(database.UpdateWorkspaceStatus(ctx, ws.ID, "ready", nil))
 	require.NoError(database.PutWorkspaceLaunchSpec(ctx, ws.ID, spec))

@@ -16,11 +16,14 @@ import (
 	"go.kenn.io/forge/internal/externalcontext"
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/server/httpapi"
+	"go.kenn.io/forge/internal/server/itemapi"
+	"go.kenn.io/forge/internal/server/spokeapi"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 )
 
 func TestConfigReloadPublishesExternalContextSources(t *testing.T) {
 	require := require.New(t)
-	srv, _, _ := setupTestServerWithConfigContent(t, validReloadConfig, &mockGH{})
+	srv, _, _, _ := setupTestServerWithConfigContent(t, validReloadConfig, &serverfake.MockGH{})
 	require.Empty(srv.externalContext.Sources())
 	executable, err := os.Executable()
 	require.NoError(err)
@@ -32,26 +35,26 @@ id = "checks"
 name = "Private checks"
 command = [%q]
 `, executable))
-	event := srv.applyConfigChange(t.Context())
+	event := srv.configreload.ApplyConfigChange(t.Context())
 	require.True(event.Valid, event.Error)
 	require.Equal([]externalcontext.ExternalContextSourceInfo{{ID: "checks", Name: "Private checks"}}, srv.externalContext.Sources())
 	writeConfigToml(t, reloadPath, malformedTomlConfig)
-	require.False(srv.applyConfigChange(t.Context()).Valid)
+	require.False(srv.configreload.ApplyConfigChange(t.Context()).Valid)
 	require.Len(srv.externalContext.Sources(), 1)
 	writeConfigToml(t, reloadPath, validReloadConfig)
-	require.True(srv.applyConfigChange(t.Context()).Valid)
+	require.True(srv.configreload.ApplyConfigChange(t.Context()).Valid)
 	require.Empty(srv.externalContext.Sources())
 }
 
 func TestExternalContextUsesHubSyncedPull(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	srv, database := setupTestServer(t)
-	seedPR(t, database, "acme", "widget", 42, func(pull *db.MergeRequest) {
+	srv, database, _ := setupTestServer(t)
+	serverfake.SeedPR(t, database, "acme", "widget", 42, func(pull *db.MergeRequest) {
 		pull.PlatformHeadSHA = "local-stale-head"
 		pull.PlatformBaseSHA = "local-stale-base"
 	})
-	srv.providerSource = &hubProviderSource{client: providerPlaneClientFunc(func(
+	srv.providerSource = &spokeapi.HubProviderSource{Client: providerPlaneClientFunc(func(
 		_ context.Context, scope federationauth.Scope, request *http.Request,
 	) (*http.Response, error) {
 		require.Equal(federationauth.ScopeProviderRead, scope)
@@ -68,7 +71,7 @@ func TestExternalContextUsesHubSyncedPull(t *testing.T) {
 			Request: request,
 		}, nil
 	})}
-	input := repoNumberInput{Provider: "github", PlatformHost: "github.com", Owner: "acme", Name: "widget", Number: 42}
+	input := itemapi.RepoNumberInput{Provider: "github", PlatformHost: "github.com", Owner: "acme", Name: "widget", Number: 42}
 	pull, err := srv.externalContextPull(t.Context(), input, 7001)
 	require.NoError(err)
 	assert.Equal(externalcontext.PullRequest{

@@ -20,6 +20,7 @@ import (
 	"go.kenn.io/forge/internal/gitclone"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/authapi"
 	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
 	"go.kenn.io/forge/internal/testutil/gitfixture"
@@ -130,6 +131,9 @@ func setupWorkspaceServerFixtureWithTmuxInjection(
 	bareDir := filepath.Join(dir, "clones")
 	require.NoError(t, os.MkdirAll(bareDir, 0o755))
 	clones := gitclone.New(bareDir, nil)
+	// Clone fetches outlive the setup that started them. Registered before the
+	// server shutdown cleanup, this runs after it and before TempDir removal.
+	t.Cleanup(clones.Wait)
 	bare, err := clones.ClonePathForContext(
 		gitclone.WithRepositoryIdentity(t.Context(), testutil.FixtureRepoID("acme", "widget")),
 		"github", "github.com", "acme", "widget",
@@ -165,7 +169,7 @@ func setupWorkspaceServerFixtureWithTmuxInjection(
 	}
 	options.Clones = clones
 	options.WorktreeDir = worktreeDir
-	options.HostCheck = server.HostCheckOptions{
+	options.HostCheck = authapi.HostCheckOptions{
 		Bind:    config.HostKey{Host: "127.0.0.1", Port: "8091"},
 		Allowed: []config.HostKey{{Host: "forge.test", Port: ""}},
 	}
