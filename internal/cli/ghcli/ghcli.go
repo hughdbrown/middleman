@@ -1,18 +1,24 @@
-// forge-gh can be installed as gh ahead of the real GitHub CLI on PATH.
-package main
+// Package ghcli runs kenn-forge as a stand-in for the GitHub CLI: a `gh`
+// symlink to kenn-forge, or `kenn-forge gh`, serves supported queries from
+// Forge and passes everything else to the real gh.
+package ghcli
 
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/spf13/cobra"
 	"go.kenn.io/forge/internal/apiclient"
 	"go.kenn.io/forge/internal/apiclient/generated"
 	"go.kenn.io/forge/internal/config"
@@ -22,36 +28,105 @@ import (
 	"golang.org/x/term"
 )
 
-func main() { os.Exit(run(os.Args[1:])) }
+// CommandName is the subcommand name and the executable name that routes to it.
+const CommandName = "gh"
 
-func run(args []string) int {
-	realPath, err := realGH()
+// ExitError carries the exit status of a served or passed-through gh call.
+type ExitError struct{ Code int }
+
+func (e *ExitError) Error() string { return fmt.Sprintf("gh exited with status %d", e.Code) }
+
+// NewCommand returns the `gh` subcommand. gh owns every argument, so Cobra
+// must not parse or normalize them.
+func NewCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:                "gh [gh arguments]",
+		Short:              "Answer supported gh pull request queries from Forge and pass the rest to gh",
+		DisableFlagParsing: true,
+		RunE: func(_ *cobra.Command, args []string) error {
+			if code := Run(args); code != 0 {
+				return &ExitError{Code: code}
+			}
+			return nil
+		},
+	}
+}
+
+// Run serves one gh invocation and returns its exit status. Pass-through
+// replaces the process on Unix.
+func Run(args []string) int {
+	// Legitimate nesting, such as a gh extension calling gh, stays shallow.
+	// A deep chain means gh keeps resolving back to this shim.
+	depth, _ := strconv.Atoi(os.Getenv(depthEnv))
+	if depth >= maxDepth {
+		fmt.Fprintln(os.Stderr, "kenn-forge gh: gh keeps calling back into kenn-forge gh; set FORGE_GH_REAL to the real gh executable")
+		return 1
+	}
+	skip := filepath.SplitList(os.Getenv(skipEnv))
+	// A gh wrapper script that runs `kenn-forge gh` sends the call it was
+	// handed straight back here. Skip that wrapper from now on, including in
+	// nested gh calls, and do not query or log the same call twice.
+	var handoff struct {
+		Path string   `json:"path"`
+		Argv []string `json:"argv"`
+	}
+	bounced := json.Unmarshal([]byte(os.Getenv(handoffEnv)), &handoff) == nil && slices.Equal(handoff.Argv, args)
+	if bounced {
+		skip = append(skip, handoff.Path)
+	}
+	realPath, err := realGH(skip)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	q, repo, supported := ghshim.Parse(args)
-	reason := "unsupported"
-	if supported && !term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("GH_FORCE_TTY") == "" && os.Getenv("CLICOLOR_FORCE") == "" {
-		if resolveRepo(&q, repo) {
-			output, handled, why := queryDaemon(q)
-			reason = why
-			if handled {
-				recordUsage(args, reason)
-				if _, err := os.Stdout.WriteString(output); err != nil {
-					return 1
+	if !bounced {
+		q, repo, supported := ghshim.Parse(args)
+		reason := "unsupported"
+		if supported && !term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("GH_FORCE_TTY") == "" && os.Getenv("CLICOLOR_FORCE") == "" {
+			if resolveRepo(&q, repo) {
+				output, handled, why := queryDaemon(q)
+				reason = why
+				if handled {
+					recordUsage(args, reason)
+					if _, err := os.Stdout.WriteString(output); err != nil {
+						return 1
+					}
+					return 0
 				}
-				return 0
+			} else {
+				reason = "repository_unresolved"
 			}
-		} else {
-			reason = "repository_unresolved"
 		}
+		recordUsage(args, reason)
 	}
-	recordUsage(args, reason)
+	handoff.Path, handoff.Argv = realPath, args
+	encoded, err := json.Marshal(handoff)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := errors.Join(
+		os.Setenv(skipEnv, strings.Join(skip, string(os.PathListSeparator))),
+		os.Setenv(handoffEnv, string(encoded)),
+		os.Setenv(depthEnv, strconv.Itoa(depth+1)),
+	); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 	return passthrough(realPath, args)
 }
 
-func realGH() (string, error) {
+// Environment passed to the real gh. The handoff names the executable and
+// arguments of the call being passed on; the skip list holds executables that
+// turned out to be wrappers around this shim; the depth counts shim hops.
+const (
+	handoffEnv = "KENN_FORGE_GH_HANDOFF"
+	skipEnv    = "KENN_FORGE_GH_SKIP"
+	depthEnv   = "KENN_FORGE_GH_DEPTH"
+	maxDepth   = 16
+)
+
+func realGH(skip []string) (string, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return "", err
@@ -59,6 +134,12 @@ func realGH() (string, error) {
 	info, err := os.Stat(self)
 	if err != nil {
 		return "", err
+	}
+	skipped := []os.FileInfo{info}
+	for _, path := range skip {
+		if other, err := os.Stat(path); err == nil {
+			skipped = append(skipped, other)
+		}
 	}
 	candidates := []string{}
 	if explicit := os.Getenv("FORGE_GH_REAL"); explicit != "" {
@@ -73,14 +154,14 @@ func realGH() (string, error) {
 			continue
 		}
 		other, err := os.Stat(candidate)
-		if err == nil && !other.IsDir() && !os.SameFile(info, other) {
-			abs, err := filepath.Abs(candidate)
-			if err == nil {
-				return abs, nil
-			}
+		if err != nil || other.IsDir() || slices.ContainsFunc(skipped, func(info os.FileInfo) bool { return os.SameFile(info, other) }) {
+			continue
+		}
+		if abs, err := filepath.Abs(candidate); err == nil {
+			return abs, nil
 		}
 	}
-	return "", fmt.Errorf("forge-gh: real gh not found; set FORGE_GH_REAL to its executable path")
+	return "", fmt.Errorf("kenn-forge gh: real gh not found; set FORGE_GH_REAL to its executable path")
 }
 
 func resolveRepo(q *ghshim.Query, repo string) bool {
@@ -171,7 +252,7 @@ func queryDaemon(q ghshim.Query) (string, bool, string) {
 
 // Record the full invocation and outcome so coverage gaps can be reproduced.
 func recordUsage(args []string, reason string) {
-	path := filepath.Join(filepath.Dir(config.DefaultConfigPath()), "forge-gh-usage.jsonl")
+	path := filepath.Join(filepath.Dir(config.DefaultConfigPath()), "gh-shim-usage.jsonl")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return
 	}
