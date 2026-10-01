@@ -1198,18 +1198,24 @@ func (d *DB) UpdateRepoViewerCanMerge(ctx context.Context, id int64, viewerCanMe
 // SQLite DATETIME text stays comparable in SQL.
 // On conflict (repo_id, number), stale snapshots are ignored wholesale.
 // parseMergeRequestUserLists fills the parsed Assignees and
-// RequestedReviewers slices from their JSON columns. Empty or malformed
-// JSON leaves the slice nil.
+// RequestedReviewers slices from their JSON columns. "" (never reported) and
+// malformed JSON leave the slice nil; "[]" (confirmed empty) yields an empty
+// non-nil slice.
 func parseMergeRequestUserLists(mr *MergeRequest) {
-	mr.Assignees = parseUserNamesJSON(mr.AssigneesJSON)
-	mr.RequestedReviewers = parseUserNamesJSON(mr.ReviewersJSON)
+	mr.Assignees = ParseUserNamesJSON(mr.AssigneesJSON)
+	mr.RequestedReviewers = ParseUserNamesJSON(mr.ReviewersJSON)
 }
 
-func parseUserNamesJSON(raw string) []string {
-	if raw == "" || raw == "[]" {
+// ParseUserNamesJSON distinguishes a provider that never reported a user
+// list ("") from one that confirmed an empty list ("[]"): the former returns
+// nil, which serializes as an absent JSON key (omitzero); the latter returns
+// a non-nil empty slice, which serializes as "[]". Shared by merge request
+// and issue ownership columns, and by the archive snapshot export.
+func ParseUserNamesJSON(raw string) []string {
+	if raw == "" {
 		return nil
 	}
-	var names []string
+	names := []string{}
 	if err := json.Unmarshal([]byte(raw), &names); err != nil {
 		return nil
 	}
@@ -1382,13 +1388,14 @@ func upsertMergeRequestSnapshot(
 		     state, is_draft, is_locked, body, head_branch, base_branch,
 		     platform_head_sha, platform_base_sha, head_repo_clone_url,
 		     additions, deletions, files_changed, merge_commit_sha, comment_count,
-		     review_decision, ci_status, ci_checks_json,
+		     review_decision, review_decision_observed_at,
+		     ci_status, ci_checks_json, ci_observed_at,
 		     detail_fetched_at, ci_had_pending,
 		     created_at, updated_at,
-		     last_activity_at, merged_at, closed_at, mergeable_state,
+		     last_activity_at, merged_at, closed_at, mergeable_state, mergeable_state_observed_at,
 		     assignees_json, reviewers_json, head_repo_identity_stale,
 		     snapshot_revision)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1)
 		ON CONFLICT(repo_id, number) DO UPDATE SET
 		    platform_id          = excluded.platform_id,
 		    platform_external_id = COALESCE(NULLIF(excluded.platform_external_id, ''), forge_merge_requests.platform_external_id),
@@ -1424,8 +1431,10 @@ func upsertMergeRequestSnapshot(
 		    merge_commit_sha     = COALESCE(NULLIF(excluded.merge_commit_sha, ''), forge_merge_requests.merge_commit_sha),
 		    comment_count        = excluded.comment_count,
 		    review_decision      = excluded.review_decision,
+		    review_decision_observed_at = excluded.review_decision_observed_at,
 		    ci_status            = excluded.ci_status,
 		    ci_checks_json       = excluded.ci_checks_json,
+		    ci_observed_at       = excluded.ci_observed_at,
 		    detail_fetched_at    = COALESCE(forge_merge_requests.detail_fetched_at, excluded.detail_fetched_at),
 		    ci_had_pending       = forge_merge_requests.ci_had_pending,
 		    updated_at           = excluded.updated_at,
@@ -1433,6 +1442,7 @@ func upsertMergeRequestSnapshot(
 		    merged_at            = excluded.merged_at,
 		    closed_at            = excluded.closed_at,
 		    mergeable_state      = excluded.mergeable_state,
+		    mergeable_state_observed_at = excluded.mergeable_state_observed_at,
 		    assignees_json       = CASE WHEN excluded.assignees_json = ''
 		                                THEN forge_merge_requests.assignees_json
 		                                ELSE excluded.assignees_json END,
@@ -1446,11 +1456,11 @@ func upsertMergeRequestSnapshot(
 		mr.State, mr.IsDraft, mr.IsLocked, mr.Body, mr.HeadBranch, mr.BaseBranch,
 		mr.PlatformHeadSHA, mr.PlatformBaseSHA, mr.HeadRepoCloneURL,
 		mr.Additions, mr.Deletions, mr.FilesChanged, mr.MergeCommitSHA,
-		mr.CommentCount, mr.ReviewDecision,
-		mr.CIStatus, mr.CIChecksJSON,
+		mr.CommentCount, mr.ReviewDecision, mr.ReviewDecisionObservedAt,
+		mr.CIStatus, mr.CIChecksJSON, mr.CIObservedAt,
 		mr.DetailFetchedAt, mr.CIHadPending,
 		mr.CreatedAt, mr.UpdatedAt,
-		mr.LastActivityAt, mr.MergedAt, mr.ClosedAt, mr.MergeableState,
+		mr.LastActivityAt, mr.MergedAt, mr.ClosedAt, mr.MergeableState, mr.MergeableStateObservedAt,
 		mr.AssigneesJSON, mr.ReviewersJSON,
 		mr.HeadRepoCloneURLUnknown,
 		mr.HeadRepoCloneURLUnknown,
@@ -1538,10 +1548,10 @@ func (d *DB) GetMergeRequest(
 		       p.diff_head_sha, p.diff_base_sha, p.merge_base_sha,
 		       p.head_repo_clone_url, p.head_repo_identity_stale,
 		       p.additions, p.deletions, p.files_changed, p.merge_commit_sha,
-		       p.comment_count, p.review_decision,
-		       p.ci_status, p.ci_checks_json,
+		       p.comment_count, p.review_decision, p.review_decision_observed_at,
+		       p.ci_status, p.ci_checks_json, p.ci_observed_at,
 		       p.created_at, p.updated_at, p.last_activity_at,
-		       p.merged_at, p.closed_at, p.mergeable_state,
+		       p.merged_at, p.closed_at, p.mergeable_state, p.mergeable_state_observed_at,
 		       p.detail_fetched_at, p.ci_had_pending,
 		       p.workflow_approval_checked_at, p.workflow_approval_head_sha,
 		       p.workflow_approval_required, p.workflow_approval_count,
@@ -1574,10 +1584,10 @@ func (d *DB) GetMergeRequest(
 		&mr.DiffHeadSHA, &mr.DiffBaseSHA, &mr.MergeBaseSHA,
 		&mr.HeadRepoCloneURL, &mr.HeadRepoIdentityStale,
 		&mr.Additions, &mr.Deletions, &mr.FilesChanged, &mr.MergeCommitSHA,
-		&mr.CommentCount, &mr.ReviewDecision,
-		&mr.CIStatus, &mr.CIChecksJSON,
+		&mr.CommentCount, &mr.ReviewDecision, &mr.ReviewDecisionObservedAt,
+		&mr.CIStatus, &mr.CIChecksJSON, &mr.CIObservedAt,
 		&mr.CreatedAt, &mr.UpdatedAt, &mr.LastActivityAt,
-		&mr.MergedAt, &mr.ClosedAt, &mr.MergeableState,
+		&mr.MergedAt, &mr.ClosedAt, &mr.MergeableState, &mr.MergeableStateObservedAt,
 		&mr.DetailFetchedAt, &mr.CIHadPending,
 		&mr.WorkflowApprovalCheckedAt, &mr.WorkflowApprovalHeadSHA,
 		&mr.WorkflowApprovalRequired, &mr.WorkflowApprovalCount,
@@ -1635,10 +1645,10 @@ func (d *DB) getMergeRequestByRepoIDAndNumber(
 		       p.diff_head_sha, p.diff_base_sha, p.merge_base_sha,
 		       p.head_repo_clone_url, p.head_repo_identity_stale,
 		       p.additions, p.deletions, p.files_changed, p.merge_commit_sha,
-		       p.comment_count, p.review_decision,
-		       p.ci_status, p.ci_checks_json,
+		       p.comment_count, p.review_decision, p.review_decision_observed_at,
+		       p.ci_status, p.ci_checks_json, p.ci_observed_at,
 		       p.created_at, p.updated_at, p.last_activity_at,
-		       p.merged_at, p.closed_at, p.mergeable_state,
+		       p.merged_at, p.closed_at, p.mergeable_state, p.mergeable_state_observed_at,
 		       p.detail_fetched_at, p.ci_had_pending,
 		       p.workflow_approval_checked_at, p.workflow_approval_head_sha,
 		       p.workflow_approval_required, p.workflow_approval_count,
@@ -1660,10 +1670,10 @@ func (d *DB) getMergeRequestByRepoIDAndNumber(
 		&mr.DiffHeadSHA, &mr.DiffBaseSHA, &mr.MergeBaseSHA,
 		&mr.HeadRepoCloneURL, &mr.HeadRepoIdentityStale,
 		&mr.Additions, &mr.Deletions, &mr.FilesChanged, &mr.MergeCommitSHA,
-		&mr.CommentCount, &mr.ReviewDecision,
-		&mr.CIStatus, &mr.CIChecksJSON,
+		&mr.CommentCount, &mr.ReviewDecision, &mr.ReviewDecisionObservedAt,
+		&mr.CIStatus, &mr.CIChecksJSON, &mr.CIObservedAt,
 		&mr.CreatedAt, &mr.UpdatedAt, &mr.LastActivityAt,
-		&mr.MergedAt, &mr.ClosedAt, &mr.MergeableState,
+		&mr.MergedAt, &mr.ClosedAt, &mr.MergeableState, &mr.MergeableStateObservedAt,
 		&mr.DetailFetchedAt, &mr.CIHadPending,
 		&mr.WorkflowApprovalCheckedAt, &mr.WorkflowApprovalHeadSHA,
 		&mr.WorkflowApprovalRequired, &mr.WorkflowApprovalCount,
@@ -1806,10 +1816,10 @@ func (d *DB) ListMergeRequests(ctx context.Context, opts ListMergeRequestsOpts) 
 		       p.diff_head_sha, p.diff_base_sha, p.merge_base_sha,
 		       p.head_repo_clone_url, p.head_repo_identity_stale,
 		       p.additions, p.deletions, p.files_changed, p.merge_commit_sha,
-		       p.comment_count, p.review_decision,
-		       p.ci_status, p.ci_checks_json,
+		       p.comment_count, p.review_decision, p.review_decision_observed_at,
+		       p.ci_status, p.ci_checks_json, p.ci_observed_at,
 		       p.created_at, p.updated_at, p.last_activity_at,
-		       p.merged_at, p.closed_at, p.mergeable_state,
+		       p.merged_at, p.closed_at, p.mergeable_state, p.mergeable_state_observed_at,
 		       p.detail_fetched_at, p.ci_had_pending,
 		       p.assignees_json, p.reviewers_json,
 		       COALESCE(k.status, '') AS kanban_status,
@@ -1843,10 +1853,10 @@ func (d *DB) ListMergeRequests(ctx context.Context, opts ListMergeRequestsOpts) 
 			&mr.DiffHeadSHA, &mr.DiffBaseSHA, &mr.MergeBaseSHA,
 			&mr.HeadRepoCloneURL, &mr.HeadRepoIdentityStale,
 			&mr.Additions, &mr.Deletions, &mr.FilesChanged, &mr.MergeCommitSHA,
-			&mr.CommentCount, &mr.ReviewDecision,
-			&mr.CIStatus, &mr.CIChecksJSON,
+			&mr.CommentCount, &mr.ReviewDecision, &mr.ReviewDecisionObservedAt,
+			&mr.CIStatus, &mr.CIChecksJSON, &mr.CIObservedAt,
 			&mr.CreatedAt, &mr.UpdatedAt, &mr.LastActivityAt,
-			&mr.MergedAt, &mr.ClosedAt, &mr.MergeableState,
+			&mr.MergedAt, &mr.ClosedAt, &mr.MergeableState, &mr.MergeableStateObservedAt,
 			&mr.DetailFetchedAt, &mr.CIHadPending,
 			&mr.AssigneesJSON, &mr.ReviewersJSON,
 			&mr.KanbanStatus, &mr.Starred,
@@ -2429,8 +2439,9 @@ func (d *DB) CountOpenMergeRequestsForRepo(ctx context.Context, repoID int64) (i
 // intentionally absent: only an authoritative provider parent observation may
 // update merge-request activity timestamps.
 type MRDerivedFields struct {
-	ReviewDecision string
-	CommentCount   int
+	ReviewDecision           string
+	ReviewDecisionObservedAt *time.Time
+	CommentCount             int
 }
 
 // IssueDerivedFields holds computed fields that are refreshed after fetching issue events.
@@ -2579,7 +2590,9 @@ func (d *DB) UpdateMRCIStatus(
 }
 
 // UpdateMRCIStatusForHead writes CI status and check runs JSON only when the
-// merge request still points at the head SHA that was refreshed.
+// merge request still points at the head SHA that was refreshed. observedAt
+// is the time Forge captured ciStatus/ciChecksJSON from the provider; it is
+// stored alongside the values, not derived from ci_had_pending.
 func (d *DB) UpdateMRCIStatusForHead(
 	ctx context.Context,
 	repoID int64,
@@ -2588,12 +2601,13 @@ func (d *DB) UpdateMRCIStatusForHead(
 	ciStatus string,
 	ciChecksJSON string,
 	ciHadPending bool,
+	observedAt *time.Time,
 ) error {
 	_, err := d.execContext(ctx, `
 		UPDATE forge_merge_requests
-		SET ci_status = ?, ci_checks_json = ?, ci_had_pending = ci_had_pending OR ?
+		SET ci_status = ?, ci_checks_json = ?, ci_had_pending = ci_had_pending OR ?, ci_observed_at = ?
 		WHERE repo_id = ? AND number = ? AND platform_head_sha = ?`,
-		ciStatus, ciChecksJSON, ciHadPending,
+		ciStatus, ciChecksJSON, ciHadPending, canonicalUTCTimePtr(observedAt),
 		repoID, number, headSHA,
 	)
 	if err != nil {
@@ -2943,12 +2957,9 @@ func (d *DB) GetIssue(
 	if err != nil {
 		return nil, fmt.Errorf("get issue: %w", err)
 	}
-	// Parse assignees from JSON. Best-effort: malformed JSON yields an empty
-	// Assignees slice rather than failing the whole read. Writes go through
-	// json.Marshal in UpsertIssue, so corruption is unexpected in practice.
-	if issue.AssigneesJSON != "" && issue.AssigneesJSON != "[]" {
-		_ = json.Unmarshal([]byte(issue.AssigneesJSON), &issue.Assignees)
-	}
+	// Parse assignees from JSON. ParseUserNamesJSON distinguishes never-
+	// reported ("") from provider-confirmed empty ("[]").
+	issue.Assignees = ParseUserNamesJSON(issue.AssigneesJSON)
 	labelsByIssue, err := d.loadLabelsForIssues(ctx, []int64{issue.ID})
 	if err != nil {
 		return nil, fmt.Errorf("load issue labels: %w", err)
@@ -3012,12 +3023,9 @@ func (d *DB) getIssueByRepoIDAndNumber(
 	if err != nil {
 		return nil, fmt.Errorf("get issue by repo id: %w", err)
 	}
-	// Parse assignees from JSON. Best-effort: malformed JSON yields an empty
-	// Assignees slice rather than failing the whole read. Writes go through
-	// json.Marshal in UpsertIssue, so corruption is unexpected in practice.
-	if issue.AssigneesJSON != "" && issue.AssigneesJSON != "[]" {
-		_ = json.Unmarshal([]byte(issue.AssigneesJSON), &issue.Assignees)
-	}
+	// Parse assignees from JSON. ParseUserNamesJSON distinguishes never-
+	// reported ("") from provider-confirmed empty ("[]").
+	issue.Assignees = ParseUserNamesJSON(issue.AssigneesJSON)
 	labelsByIssue, err := d.loadLabelsForIssues(ctx, []int64{issue.ID})
 	if err != nil {
 		return nil, fmt.Errorf("load issue labels: %w", err)
@@ -3157,12 +3165,9 @@ func (d *DB) ListIssues(
 		); err != nil {
 			return nil, fmt.Errorf("scan issue: %w", err)
 		}
-		// Parse assignees from JSON. Best-effort: malformed JSON yields an empty
-		// Assignees slice rather than failing the whole read. Writes go through
-		// json.Marshal in UpsertIssue, so corruption is unexpected in practice.
-		if issue.AssigneesJSON != "" && issue.AssigneesJSON != "[]" {
-			_ = json.Unmarshal([]byte(issue.AssigneesJSON), &issue.Assignees)
-		}
+		// Parse assignees from JSON. ParseUserNamesJSON distinguishes never-
+		// reported ("") from provider-confirmed empty ("[]").
+		issue.Assignees = ParseUserNamesJSON(issue.AssigneesJSON)
 		issues = append(issues, issue)
 		issueIDs = append(issueIDs, issue.ID)
 	}

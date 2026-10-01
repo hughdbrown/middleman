@@ -321,6 +321,14 @@ registry helpers return typed errors for missing providers or capabilities.
 
 - Missing optional capabilities should degrade that feature with a typed
   platform error, not break unrelated sync work.
+- `platform.Capabilities` has no flag for "reports a review decision"; GitLab,
+  Forgejo, and Gitea normalizers never set `ReviewDecision`. Callers that need
+  this compare the repository's provider `Kind` to `platform.KindGitHub`
+  directly (`internal/archive/snapshot.go::Service.snapshot`, computing
+  `merge_status_observed_at`).
+- `merge_status_observed_at` is the oldest of the counted per-field observation
+  times, not a stored column; null on an empty input and whenever any counted
+  time is null, never the zero time (`internal/archive/snapshot.go::minObservedAt`).
 - Never put foreground deadlines on a shared provider HTTP client; scope them to
   the operation context (`platform/gitlab/client.go::NewClient`).
 - Provider clients with a local sync budget must use the shared transport; duplicate
@@ -410,6 +418,7 @@ registry helpers return typed errors for missing providers or capabilities.
   HEAD diff (0/0 sidebar stats).
 - Child datasets and detail/CI/diff freshness writes are fenced to the parent snapshot revision. Complete comments and inline review sets replace; submitted reviews remain additive. (`internal/db/queries_snapshot_children.go::CommitMergeRequestChildSnapshot`)
 - Merge-request assignee omission remains unknown; only a provider-confirmed empty set counts as unassigned, so incomplete snapshots cannot claim that an item has no owner. (`internal/platformdb/persist.go::MarshalUserNamesJSON`, `internal/db/queries_assignees.go::unassignedCondition`)
+- This distinction carries onto the API: `assignees`/`requested_reviewers` are `omitzero` `[]string` fields, so a never-reported list is an absent JSON key and a confirmed-empty list serializes as `[]`; callers must not collapse the two. (`internal/db/queries.go::parseUserNamesJSON`)
 
 ## Historical Archive
 

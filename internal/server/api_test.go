@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -67,6 +68,7 @@ import (
 	"go.kenn.io/forge/internal/workspace"
 	"go.kenn.io/forge/internal/workspace/localruntime"
 	"go.kenn.io/forge/platform"
+	platformgithub "go.kenn.io/forge/platform/github"
 )
 
 var (
@@ -315,6 +317,34 @@ func launchPlainShellRuntimeSession(
 func setTestServerNow(t *testing.T, srv *Server, now time.Time) {
 	t.Helper()
 	srv.now = func() time.Time { return now }
+}
+
+// observationClock proves a production capture point runs BEFORE a provider
+// call rather than after: the fake provider advances the clock while
+// serving each request (via a deferred call, so the tick lands after the
+// callback body runs but before control returns to the caller), so a time
+// captured before the call and one captured after it are always different
+// literal values. A test using a constant clock (setTestServerNow) cannot
+// tell the two apart.
+type observationClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newObservationClock(start time.Time) *observationClock {
+	return &observationClock{now: start}
+}
+
+func (c *observationClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *observationClock) advance() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(time.Minute)
 }
 
 func testEDTTime(hour, minute int) time.Time {
@@ -1089,6 +1119,293 @@ func TestAPICloseIssue(t *testing.T) {
 	require.NoError(err)
 	require.Equal("closed", issue.State)
 	assertTimePtrEqualsUTC(t, issue.ClosedAt, handlerNow)
+}
+
+// TestAPIReadyForReviewStampsMergeableStateAndCarriesReviewAndCI exercises
+// the ready-for-review mutation response directly: the response carries no
+// review decision, CI status, or comment count, so those values and their
+// observation times must be carried unchanged from the stored row, while the
+// mergeable state observation time is the mutation request time whenever the
+// response reports a concrete state and nil for unknown/empty.
+func TestAPIReadyForReviewStampsMergeableStateAndCarriesReviewAndCI(t *testing.T) {
+	runParallelServerTest(t)
+	mutationRequestedAt := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	reviewObservedAt := time.Date(2026, 9, 5, 8, 0, 0, 0, time.UTC)
+	ciObservedAt := time.Date(2026, 9, 6, 9, 0, 0, 0, time.UTC)
+	ciChecks := `[{"name":"build","status":"completed","conclusion":"success","url":"","app":"GitHub Actions"}]`
+
+	tests := []struct {
+		name           string
+		mergeableState string
+		wantObserved   bool
+	}{
+		{name: "concrete state stamps observed time", mergeableState: "clean", wantObserved: true},
+		{name: "unknown state leaves observed time nil", mergeableState: "unknown", wantObserved: false},
+		{name: "empty state leaves observed time nil", mergeableState: "", wantObserved: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			mergeableState := tt.mergeableState
+			// The clock advances while the fake provider serves the
+			// request, so a time captured before the call (correct) and
+			// one captured after it (a regression) are different literal
+			// values; a constant clock could not tell them apart.
+			clock := newObservationClock(mutationRequestedAt)
+			mock := &serverfake.MockGH{
+				MarkReadyForReviewFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
+					defer clock.advance()
+					id := int64(1001)
+					title := "Ready PR"
+					state := "open"
+					url := "https://github.com/acme/widget/pull/1"
+					author := "octocat"
+					draft := false
+					now := gh.Timestamp{Time: time.Now().UTC()}
+					return &gh.PullRequest{
+						ID:             &id,
+						Number:         &number,
+						Title:          &title,
+						State:          &state,
+						HTMLURL:        &url,
+						Draft:          &draft,
+						CreatedAt:      &now,
+						UpdatedAt:      &now,
+						User:           &gh.User{Login: &author},
+						Head:           &gh.PullRequestBranch{Ref: new("feature"), SHA: new("head-sha")},
+						Base:           &gh.PullRequestBranch{Ref: new("main")},
+						MergeableState: &mergeableState,
+					}, nil
+				},
+			}
+			srv, database, _ := setupTestServerWithMock(t, mock)
+			srv.now = clock.Now
+
+			repoID, err := reposeed.Seed(t.Context(), database, serverfake.VerifiedGitHubRepoIdentity("github.com", "acme", "widget"))
+			require.NoError(err)
+			now := time.Now().UTC().Truncate(time.Second)
+			prID, err := database.UpsertMergeRequest(t.Context(), &db.MergeRequest{
+				RepoID:                   repoID,
+				PlatformID:               1001,
+				Number:                   1,
+				URL:                      "https://github.com/acme/widget/pull/1",
+				Title:                    "Ready PR",
+				Author:                   "octocat",
+				State:                    "open",
+				IsDraft:                  true,
+				HeadBranch:               "feature",
+				BaseBranch:               "main",
+				PlatformHeadSHA:          "head-sha",
+				CommentCount:             4,
+				ReviewDecision:           "APPROVED",
+				ReviewDecisionObservedAt: &reviewObservedAt,
+				CIStatus:                 "success",
+				CIChecksJSON:             ciChecks,
+				CIObservedAt:             &ciObservedAt,
+				CreatedAt:                now,
+				UpdatedAt:                now,
+				LastActivityAt:           now,
+			})
+			require.NoError(err)
+			require.NoError(database.EnsureKanbanState(t.Context(), prID))
+
+			client := setupTestClient(t, srv)
+			resp, err := client.HTTP.MarkPullReadyForReviewWithResponse(t.Context(), &generated.MarkPullReadyForReviewRequestOptions{PathParams: &generated.MarkPullReadyForReviewPath{Provider: "gh", Owner: "acme", Name: "widget", Number: int64(1)}})
+			require.NoError(err)
+			require.Equal(http.StatusOK, resp.StatusCode)
+
+			pr, err := database.GetMergeRequest(t.Context(), "github", "github.com", "acme", "widget", 1)
+			require.NoError(err)
+			require.NotNil(pr)
+			assert.False(pr.IsDraft)
+			assert.Equal(mergeableState, pr.MergeableState)
+			if tt.wantObserved {
+				assertTimePtrEqualsUTC(t, pr.MergeableStateObservedAt, mutationRequestedAt)
+			} else {
+				assert.Nil(pr.MergeableStateObservedAt)
+			}
+			assert.Equal(4, pr.CommentCount)
+			assert.Equal("APPROVED", pr.ReviewDecision)
+			assertTimePtrEqualsUTC(t, pr.ReviewDecisionObservedAt, reviewObservedAt)
+			assert.Equal("success", pr.CIStatus)
+			assert.JSONEq(ciChecks, pr.CIChecksJSON)
+			assertTimePtrEqualsUTC(t, pr.CIObservedAt, ciObservedAt)
+		})
+	}
+}
+
+// TestAPISetPRGitHubStateStampsMergeableStateAndCarriesReviewAndCI exercises
+// the state-edit success path: the edit response cannot represent review
+// decision or CI status, so those values and their observation times must
+// be carried unchanged from the stored row, while the mergeable state
+// observation time is the mutation request time whenever the response
+// reports a concrete state and nil for unknown.
+func TestAPISetPRGitHubStateStampsMergeableStateAndCarriesReviewAndCI(t *testing.T) {
+	runParallelServerTest(t)
+	mutationRequestedAt := time.Date(2026, 9, 21, 11, 0, 0, 0, time.UTC)
+	reviewObservedAt := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
+	ciObservedAt := time.Date(2026, 9, 2, 9, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name           string
+		mergeableState string
+		wantObserved   bool
+	}{
+		{name: "concrete state stamps observed time", mergeableState: "dirty", wantObserved: true},
+		{name: "unknown state leaves observed time nil", mergeableState: "unknown", wantObserved: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			mergeableState := tt.mergeableState
+			// The clock advances while the fake provider serves the edit
+			// request, so a time captured before the call (correct) and
+			// one captured after it (a regression) are different literal
+			// values; a constant clock could not tell them apart.
+			clock := newObservationClock(mutationRequestedAt)
+			mock := &serverfake.MockGH{
+				EditPullRequestFn: func(
+					_ context.Context, _, _ string, number int, opts platformgithub.EditPullRequestOpts,
+				) (*gh.PullRequest, error) {
+					defer clock.advance()
+					require.NotNil(opts.State)
+					pr := serverfake.ProviderStatePR(
+						number, *opts.State, time.Now().UTC().Add(time.Hour),
+						nil, nil, "head-sha",
+					)
+					pr.MergeableState = &mergeableState
+					return pr, nil
+				},
+			}
+			srv, database, _ := setupTestServerWithMock(t, mock)
+			srv.now = clock.Now
+			serverfake.SeedPR(t, database, "acme", "widget", 1,
+				serverfake.WithSeedPRHeadSHA("head-sha"),
+				serverfake.WithSeedPRCI("success", `[{"name":"build","status":"completed","conclusion":"success","url":"","app":"GitHub Actions"}]`),
+				func(pr *db.MergeRequest) {
+					pr.ReviewDecision = "APPROVED"
+					pr.ReviewDecisionObservedAt = &reviewObservedAt
+					pr.CIObservedAt = &ciObservedAt
+				},
+			)
+			client := setupTestClient(t, srv)
+
+			resp, err := client.HTTP.SetPrGithubStateWithResponse(t.Context(), &generated.SetPrGithubStateRequestOptions{PathParams: &generated.SetPrGithubStatePath{Provider: "gh", Owner: "acme", Name: "widget", Number: int64(1)}, Body: &generated.SetPrGithubStateBody{State: "closed"}})
+			require.NoError(err)
+			require.Equal(http.StatusOK, resp.StatusCode)
+
+			pr, err := database.GetMergeRequest(t.Context(), "github", "github.com", "acme", "widget", 1)
+			require.NoError(err)
+			assert.Equal(db.MergeRequestStateClosed, pr.State)
+			assert.Equal(mergeableState, pr.MergeableState)
+			if tt.wantObserved {
+				assertTimePtrEqualsUTC(t, pr.MergeableStateObservedAt, mutationRequestedAt)
+			} else {
+				assert.Nil(pr.MergeableStateObservedAt)
+			}
+			// The edit response cannot carry review decision or CI state;
+			// closing preserves both the values and their observation
+			// times from the stored row.
+			assert.Equal("APPROVED", pr.ReviewDecision)
+			assertTimePtrEqualsUTC(t, pr.ReviewDecisionObservedAt, reviewObservedAt)
+			assert.Equal("success", pr.CIStatus)
+			assertTimePtrEqualsUTC(t, pr.CIObservedAt, ciObservedAt)
+		})
+	}
+}
+
+// TestAPISetPRGitHubState422RefetchStampsMergeableStateAndCarriesReviewAndCI
+// exercises the 422 refetch path: the refetched snapshot cannot represent
+// review decision or CI status, so those values and their observation times
+// must be carried unchanged from the stored row, while the mergeable state
+// observation time is the refetch request time whenever the refetched PR
+// reports a concrete state and nil for unknown.
+func TestAPISetPRGitHubState422RefetchStampsMergeableStateAndCarriesReviewAndCI(t *testing.T) {
+	runParallelServerTest(t)
+	refetchRequestedAt := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	reviewObservedAt := time.Date(2026, 9, 3, 8, 0, 0, 0, time.UTC)
+	ciObservedAt := time.Date(2026, 9, 4, 9, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name           string
+		mergeableState string
+		wantObserved   bool
+	}{
+		{name: "concrete state stamps observed time", mergeableState: "clean", wantObserved: true},
+		{name: "unknown state leaves observed time nil", mergeableState: "unknown", wantObserved: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			mergeableState := tt.mergeableState
+			state := "closed"
+			// The failed edit does not advance the clock (it never reaches
+			// a provider snapshot); the clock advances only while the fake
+			// provider serves the refetch, so a time captured before that
+			// specific call (correct) and one captured after it (a
+			// regression) are different literal values.
+			clock := newObservationClock(refetchRequestedAt)
+			mock := &serverfake.MockGH{
+				EditPullRequestFn: func(_ context.Context, _, _ string, _ int, _ platformgithub.EditPullRequestOpts) (*gh.PullRequest, error) {
+					return nil, serverfake.Make422Error()
+				},
+				GetPullRequestFn: func(_ context.Context, _, _ string, _ int) (*gh.PullRequest, error) {
+					defer clock.advance()
+					id := int64(1000)
+					now := gh.Timestamp{Time: time.Now().UTC()}
+					closedAt := gh.Timestamp{Time: time.Now().UTC()}
+					return &gh.PullRequest{
+						ID: &id, Number: new(1), State: &state,
+						Title: new("PR"), HTMLURL: new("https://example.com"),
+						User:      &gh.User{Login: new("u")},
+						Head:      &gh.PullRequestBranch{Ref: new("f"), SHA: new("head-sha")},
+						Base:      &gh.PullRequestBranch{Ref: new("main")},
+						CreatedAt: &now, UpdatedAt: &now, ClosedAt: &closedAt,
+						MergeableState: &mergeableState,
+					}, nil
+				},
+			}
+			srv, database, _ := setupTestServerWithMock(t, mock)
+			srv.now = clock.Now
+			serverfake.SeedPR(t, database, "acme", "widget", 1,
+				serverfake.WithSeedPRHeadSHA("head-sha"),
+				serverfake.WithSeedPRCI("success", `[{"name":"build","status":"completed","conclusion":"success","url":"","app":"GitHub Actions"}]`),
+				func(pr *db.MergeRequest) {
+					pr.ReviewDecision = "APPROVED"
+					pr.ReviewDecisionObservedAt = &reviewObservedAt
+					pr.CIObservedAt = &ciObservedAt
+				},
+			)
+			client := setupTestClient(t, srv)
+
+			resp, err := client.HTTP.SetPrGithubStateWithResponse(t.Context(), &generated.SetPrGithubStateRequestOptions{PathParams: &generated.SetPrGithubStatePath{Provider: "gh", Owner: "acme", Name: "widget", Number: int64(1)}, Body: &generated.SetPrGithubStateBody{State: "closed"}})
+			require.NoError(err)
+			require.Equal(http.StatusOK, resp.StatusCode)
+
+			pr, err := database.GetMergeRequest(t.Context(), "github", "github.com", "acme", "widget", 1)
+			require.NoError(err)
+			assert.Equal(db.MergeRequestStateClosed, pr.State)
+			assert.Equal(mergeableState, pr.MergeableState)
+			if tt.wantObserved {
+				assertTimePtrEqualsUTC(t, pr.MergeableStateObservedAt, refetchRequestedAt)
+			} else {
+				assert.Nil(pr.MergeableStateObservedAt)
+			}
+			// The refetched snapshot cannot carry review decision or CI
+			// state; the recovery preserves both the values and their
+			// observation times from the stored row.
+			assert.Equal("APPROVED", pr.ReviewDecision)
+			assertTimePtrEqualsUTC(t, pr.ReviewDecisionObservedAt, reviewObservedAt)
+			assert.Equal("success", pr.CIStatus)
+			assertTimePtrEqualsUTC(t, pr.CIObservedAt, ciObservedAt)
+		})
+	}
 }
 
 func TestAPIGetIssueWorkspaceUsesProviderScopedLookup(t *testing.T) {

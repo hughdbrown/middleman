@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,6 +53,18 @@ import (
 
 func TestMain(m *testing.M) {
 	os.Exit(serverfake.RunMain(m, func() int { return gitsafe.RunIsolatedMain(m) }))
+}
+
+func assertTimePtrUTC(t *testing.T, got *time.Time) {
+	t.Helper()
+	require.NotNil(t, got)
+	assert.Equal(t, time.UTC, got.Location())
+}
+
+func assertTimePtrEqualsUTC(t *testing.T, got *time.Time, want time.Time) {
+	t.Helper()
+	assertTimePtrUTC(t, got)
+	assert.Equal(t, want.UTC(), got.UTC())
 }
 
 func seedPRWithHeadSHA(t *testing.T, database *db.DB, owner, name string, number int, headSHA string) int64 {
@@ -182,6 +195,61 @@ func TestAPIGetPullIncludesCIChecks(t *testing.T) {
 	assert.Equal("https://ci.example/build", detail.Checks[0].URL)
 	assert.Equal("lint", detail.Checks[1].Name)
 	assert.Equal("in_progress", detail.Checks[1].Status)
+}
+
+func TestAPIPullJSONCarriesMergeStatusObservationTimes(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	require := require.New(t)
+	srv, database := servertest.SetupTestServer(t)
+	ciAt := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
+	reviewAt := time.Date(2026, 9, 2, 9, 0, 0, 0, time.UTC)
+	mergeableAt := time.Date(2026, 9, 3, 10, 0, 0, 0, time.UTC)
+	serverfake.SeedPR(t, database, "acme", "widget", 1, func(pr *db.MergeRequest) {
+		pr.CIStatus, pr.CIObservedAt = "success", &ciAt
+		pr.ReviewDecision, pr.ReviewDecisionObservedAt = "approved", &reviewAt
+		pr.MergeableState, pr.MergeableStateObservedAt = "clean", &mergeableAt
+	})
+	serverfake.SeedPR(t, database, "acme", "widget", 2)
+	observed := map[string]any{
+		"ci_observed_at":              "2026-09-01T08:00:00Z",
+		"review_decision_observed_at": "2026-09-02T09:00:00Z",
+		"mergeable_state_observed_at": "2026-09-03T10:00:00Z",
+	}
+	observedTimes := func(item map[string]any) map[string]any {
+		found := map[string]any{}
+		for key := range observed {
+			if value, ok := item[key]; ok {
+				found[key] = value
+			}
+		}
+		return found
+	}
+
+	rawList := testutil.DoJSON(t, srv, http.MethodGet, "/api/v1/pulls", nil)
+	require.Equal(http.StatusOK, rawList.Code, rawList.Body.String())
+	var list []map[string]any
+	require.NoError(json.Unmarshal(rawList.Body.Bytes(), &list))
+	listByNumber := map[float64]map[string]any{}
+	for _, item := range list {
+		number, ok := item["Number"].(float64)
+		require.True(ok, "list item number: %v", item)
+		listByNumber[number] = item
+	}
+	require.Len(listByNumber, 2)
+	assert.Equal(t, observed, observedTimes(listByNumber[1]))
+	assert.Empty(t, observedTimes(listByNumber[2]))
+
+	for number, want := range map[int]map[string]any{1: observed, 2: {}} {
+		rawDetail := testutil.DoJSON(t, srv, http.MethodGet,
+			"/api/v1/pulls/gh/acme/widget/"+strconv.Itoa(number), nil)
+		require.Equal(http.StatusOK, rawDetail.Code, rawDetail.Body.String())
+		var detail struct {
+			MergeRequest map[string]any `json:"merge_request"`
+		}
+		require.NoError(json.Unmarshal(rawDetail.Body.Bytes(), &detail))
+		require.NotNil(detail.MergeRequest)
+		assert.Equal(t, want, observedTimes(detail.MergeRequest), "pull %d", number)
+	}
 }
 
 // TestAPIGetPullToleratesMalformedCIChecks confirms a corrupt ci_checks_json
@@ -3241,6 +3309,65 @@ func TestAPIStackBaseConflictMarksDownstreamPRsDirty(t *testing.T) {
 	require.NotNil(detailResp.JSON200)
 	assert.Equal("dirty", detailResp.JSON200.MergeRequest.MergeableState)
 	assert.Empty(serverfake.RequireMR(t, database, repo.ID, 11).MergeableState)
+}
+
+func TestAPIStackConflictOverrideDropsReplacedMergeableObservationTime(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, database := servertest.SetupTestServer(t)
+	client := servertest.SetupTestClient(t, srv)
+	ctx := t.Context()
+
+	seedStackedPRMergeable(
+		t, database, "acme", "widget", 10,
+		"feat/api-base", "main", db.MergeRequestStateOpen, "success", "APPROVED", "dirty",
+	)
+	seedStackedPRMergeable(
+		t, database, "acme", "widget", 11,
+		"feat/api-retry", "feat/api-base", db.MergeRequestStateOpen, "success", "APPROVED", "clean",
+	)
+	seedStackedPRMergeable(
+		t, database, "acme", "widget", 12,
+		"feat/api-docs", "feat/api-retry", db.MergeRequestStateOpen, "success", "APPROVED", "dirty",
+	)
+	serverfake.RunStackDetection(t, database, "acme", "widget")
+	repo, err := database.GetRepoByIdentity(ctx, serverfake.VerifiedGitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	require.NotNil(repo)
+	baseObservedAt := time.Date(2026, 9, 3, 7, 0, 0, 0, time.UTC)
+	downstreamObservedAt := time.Date(2026, 9, 4, 8, 0, 0, 0, time.UTC)
+	tipObservedAt := time.Date(2026, 9, 5, 9, 0, 0, 0, time.UTC)
+	for number, at := range map[int]time.Time{10: baseObservedAt, 11: downstreamObservedAt, 12: tipObservedAt} {
+		mr := serverfake.RequireMR(t, database, repo.ID, number)
+		mr.MergeableStateObservedAt = &at
+		_, err = database.UpsertMergeRequest(ctx, mr)
+		require.NoError(err)
+	}
+
+	listResp, err := client.HTTP.ListPullsWithResponse(ctx, &generated.ListPullsRequestOptions{Query: &generated.ListPullsQuery{}})
+	require.NoError(err)
+	require.Equal(http.StatusOK, listResp.StatusCode, string(listResp.Body))
+	require.NotNil(listResp.JSON200)
+	byNumber := map[int64]generated.MergeRequestResponse{}
+	for _, item := range *listResp.JSON200 {
+		byNumber[item.Number] = item
+	}
+	require.Len(byNumber, 3)
+	assert.Equal("dirty", byNumber[10].MergeableState)
+	assertTimePtrEqualsUTC(t, byNumber[10].MergeableStateObservedAt, baseObservedAt)
+	assert.Equal("dirty", byNumber[11].MergeableState)
+	assert.Nil(byNumber[11].MergeableStateObservedAt, "the clean observation does not time the override")
+	assert.Equal("dirty", byNumber[12].MergeableState)
+	assertTimePtrEqualsUTC(t, byNumber[12].MergeableStateObservedAt, tipObservedAt)
+
+	detailResp, err := client.HTTP.GetPullWithResponse(ctx, &generated.GetPullRequestOptions{PathParams: &generated.GetPullPath{Provider: "gh", Owner: "acme", Name: "widget", Number: int64(11)}})
+	require.NoError(err)
+	require.Equal(http.StatusOK, detailResp.StatusCode, string(detailResp.Body))
+	require.NotNil(detailResp.JSON200)
+	assert.Equal("dirty", detailResp.JSON200.MergeRequest.MergeableState)
+	assert.Nil(detailResp.JSON200.MergeRequest.MergeableStateObservedAt)
+	assertTimePtrEqualsUTC(t, serverfake.RequireMR(t, database, repo.ID, 11).MergeableStateObservedAt, downstreamObservedAt)
 }
 
 func TestAPIListStacks_DraftNotAllGreen(t *testing.T) {

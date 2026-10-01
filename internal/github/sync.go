@@ -1650,13 +1650,16 @@ func (s *Syncer) commitIssueParentSnapshot(
 // the terminal commit-liveness computation there, against the transaction's
 // own view of the stored events — finalization is intrinsic to the choke
 // point, so no caller can commit a terminal transition without it and no
-// concurrent round can shift the data between compute and commit.
+// concurrent round can shift the data between compute and commit. It also
+// drops the observation time of an empty or unknown mergeable state, which
+// is never an observation.
 func (s *Syncer) CommitMergeRequestParentSnapshot(
 	ctx context.Context,
 	repo RepoRef,
 	mr *db.MergeRequest,
 ) (int64, int64, bool, error) {
 	ctx = withCloneRepositoryIdentity(ctx, repo)
+	clearUnknownMergeableStateTime(mr)
 	mrID, revision, accepted, err := s.db.UpsertMergeRequestSnapshotWithLabelsAndEventMetadata(
 		ctx, mr, s.terminalLivenessComputer(ctx, repo, mr),
 	)
@@ -6205,6 +6208,7 @@ func (s *Syncer) indexSyncRepo(
 		// Discovery of new and closed PRs rides the essential budget
 		// reserve so optional background spend cannot starve it.
 		listCtx := WithEssentialSyncBudget(ctx)
+		listRequestedAt := s.nowUTC()
 		if nativeReader, ok := mrReader.(interface {
 			ListOpenMergeRequestsWithNativeStackHints(
 				context.Context, platform.RepoRef,
@@ -6258,6 +6262,7 @@ func (s *Syncer) indexSyncRepo(
 			if fetcher := s.fetcherForContext(ctx, repo); fetcher != nil &&
 				s.shouldUseBulkGraphQLForMRs(ctx, repo, repoID, len(openMRs)) {
 				if s.graphQLReadAllowed(ctx, repo, fetcher) {
+					bulkRequestedAt := s.nowUTC()
 					result, gqlErr := fetcher.FetchRepoPRs(
 						ctx, repo.Owner, repo.Name, preferNativeStacks,
 					)
@@ -6281,7 +6286,7 @@ func (s *Syncer) indexSyncRepo(
 							nativeStackHints = nativeStackHintsFromBulk(result)
 						}
 						if err := s.doSyncRepoGraphQL(
-							ctx, repo, repoID, result, cloneFetchOK,
+							ctx, repo, repoID, result, bulkRequestedAt, cloneFetchOK,
 						); err != nil {
 							if s.recordRepositoryFeatureDisabled(
 								repo, platform.RepositoryFeatureMergeRequests, err,
@@ -6302,7 +6307,7 @@ func (s *Syncer) indexSyncRepo(
 
 			if !graphQLDone {
 				if err := s.syncMergeRequestsFromList(
-					ctx, mrReader, repo, repoID, openMRs, cloneFetchOK,
+					ctx, mrReader, repo, repoID, openMRs, listRequestedAt, cloneFetchOK,
 				); err != nil {
 					if s.recordRepositoryFeatureDisabled(
 						repo, platform.RepositoryFeatureMergeRequests, err,
@@ -6545,6 +6550,7 @@ func (s *Syncer) syncMergeRequestsFromList(
 	repo RepoRef,
 	repoID int64,
 	mrs []platform.MergeRequest,
+	requestedAt time.Time,
 	cloneFetchOK bool,
 ) error {
 	stillOpen := make(map[int]bool, len(mrs))
@@ -6556,7 +6562,7 @@ func (s *Syncer) syncMergeRequestsFromList(
 	var failureCause error
 	progress := newMergeRequestSyncProgressLogger(repo, "provider", len(mrs))
 	for i, mr := range mrs {
-		if err := s.indexUpsertMergeRequest(ctx, repo, repoID, mr, cloneFetchOK); err != nil {
+		if err := s.indexUpsertMergeRequest(ctx, repo, repoID, mr, requestedAt, cloneFetchOK); err != nil {
 			if errors.Is(err, platform.ErrRepositoryFeatureDisabled) {
 				return preservePartialSyncFailure(
 					failMR, err, failureCause,
@@ -6963,9 +6969,11 @@ func (s *Syncer) indexUpsertMergeRequest(
 	repo RepoRef,
 	repoID int64,
 	mr platform.MergeRequest,
+	requestedAt time.Time,
 	cloneFetchOK bool,
 ) error {
 	normalized := platformdb.DBMergeRequest(repoID, mr)
+	normalized.MergeableStateObservedAt = &requestedAt
 
 	existing, err := s.db.GetMergeRequestByRepoIDAndNumber(
 		ctx, repoID, mr.Number,
@@ -7184,11 +7192,13 @@ func (s *Syncer) indexUpsertMR(
 	repo RepoRef,
 	repoID int64,
 	ghPR *gh.PullRequest,
+	requestedAt time.Time,
 ) error {
 	normalized, err := NormalizePR(repoID, ghPR)
 	if err != nil {
 		return fmt.Errorf("normalize MR #%d: %w", ghPR.GetNumber(), err)
 	}
+	normalized.MergeableStateObservedAt = &requestedAt
 
 	existing, err := s.db.GetMergeRequestByRepoIDAndNumber(
 		ctx, repoID, ghPR.GetNumber(),
@@ -7534,6 +7544,7 @@ func (s *Syncer) doSyncRepoGraphQL(
 	repo RepoRef,
 	repoID int64,
 	result *RepoBulkResult,
+	requestedAt time.Time,
 	cloneFetchOK bool,
 ) error {
 	var failedScope failScope
@@ -7547,7 +7558,7 @@ func (s *Syncer) doSyncRepoGraphQL(
 		stillOpen[number] = true
 
 		if err := s.syncOpenMRFromBulk(
-			ctx, repo, repoID, bulk, cloneFetchOK,
+			ctx, repo, repoID, requestedAt, bulk, cloneFetchOK,
 		); err != nil {
 			if errors.Is(err, platform.ErrRepositoryFeatureDisabled) {
 				return preservePartialSyncFailure(
@@ -7803,6 +7814,7 @@ func (s *Syncer) syncOpenMRFromBulk(
 	ctx context.Context,
 	repo RepoRef,
 	repoID int64,
+	requestedAt time.Time,
 	bulk *BulkPR,
 	cloneFetchOK bool,
 ) error {
@@ -7811,6 +7823,7 @@ func (s *Syncer) syncOpenMRFromBulk(
 	if err != nil {
 		return fmt.Errorf("normalize MR #%d: %w", number, err)
 	}
+	normalized.MergeableStateObservedAt = &requestedAt
 
 	// Preserve derived fields that NormalizePR doesn't populate.
 	// Without this, upsert overwrites them with zero values; if
@@ -7829,6 +7842,7 @@ func (s *Syncer) syncOpenMRFromBulk(
 	if existing != nil {
 		normalized.CommentCount = existing.CommentCount
 		normalized.ReviewDecision = existing.ReviewDecision
+		normalized.ReviewDecisionObservedAt = existing.ReviewDecisionObservedAt
 		// CI is tied to the head SHA. If the head moved we must clear
 		// the previous values; otherwise an incomplete bulk CI fetch
 		// (CIComplete=false skips the UpdateMRCIStatus write below)
@@ -7836,6 +7850,7 @@ func (s *Syncer) syncOpenMRFromBulk(
 		if !headChanged {
 			normalized.CIStatus = existing.CIStatus
 			normalized.CIChecksJSON = existing.CIChecksJSON
+			normalized.CIObservedAt = existing.CIObservedAt
 			normalized.CIHadPending = existing.CIHadPending
 		}
 		normalized.DetailFetchedAt = existing.DetailFetchedAt
@@ -7855,9 +7870,21 @@ func (s *Syncer) syncOpenMRFromBulk(
 	// retained (review history is additive).
 	if decision, authoritative := mapGraphQLReviewDecision(bulk.ReviewDecision); authoritative {
 		normalized.ReviewDecision = decision
+		normalized.ReviewDecisionObservedAt = &requestedAt
 	} else if bulk.ReviewsComplete && len(bulk.Reviews) > 0 {
 		normalized.ReviewDecision = DeriveReviewDecision(bulk.Reviews)
+		normalized.ReviewDecisionObservedAt = &requestedAt
+	} else if bulk.ReviewsComplete && normalized.ReviewDecision == "" {
+		// A complete, empty review history with no provider decision
+		// confirms that no decision exists (repositories that do not
+		// require reviews). A stored decision is left alone because
+		// review history is additive.
+		normalized.ReviewDecisionObservedAt = &requestedAt
 	}
+	// The child snapshot below writes the review decision again; it takes
+	// this resolved pair, not whatever the parent commit leaves in normalized.
+	reviewDecision := normalized.ReviewDecision
+	reviewDecisionObservedAt := normalized.ReviewDecisionObservedAt
 
 	// Resolve display name if missing.
 	if normalized.Author != "" &&
@@ -7989,8 +8016,9 @@ func (s *Syncer) syncOpenMRFromBulk(
 	var derived *db.MRDerivedFields
 	if bulk.CommentsComplete {
 		fields := db.MRDerivedFields{
-			ReviewDecision: normalized.ReviewDecision,
-			CommentCount:   len(bulk.Comments),
+			ReviewDecision:           reviewDecision,
+			ReviewDecisionObservedAt: reviewDecisionObservedAt,
+			CommentCount:             len(bulk.Comments),
 		}
 		derived = &fields
 	}
@@ -8032,6 +8060,7 @@ func (s *Syncer) syncOpenMRFromBulk(
 		ciStatus := deriveCIStatusFromChecks(ciChecks)
 		ciApplied, err := s.db.UpdateMergeRequestCISnapshot(
 			ctx, mrID, revision, ciStatus, string(ciJSON),
+			&requestedAt,
 		)
 		if err != nil {
 			slog.Warn("update CI status failed",
@@ -8197,6 +8226,7 @@ func (s *Syncer) fetchMRDetailWithRouteFence(
 		)
 	}
 
+	requestedAt := s.nowUTC()
 	fullPR, newETag, notModified, err := s.getPullRequestForDetail(
 		ctx, client, repo, number,
 	)
@@ -8228,7 +8258,12 @@ func (s *Syncer) fetchMRDetailWithRouteFence(
 	if err != nil {
 		return calls, fmt.Errorf("normalize full PR #%d: %w", number, err)
 	}
+	normalized.MergeableStateObservedAt = &requestedAt
 	preserveMergeableStateIfOmitted(normalized, existing)
+	// The REST pull request carries no review decision or CI state. Keep the
+	// stored values until the timeline and CI refreshes below re-observe
+	// them, so a failed refresh does not leave them cleared.
+	CarryMergeRequestDerivedFields(normalized, existing)
 
 	if normalized.Author != "" &&
 		normalized.AuthorDisplayName == "" {
@@ -8538,6 +8573,7 @@ func (s *Syncer) fetchProviderMRDetail(
 	if err != nil {
 		return calls, fmt.Errorf("resolve merge request reader for %s/%s: %w", repo.Owner, repo.Name, err)
 	}
+	requestedAt := s.nowUTC()
 	mr, err := mrReader.GetMergeRequest(ctx, platformRepoRef(repo), number)
 	calls++
 	if err != nil {
@@ -8548,6 +8584,7 @@ func (s *Syncer) fetchProviderMRDetail(
 	}
 
 	normalized := platformdb.DBMergeRequest(repoID, mr)
+	normalized.MergeableStateObservedAt = &requestedAt
 	existing, err := s.db.GetMergeRequestByRepoIDAndNumber(
 		ctx, repoID, number,
 	)
@@ -8557,6 +8594,10 @@ func (s *Syncer) fetchProviderMRDetail(
 		)
 	}
 	preserveMergeableStateIfOmitted(normalized, existing)
+	// The detail response carries at most a pipeline-only CI status without
+	// checks. Keep the stored CI state until the CI-check fetch below
+	// replaces it, so a failed or unsupported fetch does not overwrite it.
+	carryCIStateOnSameHead(normalized, existing)
 
 	mrID, revision, accepted, err := s.CommitMergeRequestParentSnapshot(
 		ctx, repo, normalized,
@@ -8694,6 +8735,7 @@ func (s *Syncer) syncProviderMRDetailExtras(
 		}
 		return calls, false, fmt.Errorf("resolve CI reader for %s/%s: %w", repo.Owner, repo.Name, err)
 	}
+	ciRequestedAt := s.nowUTC()
 	checks, err := ciReader.ListCIChecks(ctx, platformRepoRef(repo), headSHA)
 	calls++
 	if errors.Is(err, platform.ErrUnsupportedCapability) {
@@ -8710,6 +8752,7 @@ func (s *Syncer) syncProviderMRDetailExtras(
 	ciStatus := deriveCIStatusFromChecks(dbChecks)
 	ciApplied, err := s.db.UpdateMergeRequestCISnapshot(
 		ctx, mrID, expectedRevision, ciStatus, string(ciJSON),
+		&ciRequestedAt,
 	)
 	if err != nil {
 		return calls, false, fmt.Errorf("update CI status for MR #%d: %w", number, err)
@@ -9113,6 +9156,7 @@ func (s *Syncer) refreshTimeline(
 		return fmt.Errorf("list comments for MR #%d: %w", number, err)
 	}
 
+	reviewsRequestedAt := s.nowUTC()
 	reviews, err := client.ListReviews(ctx, repo.Owner, repo.Name, number)
 	if err != nil {
 		return fmt.Errorf("list reviews for MR #%d: %w", number, err)
@@ -9179,8 +9223,9 @@ func (s *Syncer) refreshTimeline(
 
 	reviewDecision := DeriveReviewDecision(reviews)
 	derived := db.MRDerivedFields{
-		ReviewDecision: reviewDecision,
-		CommentCount:   len(comments),
+		ReviewDecision:           reviewDecision,
+		ReviewDecisionObservedAt: &reviewsRequestedAt,
+		CommentCount:             len(comments),
 	}
 	applied, err := s.commitMergeRequestDatasets(
 		ctx, repo, mrID, number, expectedRevision,
@@ -9228,6 +9273,7 @@ func (s *Syncer) RefreshMRCIStatusOnProvider(
 		return nil, s.db.UpdateMRCIStatusForHead(
 			ctx, repoID, number, headSHA,
 			result.Status, result.ChecksJSON, ciHasPending(result.ChecksJSON),
+			&result.RequestedAt,
 		)
 	}
 
@@ -9238,6 +9284,7 @@ func (s *Syncer) RefreshMRCIStatusOnProvider(
 		}
 		return nil, fmt.Errorf("resolve CI reader for %s/%s: %w", repo.Owner, repo.Name, err)
 	}
+	requestedAt := s.nowUTC()
 	checks, err := ciReader.ListCIChecks(ctx, platformRepoRef(repo), headSHA)
 	if err != nil {
 		if errors.Is(err, platform.ErrUnsupportedCapability) {
@@ -9259,6 +9306,7 @@ func (s *Syncer) RefreshMRCIStatusOnProvider(
 	if err := s.db.UpdateMRCIStatusForHead(
 		ctx, repoID, number, headSHA,
 		ciStatus, string(ciJSON), ciHasPending(string(ciJSON)),
+		&requestedAt,
 	); err != nil {
 		return nil, fmt.Errorf("update CI status for MR #%d: %w", number, err)
 	}
@@ -9300,6 +9348,7 @@ func (s *Syncer) refreshCIStatus(
 	return s.db.UpdateMRCIStatusForHead(
 		ctx, repoID, number, headSHA,
 		result.Status, result.ChecksJSON, ciHasPending(result.ChecksJSON),
+		&result.RequestedAt,
 	)
 }
 
@@ -9322,6 +9371,7 @@ func (s *Syncer) refreshCIStatusSnapshot(
 	}
 	applied, err := s.db.UpdateMergeRequestCISnapshot(
 		ctx, mrID, expectedRevision, result.Status, result.ChecksJSON,
+		&result.RequestedAt,
 	)
 	if errors.Is(err, db.ErrRepositoryIdentityChanged) {
 		return false, nil
@@ -9336,6 +9386,8 @@ type ciStatusFetchResult struct {
 	ChecksJSON string
 	Updated    bool
 	Warning    string
+	// RequestedAt is when the check-runs request was sent.
+	RequestedAt time.Time
 }
 
 func (s *Syncer) fetchGitHubCIStatus(
@@ -9354,6 +9406,7 @@ func (s *Syncer) fetchGitHubCIStatus(
 	if err != nil {
 		return ciStatusFetchResult{}, fmt.Errorf("resolve client for %s/%s: %w", repo.Owner, repo.Name, err)
 	}
+	requestedAt := s.nowUTC()
 	checkRuns, err := client.ListCheckRunsForRef(ctx, repo.Owner, repo.Name, headSHA)
 	if err != nil {
 		slog.Warn("list check runs failed",
@@ -9375,9 +9428,10 @@ func (s *Syncer) fetchGitHubCIStatus(
 	}
 
 	return ciStatusFetchResult{
-		Status:     DeriveOverallCIStatus(checkRuns, combined),
-		ChecksJSON: NormalizeCIChecks(checkRuns, combined),
-		Updated:    true,
+		Status:      DeriveOverallCIStatus(checkRuns, combined),
+		ChecksJSON:  NormalizeCIChecks(checkRuns, combined),
+		Updated:     true,
+		RequestedAt: requestedAt,
 	}, nil
 }
 
@@ -11110,6 +11164,7 @@ func (s *Syncer) syncMRForRepoResolved(
 	var platformMR platform.MergeRequest
 	var normalized *db.MergeRequest
 	var newETag string
+	requestedAt := s.nowUTC()
 	if rawReader, ok := mrReader.(interface {
 		GetGitHubPullRequest(context.Context, platform.RepoRef, int) (*gh.PullRequest, platform.MergeRequest, error)
 	}); ok {
@@ -11172,6 +11227,7 @@ func (s *Syncer) syncMRForRepoResolved(
 	if normalized == nil {
 		return fmt.Errorf("get MR %s/%s#%d: provider returned no merge request", owner, name, number)
 	}
+	normalized.MergeableStateObservedAt = &requestedAt
 	if fetchedEvidence != nil {
 		*fetchedEvidence = mergeRequestFetchEvidence{
 			merged:         normalized.State == db.MergeRequestStateMerged || normalized.MergedAt != nil,
@@ -11185,6 +11241,7 @@ func (s *Syncer) syncMRForRepoResolved(
 	if existing != nil {
 		normalized.CommentCount = existing.CommentCount
 		normalized.ReviewDecision = existing.ReviewDecision
+		normalized.ReviewDecisionObservedAt = existing.ReviewDecisionObservedAt
 		preserveMergeableStateIfOmitted(normalized, existing)
 		preserveMergedAtIfOmitted(normalized, existing)
 		// CI is tied to the head SHA. If the head moved we must clear the
@@ -11193,6 +11250,7 @@ func (s *Syncer) syncMRForRepoResolved(
 		if !headChanged {
 			normalized.CIStatus = existing.CIStatus
 			normalized.CIChecksJSON = existing.CIChecksJSON
+			normalized.CIObservedAt = existing.CIObservedAt
 			normalized.CIHadPending = existing.CIHadPending
 		}
 		normalized.DetailFetchedAt = existing.DetailFetchedAt
@@ -11488,6 +11546,7 @@ func preserveMergeableStateIfOmitted(
 	if normalized.MergeableState == "" ||
 		(normalized.MergeableState == "unknown" && existing.MergeableState != "") {
 		normalized.MergeableState = existing.MergeableState
+		normalized.MergeableStateObservedAt = existing.MergeableStateObservedAt
 	}
 }
 
@@ -11509,7 +11568,7 @@ func preserveReviewDecisionIfOmitted(
 	if normalized == nil || existing == nil {
 		return
 	}
-	if normalized.ReviewDecision != "" || existing.ReviewDecision == "" {
+	if normalized.ReviewDecision != "" {
 		return
 	}
 	if normalized.PlatformHeadSHA != "" &&
@@ -11518,6 +11577,7 @@ func preserveReviewDecisionIfOmitted(
 		return
 	}
 	normalized.ReviewDecision = existing.ReviewDecision
+	normalized.ReviewDecisionObservedAt = existing.ReviewDecisionObservedAt
 }
 
 func preserveCIStateIfOmitted(
@@ -11537,11 +11597,22 @@ func preserveCIStateIfOmitted(
 		normalized.CIStatus != existing.CIStatus
 	if normalized.CIStatus == "" {
 		normalized.CIStatus = existing.CIStatus
+		normalized.CIObservedAt = existing.CIObservedAt
 	}
 	if normalized.CIChecksJSON == "" && !ciStatusChanged {
 		normalized.CIChecksJSON = existing.CIChecksJSON
 	}
 	return ciStatusChanged && normalized.CIChecksJSON == ""
+}
+
+// clearUnknownMergeableStateTime drops the observation time of an empty or
+// unknown mergeable state: the provider either omitted the field or had not
+// computed it. Empty review decisions and CI keep their times, because the
+// paths that stamp them do so only from authoritative, complete responses.
+func clearUnknownMergeableStateTime(mr *db.MergeRequest) {
+	if mr.MergeableState == "" || mr.MergeableState == "unknown" {
+		mr.MergeableStateObservedAt = nil
+	}
 }
 
 // syncMRDiff fetches the bare clone and computes diff SHAs for a single PR.
@@ -12057,10 +12128,21 @@ func CarryMergeRequestDerivedFields(normalized, existing *db.MergeRequest) {
 	}
 	normalized.CommentCount = existing.CommentCount
 	normalized.ReviewDecision = existing.ReviewDecision
-	if strings.EqualFold(normalized.PlatformHeadSHA, existing.PlatformHeadSHA) {
-		normalized.CIStatus = existing.CIStatus
-		normalized.CIChecksJSON = existing.CIChecksJSON
+	normalized.ReviewDecisionObservedAt = existing.ReviewDecisionObservedAt
+	carryCIStateOnSameHead(normalized, existing)
+}
+
+// carryCIStateOnSameHead copies the stored CI status, checks, and CI
+// observation time onto normalized while the head is unchanged. CI state is
+// head-derived, so a new head keeps the snapshot's own value.
+func carryCIStateOnSameHead(normalized, existing *db.MergeRequest) {
+	if normalized == nil || existing == nil ||
+		!strings.EqualFold(normalized.PlatformHeadSHA, existing.PlatformHeadSHA) {
+		return
 	}
+	normalized.CIStatus = existing.CIStatus
+	normalized.CIChecksJSON = existing.CIChecksJSON
+	normalized.CIObservedAt = existing.CIObservedAt
 }
 
 // fetchAndUpdateClosed retrieves the final state of a now-closed PR from GitHub.
@@ -12078,6 +12160,7 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 	if err != nil {
 		return fmt.Errorf("resolve client for %s/%s: %w", repo.Owner, repo.Name, err)
 	}
+	requestedAt := s.nowUTC()
 	ghPR, err := client.GetPullRequest(ctx, repo.Owner, repo.Name, number)
 	// Route fetch failures and detected transfers through the canonical
 	// lookup classification so removed, inaccessible, and moved items
@@ -12099,6 +12182,7 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 	if err != nil {
 		return fmt.Errorf("normalize closed PR #%d: %w", number, err)
 	}
+	normalized.MergeableStateObservedAt = &requestedAt
 	existing, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number)
 	if err != nil {
 		return fmt.Errorf("get closed MR #%d: %w", number, err)
@@ -12274,11 +12358,13 @@ func (s *Syncer) fetchAndUpdateClosedMergeRequest(
 	if err != nil {
 		return fmt.Errorf("resolve merge request reader for %s/%s: %w", repo.Owner, repo.Name, err)
 	}
+	requestedAt := s.nowUTC()
 	mr, err := mrReader.GetMergeRequest(ctx, platformRepoRef(repo), number)
 	if err != nil {
 		return fmt.Errorf("get closed MR #%d: %w", number, err)
 	}
 	normalized := platformdb.DBMergeRequest(repoID, mr)
+	normalized.MergeableStateObservedAt = &requestedAt
 	existing, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number)
 	if err != nil {
 		return fmt.Errorf("get stored closed MR #%d: %w", number, err)

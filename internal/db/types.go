@@ -666,16 +666,23 @@ type MergeRequest struct {
 	MergeCommitSHA        string
 	CommentCount          int
 	ReviewDecision        string
-	CIStatus              string
-	CIChecksJSON          string
-	CreatedAt             time.Time
-	UpdatedAt             time.Time
-	LastActivityAt        time.Time
-	MergedAt              *time.Time
-	ClosedAt              *time.Time
-	MergeableState        string
-	DetailFetchedAt       *time.Time
-	CIHadPending          bool
+	// ReviewDecisionObservedAt, CIObservedAt, and MergeableStateObservedAt
+	// record when Forge observed the value currently stored in the sibling
+	// field, not when the row was last written. A nil time means the value
+	// is unknown-provenance (never stamped, or explicitly cleared).
+	ReviewDecisionObservedAt *time.Time `json:"review_decision_observed_at,omitzero"`
+	CIStatus                 string
+	CIChecksJSON             string
+	CIObservedAt             *time.Time `json:"ci_observed_at,omitzero"`
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+	LastActivityAt           time.Time
+	MergedAt                 *time.Time
+	ClosedAt                 *time.Time
+	MergeableState           string
+	MergeableStateObservedAt *time.Time `json:"mergeable_state_observed_at,omitzero"`
+	DetailFetchedAt          *time.Time
+	CIHadPending             bool
 	// WorkflowApprovalCheckedAt is when kenn-forge last reconciled the
 	// workflow-approval state for this merge request. Nil means never
 	// checked; the GET path treats persisted state as authoritative
@@ -694,8 +701,8 @@ type MergeRequest struct {
 	// records a provider-confirmed empty set.
 	AssigneesJSON      string   `json:"-"`
 	ReviewersJSON      string   `json:"-"`
-	Assignees          []string `json:"assignees,omitempty"`
-	RequestedReviewers []string `json:"requested_reviewers,omitempty"`
+	Assignees          []string `json:"assignees,omitzero"`
+	RequestedReviewers []string `json:"requested_reviewers,omitzero"`
 }
 
 type MergeRequestState string
@@ -980,7 +987,7 @@ type Issue struct {
 	Starred            bool
 	WorkflowStatus     KanbanStatus `enum:"new,reviewing,waiting,awaiting_merge"`
 	Labels             []Label      `json:"labels,omitempty"`
-	Assignees          []string     `json:"assignees,omitempty"` // Parsed assignees
+	Assignees          []string     `json:"assignees,omitzero"` // Parsed assignees
 }
 
 type IssueEvent struct {
