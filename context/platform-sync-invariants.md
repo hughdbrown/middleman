@@ -7,26 +7,64 @@ provider interfaces, and the checklist for adding a new provider, read
 
 ## Identity
 
-Repository identity is `(platform, platform_host, platform_repo_id)`, where
-`platform_repo_id` is the provider's integer repository ID. Every supported
-provider assigns it once per host and keeps it across renames and transfers;
-GitHub's `node_id` has more than one encoding for one repository and is never
-identity. Owner, name, and `repo_path` are the repository's current route.
+Repository identity is `(platform, platform_host, key)`. The key is one
+`platform.RepositoryKey`: a positive integer repository ID for every provider,
+including Bitbucket Data Center, or the repository UUID for Bitbucket Cloud,
+which has no integer ID (`platform/repository_key.go::RepositoryKey`,
+`platform/repository_identity.go::RepositoryIdentity.Valid`). GitHub's
+`node_id` is never identity. Owner, name, and `repo_path` are the current route.
 
+- Every Go value that identifies a repository holds a `platform.RepositoryKey`
+  (`Key` on repository types, `RepoKey` on types that carry other data too);
+  never a bare integer ID or a separate UUID field. Compare keys with `==`,
+  test verification with `IsZero`, and format them with `String`; the key's
+  fields are unexported so no code can check half of it (maintainer decision).
+- Flat `platform_repo_id` and `bitbucket_repository_uuid` values exist only in
+  encodings: SQL columns (`internal/db/repository_key.go`), JSON bodies,
+  federation payloads, and the config file. Decode with
+  `platform.RepositoryKeyFromWire` where the value enters and encode with
+  `RepositoryKey.Wire`. A JSON-encoded type keeps its key field, tagged
+  `json:"-" repokey:"<id member>,<uuid member>[,omitempty]"`, and its JSON
+  methods call `platform.MarshalKeyedJSON`/`UnmarshalKeyedJSON`, which derive
+  the flat wire form from the type itself; never add a parallel JSON struct
+  that copies fields (maintainer decision). API schemas document these types
+  by that derived form, so OpenAPI names and shapes do not change
+  (`platform/repository_key_json.go`,
+  `internal/server/activityapi/repository_key_schemas.go::repositoryKeyAPITypes`); a huma
+  API serving those types must be built with `WithRepositoryKeyWireSchemas`,
+  or its validator rejects the flat key members. An
+  outbound DTO whose Go use is only encoding may hold the flat fields instead,
+  set only from `Wire`; a type embedded in another DTO must not define
+  `MarshalJSON`, because the method is promoted and drops the outer fields.
+  Tool schemas the MCP SDK reflects from struct fields stay flat for the same
+  reason and decode to a key where the input enters. Config entries expose
+  only `RepositoryKey`/`SetRepositoryKey`
+  (`internal/config/config.go::Repo.RepositoryKey`).
+- Provider adapters read their own key kind with `RepositoryKey.ID` or
+  `RepositoryKey.UUID`; nothing else does.
+- The frontend mirrors the key as one `RepositoryKey` type: decode API data
+  with `repositoryKeyFromWire`, send it with `repositoryKeyToWire`, compare with
+  `sameRepositoryKey`, and key maps and persisted state with
+  `repositoryKeyString`, whose `id|<n>` form keeps stored integer keys valid
+  (`frontend/src/lib/api/repository-key.ts`).
 - Owner/name is edge input. Resolve it to a repository once where it enters
   (HTTP params, MCP args, config entries, URLs) and key everything below by the
   repository. A request that carries a provider ID resolves by that ID
   (`internal/db/queries.go::DB.GetRepoByIdentity`,
   `internal/server/mcp_backend.go::mcpBackend.resolveRepository`).
-- Provider wrappers expose only the integer ID (`platform.RepoRef.PlatformID`);
-  `GetRepository` reads by ID once the ref carries one, so renames resolve to
-  the current route (`platform/github/provider.go::Provider.GetRepository`).
-- Observing a repository upserts its row by ID and moves owner/name in place;
-  another active row on that route is deactivated and re-resolves by its own ID
-  on its next read. There are no route generations, fences, or observation
-  watermarks: a route changing hands mid-pass self-heals on the next pass
-  (`internal/db/repository_catalog.go::DB.ObserveRepository`).
-- Every repository row has a verified ID; nothing creates route-only rows.
+- Carry `platform.RepoRef.Key`. Never hash the UUID into an integer
+  (`internal/server/httpapi/repository_resolver.go::PlatformRepoRef`).
+  `GetRepository` reads by that key once the ref carries one, so renames
+  resolve to the current route
+  (`platform/github/provider.go::Provider.GetRepository`).
+- Observing a repository upserts its row by that key and moves owner/name in
+  place; another active row on that route is deactivated and re-resolves by
+  its own key on its next read. There are no route generations, fences, or
+  observation watermarks: a route changing hands mid-pass self-heals on the
+  next pass (`internal/db/repository_catalog.go::DB.ObserveRepository`).
+- Every repository row has a verified provider key; nothing creates route-only
+  rows. An absent Cloud UUID is stored as empty text, never the nil UUID's
+  canonical string (`internal/db/repository_key.go::repositoryKeyArgs`).
   Callers holding only a route look up the active occupant or leave the link
   unset (`internal/server/workspaceapi/projects_handlers.go`).
 - GitHub rows stored before migration 60 hold `github_node_id` until a sync pass
@@ -41,8 +79,12 @@ identity. Owner, name, and `repo_path` are the repository's current route.
   held merges into that row, whose copy wins item conflicts. Every column holding
   a `forge_repos` id must be in `repositoryOwnedColumns`
   (`internal/db/repository_catalog.go::mergeDuplicateRepositoryTx`).
+- Clone partitions, cooldown and credential-alias keys, archive snapshot IDs,
+  and provider-state source keys use `RepositoryKey.String`, which formats an
+  integer key as its decimal ID, so integer-keyed state keeps its existing
+  names (`internal/gitclone/clone.go::WithRepositoryIdentity`).
 - Keep provider calls route-based where the provider API is; the integer ID
-  confirms which repository answered and keys local state. Do not rewrite
+  key confirms which repository answered and keys local state. Do not rewrite
   owner/name reads into ID reads (maintainer decision).
 - Saved repository-filter presets resolve by stable identity and use `repo_path` only for display; reject unverified members and never fall back to a new occupant of the stored route (`internal/config/config.go::RepoPresetRepository`, `frontend/src/lib/stores/repo-presets.ts`).
 - `platform` is the provider kind named in the canonical provider list in
@@ -574,3 +616,22 @@ Run Go tests with `-shuffle=on`. Use the GitLab CE container fixture for
 changes that need real GitLab REST behavior. Use the optional Forgejo/Gitea
 container fixtures when fake transports are too weak to prove gitealike REST
 behavior.
+
+## Bitbucket
+
+- Cloud repository identity is `bitbucket_repository_uuid`, not `platform_repo_id` (`internal/db/migrations/000062_bitbucket_repository_uuid.up.sql`). Pull and issue numbers stay repository-scoped (`platform/bitbucket/normalize.go::repository.normalize`).
+- Drain Cloud pages outside the SDK, whose auto-paging ignores later decode errors (`platform/bitbucket/client.go::collect`).
+- Cloud cannot reopen declined PRs; keep combined state/content mutation disabled (`platform/bitbucket/client.go::Client.Capabilities`).
+- Cloud PR embeds omit clone links and abbreviate hashes; resolve canonical URLs and full hashes (`platform/bitbucket/read.go::Client.normalizePull`).
+- Cloud fetches use source branches; its pull ref is local storage (`internal/workspace/manager.go::fetchWorkspaceMergeRequestHeadRefWithGit`).
+- `bitbucket.org` uses Cloud; other hosts use Data Center's distinct API (`cmd/kenn-forge/provider_startup.go::defaultProviderFactories`).
+- Data Center `/scm/` and SSH ports describe transport, not repository identity; preserve execution URLs (`platform/remote.go::repositoryRemote`).
+
+- Bitbucket Git credential parsing must be provider-scoped; colons are valid in other providers' opaque tokens (`internal/gitclone/clone.go::gitRunnerAuthed`).
+- Cache complete Bitbucket permission inventories for five minutes, scoped to the credential and workspace/server;
+  repository discovery shares one snapshot and matches stable repository IDs (`platform/bitbucket/permissions.go`, `platform/bitbucketdc/permissions.go`).
+- Cloud reviewer nicknames are non-unique. Display account names but submit stable IDs; do not infer IDs from text (`platform/bitbucket/review.go::ListReviewerAccounts`).
+- Keep Data Center comments and threads disabled until current wire data is verified; the older activity example cannot establish today's response contract (`platform/bitbucketdc/client.go::Client.Capabilities`).
+- Data Center approval activity represents participant state, keyed by stable user ID and verified reviewed commit;
+  repeated approvals of that commit share one entry (`platform/bitbucketdc/mutation.go::Client.ApproveMergeRequest`).
+- Validate Bitbucket diff fetches against the API-observed head; Data Center private PR refs may be missing or stale (`internal/gitclone/bitbucket.go::FetchBitbucketMergeRequestHead`).

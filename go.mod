@@ -25,6 +25,7 @@ require (
 	github.com/jellydator/ttlcache/v3 v3.4.1
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/klauspost/compress v1.20.0
+	github.com/ktrysmt/go-bitbucket v0.10.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/posthog/posthog-go v1.25.3
 	github.com/rhysd/actionlint v1.7.12
@@ -160,6 +161,7 @@ require (
 	github.com/mattn/go-runewidth v0.0.24 // indirect
 	github.com/mattn/go-shellwords v1.0.13 // indirect
 	github.com/mitchellh/hashstructure/v2 v2.0.2 // indirect
+	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/moby/buildkit v0.31.0 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/go-archive v0.3.0 // indirect

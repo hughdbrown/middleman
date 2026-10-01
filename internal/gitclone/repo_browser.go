@@ -22,6 +22,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	providerplatform "go.kenn.io/forge/platform"
+
 	"go.kenn.io/forge/internal/procutil"
 	"golang.org/x/sync/semaphore"
 )
@@ -114,13 +116,12 @@ type RepoBrowserRepoRef struct {
 	Owner    string
 	Name     string
 	RepoPath string
-	// ProviderRepoID is the provider's integer repository identity. Browser
-	// clone storage partitions on it so a reused owner/name path never
-	// serves the displaced repository's cached refs or objects. Zero for
-	// repositories without a verified identity, which keep path-scoped
-	// storage.
-	ProviderRepoID int64
-	RemoteURL      string
+	// Key is the provider's repository key. Browser clone storage
+	// partitions on it so a reused owner/name path never serves the
+	// displaced repository's cached refs or objects. Zero for repositories
+	// without a verified identity, which keep path-scoped storage.
+	Key       providerplatform.RepositoryKey
+	RemoteURL string
 	// RequireCredential marks federation-node clones whose network work must
 	// never fall back to anonymous access if the exact route disappears.
 	RequireCredential bool
@@ -1223,7 +1224,7 @@ func (m *Manager) fetchRepoBrowserTags(
 	// to tag namespace size or moved-tag failures.
 	_, err := retryTransient(ctx, "git fetch repo browser tags", func() ([]byte, error) {
 		return m.gitNetworked(
-			ctx, m.sourceForRepo(platform, host, owner, name), host, clonePath, nil,
+			ctx, m.sourceForRepo(platform, host, owner, name), platform, host, clonePath, nil,
 			"fetch", "origin", "+refs/tags/*:refs/tags/*",
 		)
 	})
@@ -1234,7 +1235,7 @@ func (m *Manager) fetchRepoBrowserTags(
 }
 
 func (m *Manager) validateRepoBrowserRemote(repo RepoBrowserRepoRef, remoteURL string) error {
-	if err := validateRemoteURLIdentity(repo.Host, repo.Owner, repo.Name, remoteURL); err != nil {
+	if err := validateRemoteURLIdentity(repo.Provider, repo.Host, repo.Owner, repo.Name, remoteURL); err != nil {
 		return err
 	}
 	return m.validateRemoteTransport(repo.Provider, repo.Host, remoteURL)
@@ -1250,8 +1251,8 @@ func repoBrowserCloneNamespace(repo RepoBrowserRepoRef) string {
 	// reuse: a replacement repository on a reused path must not serve the
 	// displaced repository's cached refs or SHA-addressable objects.
 	// Repositories without a verified identity keep path-scoped storage.
-	if repo.ProviderRepoID > 0 {
-		parts = append(parts, strconv.FormatInt(repo.ProviderRepoID, 10))
+	if !repo.Key.IsZero() {
+		parts = append(parts, repo.Key.String())
 	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return "repo-browser-" + hex.EncodeToString(sum[:8])

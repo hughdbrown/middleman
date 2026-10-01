@@ -67,10 +67,7 @@ func (d *DB) validateWorkspaceLaunchSpecRepository(
 	if err != nil {
 		return fmt.Errorf("resolve workspace launch repository: %w", err)
 	}
-	if repo == nil ||
-		!strings.EqualFold(repo.Platform, spec.Repository.Provider) ||
-		!strings.EqualFold(repo.PlatformHost, spec.Repository.PlatformHost) ||
-		repo.PlatformRepoID != spec.Repository.PlatformRepoID {
+	if repo == nil || repo.Identity() != spec.Repository.Identity() {
 		return fmt.Errorf(
 			"%w: workspace launch specification repository identity changed",
 			ErrRepositoryIdentityChanged,
@@ -151,16 +148,15 @@ func (d *DB) PutWorkspaceLaunchSpec(
 // Repository display routes are deliberately excluded because they can change.
 func (d *DB) GetWorkspaceByLaunchSpecIdentity(
 	ctx context.Context,
-	platform, platformHost string, platformRepoID int64, itemType, itemKey string,
+	repository WorkspaceLaunchRepository, itemType, itemKey string,
 ) (*Workspace, error) {
-	platform = strings.ToLower(strings.TrimSpace(platform))
-	platformHost = strings.ToLower(strings.TrimSpace(platformHost))
+	identity := repository.Identity()
 	itemType = strings.TrimSpace(itemType)
 	itemKey = strings.TrimSpace(itemKey)
-	if platform == "" || platformHost == "" || platformRepoID <= 0 ||
-		itemType == "" || itemKey == "" {
+	if !identity.Valid() || itemType == "" || itemKey == "" {
 		return nil, nil
 	}
+	keyID, keyUUID := repositoryKeyArgs(identity.Key)
 	workspace, err := d.scanWorkspace(ctx, d.roQueryRowContext(ctx, `
 		SELECT w.id, w.platform, w.platform_host, w.repo_owner, w.repo_name,
 		       w.repo_id,
@@ -173,11 +169,14 @@ func (d *DB) GetWorkspaceByLaunchSpecIdentity(
 		WHERE lower(json_extract(launch.spec_json, '$.repository.provider')) = ?
 		  AND lower(json_extract(launch.spec_json, '$.repository.platform_host')) = ?
 		  AND json_extract(launch.spec_json, '$.repository.platform_repo_id') = ?
+		  AND COALESCE(json_extract(launch.spec_json, '$.repository.bitbucket_repository_uuid'), '') = ?
 		  AND json_extract(launch.spec_json, '$.item_type') = ?
 		  AND json_extract(launch.spec_json, '$.item_key') = ?
 		ORDER BY w.created_at, w.id
 		LIMIT 1`,
-		platform, platformHost, platformRepoID, itemType, itemKey,
+		identity.Provider, identity.PlatformHost,
+		keyID, keyUUID,
+		itemType, itemKey,
 	))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -224,16 +223,10 @@ func (d *DB) PutRefreshedWorkspaceLaunchSpec(
 		!strings.EqualFold(current.Repository.Owner, spec.Repository.Owner) ||
 		!strings.EqualFold(current.Repository.Name, spec.Repository.Name))
 	if routeChanged {
-		if current == nil ||
-			current.Repository.PlatformRepoID != spec.Repository.PlatformRepoID ||
-			!strings.EqualFold(current.Repository.Provider, spec.Repository.Provider) ||
-			!strings.EqualFold(current.Repository.PlatformHost, spec.Repository.PlatformHost) {
+		if current == nil || current.Repository.Identity() != spec.Repository.Identity() {
 			return nil, errors.New("refreshed workspace repository identity changed")
 		}
-		entry, lookupErr := d.GetRepositoryByProviderID(ctx, platform.RepositoryIdentity{
-			Provider: spec.Repository.Provider, PlatformHost: spec.Repository.PlatformHost,
-			PlatformRepoID: spec.Repository.PlatformRepoID,
-		})
+		entry, lookupErr := d.GetRepositoryByProviderID(ctx, spec.Repository.Identity())
 		if lookupErr != nil {
 			return nil, lookupErr
 		}
@@ -413,21 +406,21 @@ func (d *DB) ListUnpreparedProviderWorkspacesAt(
 			reason = "launchSpecMismatch"
 		}
 		if reason != "" {
-			var platformRepoID int64
+			var repoKey platform.RepositoryKey
 			if spec != nil {
-				platformRepoID = spec.Repository.PlatformRepoID
+				repoKey = spec.Repository.Key
 			} else if workspace.RepoID != 0 {
 				repo, err := d.GetActiveRepoByID(ctx, workspace.RepoID)
 				if err != nil {
 					return nil, err
 				}
 				if repo != nil {
-					platformRepoID = repo.PlatformRepoID
+					repoKey = repo.Key
 				}
 			}
 			unprepared = append(unprepared, UnpreparedWorkspace{
 				Workspace: *workspace, Reason: reason,
-				PlatformRepoID: platformRepoID,
+				RepoKey: repoKey,
 			})
 		}
 	}

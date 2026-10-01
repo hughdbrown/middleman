@@ -2344,7 +2344,7 @@ func (s *Handler) resolvePullCloneSnapshot(
 			)
 		}
 		return &resolvedPullCloneSnapshot{
-			ctx:  gitclone.WithRepositoryIdentity(ctx, repo.PlatformRepoID),
+			ctx:  gitclone.WithRepositoryIdentity(ctx, repo.Identity()),
 			repo: repo.Row(), shas: shas, stale: shas.Stale(),
 		}, nil
 	}
@@ -2366,7 +2366,7 @@ func (s *Handler) resolvePullCloneSnapshot(
 	if err != nil {
 		return nil, providerRouteLookupError(err)
 	}
-	if repo.PlatformRepoID != repository.PlatformRepoID {
+	if repo.Key != repository.Key {
 		return nil, httpapi.Upstream(
 			"hub descriptor did not resolve to its stable repository",
 			repository.Provider, repository.PlatformHost,
@@ -2379,7 +2379,7 @@ func (s *Handler) resolvePullCloneSnapshot(
 		return nil, pullClonePreparationProblem(err, repository)
 	}
 	cloneCtx := gitclone.WithRequiredCredential(
-		gitclone.WithRepositoryIdentity(ctx, repository.PlatformRepoID),
+		gitclone.WithRepositoryIdentity(ctx, repo.Identity()),
 	)
 	if err := s.clones.EnsureCloneValidated(
 		cloneCtx, repository.Provider, repository.PlatformHost,

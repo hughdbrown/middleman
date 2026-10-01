@@ -1,5 +1,6 @@
 <script lang="ts">
   import QuerySearchInput from "../shared/QuerySearchInput.svelte";
+  import { buildCanonicalProviderItemURL } from "../../utils/item-reference.js";
   import {
     copyToClipboard,
     formatRelativeTime,
@@ -81,6 +82,7 @@
   } from "../../utils/repo-filter-values.js";
   import { setWorkspaceRepoCatalog } from "../../stores/workspace-repo-catalog.svelte.js";
   import { loadFleetSnapshot } from "../../api/fleet-snapshot.js";
+  import { repositoryKeyFromWire } from "../../api/repository-key.js";
 
   type Workspace = WorkspaceListItem;
 
@@ -637,7 +639,7 @@
     return number > 0 && detail.isPullMerging({
       provider: ws.repo.provider,
       platformHost: ws.repo.platform_host,
-      platformRepoId: ws.repo.platform_repo_id,
+      repositoryKey: repositoryKeyFromWire(ws.repo),
       owner: ws.repo.owner,
       name: ws.repo.name,
       repoPath: ws.repo.repo_path,
@@ -827,32 +829,21 @@
   }
 
   function providerItemURL(ws: Workspace): string | null {
-    // Kata workspaces are not backed by a provider item, and an ad-hoc
-    // workspace only has one once a PR has been detected for its branch.
+    // Kata and unlinked ad-hoc workspaces have no provider item.
     if (ws.item_type === "kata_task") return null;
     const itemNumber = itemBubbleNumber(ws);
     if (itemNumber === null) return null;
     const provider = workspaceProvider(ws)?.toLowerCase();
-    const repoPath = ws.repo?.repo_path ?? `${ws.repo_owner}/${ws.repo_name}`;
-    const encodedPath = repoPath
-      .split("/")
-      .map((part) => encodeURIComponent(part))
-      .join("/");
-    const host = ws.platform_host;
-    if (!host || !encodedPath) return null;
-    if (provider === "github") {
-      const kind = ws.item_type === "issue" ? "issues" : "pull";
-      return `https://${host}/${encodedPath}/${kind}/${itemNumber}`;
-    }
-    if (provider === "gitlab") {
-      const kind = ws.item_type === "issue" ? "issues" : "merge_requests";
-      return `https://${host}/${encodedPath}/-/${kind}/${itemNumber}`;
-    }
-    if (provider === "gitea" || provider === "forgejo") {
-      const kind = ws.item_type === "issue" ? "issues" : "pulls";
-      return `https://${host}/${encodedPath}/${kind}/${itemNumber}`;
-    }
-    return null;
+    if (!provider) return null;
+    return buildCanonicalProviderItemURL({
+      provider,
+      platformHost: ws.platform_host,
+      owner: ws.repo_owner,
+      name: ws.repo_name,
+      repoPath: ws.repo?.repo_path ?? `${ws.repo_owner}/${ws.repo_name}`,
+      number: itemNumber,
+      itemType: ws.item_type === "issue" ? "issue" : "pr",
+    }) ?? null;
   }
 
   function providerLabel(ws: Workspace): string {
@@ -1198,7 +1189,7 @@
     return {
       provider,
       platformHost: current.platform_host,
-      platformRepoId: current.repo?.platform_repo_id,
+      repositoryKey: repositoryKeyFromWire(current.repo),
       owner: current.repo_owner,
       name: current.repo_name,
     };

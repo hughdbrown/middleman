@@ -15,7 +15,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -124,8 +123,13 @@ type (
 // stable repository identity. Callers should set this after reconciling a
 // mutable owner/name route so route reuse cannot share clone state or an
 // in-flight fetch between distinct repositories.
-func WithRepositoryIdentity(ctx context.Context, providerRepoID int64) context.Context {
-	return context.WithValue(ctx, repositoryIdentityContextKey{}, providerRepoID)
+func WithRepositoryIdentity(
+	ctx context.Context, identity providerplatform.RepositoryIdentity,
+) context.Context {
+	// The partition is named by the key alone: the clone namespace already
+	// carries the platform and the path carries the host. Integer keys
+	// format as the decimal ID, so their on-disk layout is unchanged.
+	return context.WithValue(ctx, repositoryIdentityContextKey{}, identity.Key.String())
 }
 
 // WithRequiredCredential makes every networked Git command in ctx fail closed
@@ -220,11 +224,11 @@ func cloneNamespaceForPlatform(platform string) string {
 
 func cloneNamespaceForContext(ctx context.Context, platform string) string {
 	namespace := cloneNamespaceForPlatform(platform)
-	providerRepoID, _ := ctx.Value(repositoryIdentityContextKey{}).(int64)
-	if providerRepoID <= 0 {
+	partitionKey, _ := ctx.Value(repositoryIdentityContextKey{}).(string)
+	if partitionKey == "" {
 		return namespace
 	}
-	digest := sha256.Sum256([]byte(strconv.FormatInt(providerRepoID, 10)))
+	digest := sha256.Sum256([]byte(partitionKey))
 	identityNamespace := fmt.Sprintf("repo-%x", digest[:16])
 	if namespace == "" {
 		return identityNamespace
@@ -259,7 +263,7 @@ type CloneLocation struct {
 func (m *Manager) ClonesForContext(
 	ctx context.Context, platform string,
 ) ([]CloneLocation, error) {
-	if providerRepoID, _ := ctx.Value(repositoryIdentityContextKey{}).(int64); providerRepoID <= 0 {
+	if partitionKey, _ := ctx.Value(repositoryIdentityContextKey{}).(string); partitionKey == "" {
 		return nil, nil
 	}
 	root := filepath.Join(m.baseDir, cloneNamespaceForContext(ctx, platform))
@@ -476,7 +480,7 @@ func (m *Manager) ensureCloneInNamespaceValidated(
 	// check a follower with a malformed URL could inherit the
 	// leader's success — or a valid caller could inherit the
 	// leader's validation error.
-	if err := validateRemoteURLIdentity(host, owner, name, remoteURL); err != nil {
+	if err := validateRemoteURLIdentity(platform, host, owner, name, remoteURL); err != nil {
 		return err
 	}
 	if err := m.validateRemoteTransport(platform, host, remoteURL); err != nil {
@@ -498,7 +502,7 @@ func (m *Manager) ensureCloneInNamespaceValidated(
 		_, statErr := os.Stat(filepath.Join(clonePath, "HEAD"))
 		m.ensureMu.Unlock()
 		if !active && statErr == nil {
-			if err := m.validateCloneOrigin(ctx, clonePath, host, owner, name); err != nil {
+			if err := m.validateCloneOrigin(ctx, clonePath, platform, host, owner, name); err != nil {
 				return err
 			}
 			return validateEnsureCloneCaller(ctx, validate)
@@ -870,7 +874,7 @@ func (m *Manager) ensureCloneNowInNamespace(
 			ctx, platform, host, owner, name, clonePath, remoteURL,
 		)
 	}
-	if err := m.validateCloneOrigin(ctx, clonePath, host, owner, name); err != nil {
+	if err := m.validateCloneOrigin(ctx, clonePath, platform, host, owner, name); err != nil {
 		return err
 	}
 	m.ensureRefspecs(ctx, clonePath)
@@ -878,11 +882,11 @@ func (m *Manager) ensureCloneNowInNamespace(
 }
 
 func (m *Manager) validateCloneOrigin(
-	ctx context.Context, clonePath, host, owner, name string,
+	ctx context.Context, clonePath, platform, host, owner, name string,
 ) error {
 	// Recheck an existing clone's origin in case its config changed.
 	if out, err := m.git(ctx, clonePath, "config", "--get", "remote.origin.url"); err == nil {
-		return validateRemoteURLIdentity(host, owner, name, strings.TrimSpace(string(out)))
+		return validateRemoteURLIdentity(platform, host, owner, name, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -1014,7 +1018,7 @@ func (m *Manager) fetch(
 	// Retry inline so a transient blip does not drop the entire sync cycle.
 	_, err := retryTransient(ctx, "git fetch", func() ([]byte, error) {
 		return m.gitNetworked(
-			ctx, m.sourceForRepo(platform, host, owner, name), host, clonePath, nil,
+			ctx, m.sourceForRepo(platform, host, owner, name), platform, host, clonePath, nil,
 			"fetch", "--prune", "--no-tags", "origin",
 		)
 	})
@@ -1027,7 +1031,7 @@ func (m *Manager) fetch(
 	// reduces stale-HEAD noise across sync cycles.
 	_, setHeadErr := retryTransient(ctx, "git remote set-head", func() ([]byte, error) {
 		return m.gitNetworked(
-			ctx, m.sourceForRepo(platform, host, owner, name), host, clonePath, nil,
+			ctx, m.sourceForRepo(platform, host, owner, name), platform, host, clonePath, nil,
 			"remote", "set-head", "origin", "-a",
 		)
 	})
@@ -1098,15 +1102,16 @@ func (m *Manager) MergeBase(
 	return strings.TrimSpace(string(out)), nil
 }
 
-func validateRemoteURLHost(expectedHost, remoteURL string) error {
-	return gitremote.ValidateRemoteHost(expectedHost, remoteURL)
+func validateRemoteURLHost(provider, expectedHost, remoteURL string) error {
+	return providerplatform.ValidateRemoteHost(providerplatform.Kind(provider), expectedHost, remoteURL)
 }
 
-func validateRemoteURLIdentity(expectedHost, owner, name, remoteURL string) error {
-	return gitremote.ValidateRemoteIdentity(gitremote.Identity{
-		Host:  expectedHost,
-		Owner: owner,
-		Name:  name,
+func validateRemoteURLIdentity(provider, expectedHost, owner, name, remoteURL string) error {
+	return providerplatform.ValidateRemoteIdentity(providerplatform.RepoRef{
+		Platform: providerplatform.Kind(provider),
+		Host:     expectedHost,
+		Owner:    owner,
+		Name:     name,
 	}, remoteURL)
 }
 
@@ -1142,11 +1147,11 @@ func (m *Manager) RunGitForRepoRemote(
 ) ([]byte, error) {
 	source := m.sourceForRepo(platform, host, owner, name)
 	if source != nil {
-		if err := m.validateRemoteIdentity(ctx, dir, remote, host, owner, name); err != nil {
+		if err := m.validateRemoteIdentity(ctx, dir, remote, platform, host, owner, name); err != nil {
 			return nil, err
 		}
 	}
-	return m.gitNetworked(ctx, source, host, dir, nil, args...)
+	return m.gitNetworked(ctx, source, platform, host, dir, nil, args...)
 }
 
 // RunGitForNamedRemote runs a networked Git command with credentials selected
@@ -1173,13 +1178,13 @@ func (m *Manager) RunGitForNamedRemote(
 func (m *Manager) RunGitForRemote(
 	ctx context.Context, platform, host, remoteURL, dir string, args ...string,
 ) ([]byte, error) {
-	if err := validateRemoteURLHost(host, remoteURL); err != nil {
+	if err := validateRemoteURLHost(platform, host, remoteURL); err != nil {
 		return nil, err
 	}
 	if err := m.validateRemoteTransport(platform, host, remoteURL); err != nil {
 		return nil, err
 	}
-	repoPath := gitremote.RemoteRepoPath(remoteURL)
+	repoPath := providerplatform.RemoteRepoPath(providerplatform.Kind(platform), host, remoteURL)
 	owner, name, ok := strings.Cut(repoPath, "/")
 	if !ok || strings.TrimSpace(owner) == "" || strings.TrimSpace(name) == "" {
 		return nil, errors.New("remote repository owner and name are required")
@@ -1188,7 +1193,7 @@ func (m *Manager) RunGitForRemote(
 		owner, name = repoPath[:index], repoPath[index+1:]
 	}
 	return m.gitNetworked(
-		ctx, m.sourceForRepo(platform, host, owner, name), host, dir, nil, args...,
+		ctx, m.sourceForRepo(platform, host, owner, name), platform, host, dir, nil, args...,
 	)
 }
 
@@ -1197,11 +1202,11 @@ func (m *Manager) RunGitForRemote(
 func (m *Manager) RunGitForHost(
 	ctx context.Context, host, dir string, args ...string,
 ) ([]byte, error) {
-	return m.gitNetworked(ctx, m.fallbackSource(host), host, dir, nil, args...)
+	return m.gitNetworked(ctx, m.fallbackSource(host), "", host, dir, nil, args...)
 }
 
 func (m *Manager) validateRemoteIdentity(
-	ctx context.Context, dir, remote, host, owner, name string,
+	ctx context.Context, dir, remote, platform, host, owner, name string,
 ) error {
 	if strings.TrimSpace(dir) == "" {
 		return nil
@@ -1226,7 +1231,7 @@ func (m *Manager) validateRemoteIdentity(
 			continue
 		}
 		for _, url := range urls {
-			if err := validateRemoteURLIdentity(host, owner, name, url); err != nil {
+			if err := validateRemoteURLIdentity(platform, host, owner, name, url); err != nil {
 				return fmt.Errorf("validate %s before authenticated git: %w", key, err)
 			}
 		}
@@ -1255,7 +1260,7 @@ func (m *Manager) namedRemoteRepository(
 	if len(remoteURLs) == 0 {
 		return "", "", fmt.Errorf("read remote.%s.url before authenticated git: no URL configured", remote)
 	}
-	repoPath := gitremote.RemoteRepoPath(remoteURLs[0])
+	repoPath := providerplatform.RemoteRepoPath(providerplatform.Kind(platform), host, remoteURLs[0])
 	index := strings.LastIndex(repoPath, "/")
 	if index <= 0 || index == len(repoPath)-1 {
 		owner, name := strings.TrimSpace(routeOwner), strings.TrimSpace(routeName)
@@ -1266,7 +1271,7 @@ func (m *Manager) namedRemoteRepository(
 			if err := m.validateRemoteTransport(platform, host, remoteURL); err != nil {
 				return "", "", err
 			}
-			if err := validateRemoteURLIdentity(host, owner, name, remoteURL); err != nil {
+			if err := validateRemoteURLIdentity(platform, host, owner, name, remoteURL); err != nil {
 				return "", "", fmt.Errorf(
 					"validate %q remote before authenticated git: %w", remote, err,
 				)
@@ -1279,7 +1284,7 @@ func (m *Manager) namedRemoteRepository(
 		if err := m.validateRemoteTransport(platform, host, remoteURL); err != nil {
 			return "", "", err
 		}
-		if err := validateRemoteURLIdentity(host, owner, name, remoteURL); err != nil {
+		if err := validateRemoteURLIdentity(platform, host, owner, name, remoteURL); err != nil {
 			return "", "", fmt.Errorf(
 				"validate %q remote before authenticated git: %w", remote, err,
 			)
@@ -1304,7 +1309,7 @@ func (m *Manager) gitCloneBare(
 	// Local-path clones copy the source object directory and can race source
 	// maintenance. Use transport semantics consistently for every remote.
 	return m.gitNetworked(
-		ctx, m.sourceForRepo(platform, host, owner, name), host, "",
+		ctx, m.sourceForRepo(platform, host, owner, name), platform, host, "",
 		func() error {
 			if err := os.RemoveAll(clonePath); err != nil {
 				return fmt.Errorf("cleanup partial clone before auth retry: %w", err)
@@ -1324,7 +1329,7 @@ func (m *Manager) gitCloneBare(
 func (m *Manager) gitNetworked(
 	ctx context.Context,
 	source tokenauth.Source,
-	host, dir string,
+	platform, host, dir string,
 	cleanupBeforeAuthRetry func() error,
 	args ...string,
 ) ([]byte, error) {
@@ -1333,7 +1338,7 @@ func (m *Manager) gitNetworked(
 		return nil, ErrCredentialUnavailable
 	}
 	out, stderr, rejectedToken, err := m.runGitAuthed(
-		ctx, source, host, dir, required, args...,
+		ctx, source, platform, host, dir, required, args...,
 	)
 	if err == nil {
 		return out, nil
@@ -1349,7 +1354,7 @@ func (m *Manager) gitNetworked(
 			}
 		}
 		out, stderr, _, err = m.runGitAuthed(
-			ctx, source, host, dir, required, args...,
+			ctx, source, platform, host, dir, required, args...,
 		)
 		if err == nil {
 			return out, nil
@@ -1367,11 +1372,11 @@ func (m *Manager) gitNetworked(
 func (m *Manager) runGitAuthed(
 	ctx context.Context,
 	source tokenauth.Source,
-	host, dir string,
+	platform, host, dir string,
 	required bool,
 	args ...string,
 ) ([]byte, []byte, string, error) {
-	runner, token, err := m.gitRunnerAuthed(ctx, source, host, required)
+	runner, token, err := m.gitRunnerAuthed(ctx, source, platform, host, required)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -1492,7 +1497,7 @@ func (m *Manager) fallbackSource(host string) tokenauth.Source {
 // gitRunnerAuthed returns a runner with the selected token attached for
 // networked operations. Stop stalled transfers without limiting active clones.
 func (m *Manager) gitRunnerAuthed(
-	ctx context.Context, source tokenauth.Source, host string, required bool,
+	ctx context.Context, source tokenauth.Source, platform, host string, required bool,
 ) (gitcmd.Runner, string, error) {
 	runner := newGitRunner().
 		WithConfig("http.lowSpeedLimit", "1").
@@ -1516,7 +1521,23 @@ func (m *Manager) gitRunnerAuthed(
 	}
 	if token != "" {
 		// GitHub's smart HTTP endpoint expects Basic auth credentials.
-		runner = runner.WithBasicAuth("x-access-token", token)
+		username, password := "x-access-token", token
+		if platform == string(providerplatform.KindBitbucket) && host == providerplatform.DefaultBitbucketHost {
+			username = "x-token-auth"
+			if _, secret, ok := strings.Cut(token, ":"); ok {
+				username, password = "x-bitbucket-api-token-auth", secret
+				tokenauth.RegisterKnownSecret(secret)
+			}
+		} else if platform == string(providerplatform.KindBitbucket) {
+			user, secret, ok := strings.Cut(token, ":")
+			if ok {
+				// Explicit username:token credentials are required by Data Center's
+				// Git Basic authentication, and retain the same shape as API auth.
+				username, password = user, secret
+				tokenauth.RegisterKnownSecret(secret)
+			}
+		}
+		runner = runner.WithBasicAuth(username, password)
 	}
 	return runner, token, nil
 }

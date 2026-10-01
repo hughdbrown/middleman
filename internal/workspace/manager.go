@@ -86,11 +86,11 @@ type Manager struct {
 // WorktreeBaseRepository identifies a tracked remote repository when resolving
 // a user-configured checkout for new git worktrees.
 type WorktreeBaseRepository struct {
-	Platform       string
-	PlatformHost   string
-	PlatformRepoID int64
-	Owner          string
-	Name           string
+	Platform     string
+	PlatformHost string
+	Key          platform.RepositoryKey
+	Owner        string
+	Name         string
 }
 
 // WorktreeBasePathResolver resolves a tracked remote repository to a
@@ -117,7 +117,8 @@ type CreateIssueOptions struct {
 // An empty BranchName generates one; a name that already exists locally is
 // reused when requested or automatically suffixed with a short random hash.
 type CreateAdHocOptions struct {
-	PlatformRepoID      int64
+	// RepoKey, when set, rejects a route now held by a different repository.
+	RepoKey             platform.RepositoryKey
 	BranchName          string
 	ReuseExistingBranch bool
 }
@@ -672,7 +673,7 @@ func (m *Manager) CreateIssueFromLaunchSpec(
 		branchDir, ok, localBase, err := m.branchInspectionDir(ctx, workspaceRepoRef{
 			ID: repo.ID, Platform: spec.Repository.Provider,
 			PlatformHost: spec.Repository.PlatformHost,
-			ProviderID:   spec.Repository.PlatformRepoID,
+			Key:          spec.Repository.Key,
 			Owner:        spec.Repository.Owner, Name: spec.Repository.Name,
 			RemoteURL: spec.Repository.CloneURL,
 		})
@@ -887,7 +888,7 @@ func (m *Manager) CreateAdHoc(
 	if repo == nil {
 		return nil, fmt.Errorf("%w: repository not tracked", ErrWorkspaceNotFound)
 	}
-	if opts.PlatformRepoID != 0 && opts.PlatformRepoID != repo.PlatformRepoID {
+	if !opts.RepoKey.IsZero() && opts.RepoKey != repo.Key {
 		return nil, fmt.Errorf("%w: workspace repository identity changed for route: %s/%s",
 			db.ErrRepositoryIdentityChanged, owner, name)
 	}
@@ -910,8 +911,8 @@ func (m *Manager) CreateAdHoc(
 	nextHashAttempt := 0
 	repoRef := workspaceRepoRef{
 		ID: repo.ID, Platform: repo.Platform, PlatformHost: platformHost,
-		ProviderID: repo.PlatformRepoID, Owner: owner, Name: name,
-		RemoteURL: workspaceCloneRemoteURL(repo.Row(), platformHost, owner, name),
+		Key: repo.Key, Owner: owner, Name: name,
+		RemoteURL: workspaceCloneRemoteURL(repo.Row(), repo.Platform, platformHost, owner, name),
 	}
 	repoDir, err := m.workspaceRepoDir(ctx, repoRef)
 	if err != nil {
@@ -1155,10 +1156,16 @@ type workspaceRepoRef struct {
 	ID           int64
 	Platform     string
 	PlatformHost string
-	ProviderID   int64
+	Key          platform.RepositoryKey
 	Owner        string
 	Name         string
 	RemoteURL    string
+}
+
+func (r workspaceRepoRef) providerIdentity() platform.RepositoryIdentity {
+	return platform.RepositoryIdentity{
+		Provider: r.Platform, PlatformHost: r.PlatformHost, Key: r.Key,
+	}.Canonical()
 }
 
 func (m *Manager) branchInspectionDir(
@@ -1171,7 +1178,7 @@ func (m *Manager) branchInspectionDir(
 		return "", false, false, nil
 	}
 
-	cloneCtx := gitclone.WithRepositoryIdentity(ctx, repo.ProviderID)
+	cloneCtx := gitclone.WithRepositoryIdentity(ctx, repo.providerIdentity())
 	if err := m.clones.EnsureCloneForInspection(
 		cloneCtx, repo.Platform, repo.PlatformHost, repo.Owner, repo.Name, repo.RemoteURL,
 		nil,
@@ -1188,14 +1195,14 @@ func (m *Manager) branchInspectionDir(
 }
 
 func workspaceCloneRemoteURL(
-	repo *db.Repo, platformHost, owner, name string,
+	repo *db.Repo, kind, platformHost, owner, name string,
 ) string {
 	if repo != nil {
 		if cloneURL := strings.TrimSpace(repo.CloneURL); cloneURL != "" {
 			return cloneURL
 		}
 	}
-	return fmt.Sprintf("https://%s/%s/%s.git", platformHost, owner, name)
+	return platform.DefaultCloneURL(platform.Kind(kind), platformHost, owner+"/"+name)
 }
 
 func workspaceBranchForExistingLocalBranch(
@@ -1253,17 +1260,12 @@ func WorkspaceHeadRepo(provider, platformHost, owner, name, cloneURL string) *st
 	// MRHeadRepo means "this PR head must be resolved through fork-safe refs"
 	// in setup. GitHub also fills head.repo.clone_url for same-repo PRs, so
 	// compare clone identities before treating a non-empty URL as fork metadata.
-	headRepo := normalizeCloneRepoIdentity(provider, cloneURL)
+	headRepo := normalizeCloneRepoIdentity(provider, platformHost, cloneURL)
 	if headRepo == "" {
 		unknown := ""
 		return &unknown
 	}
-	baseRepo := strings.ToLower(strings.Join([]string{
-		strings.TrimSpace(provider),
-		normalizePlatformHostIdentity(platformHost),
-		strings.TrimSpace(owner),
-		strings.TrimSpace(name),
-	}, "/"))
+	baseRepo := strings.ToLower(strings.Join([]string{strings.TrimSpace(provider), normalizePlatformHostIdentity(platformHost), strings.TrimSpace(owner), strings.TrimSpace(name)}, "/"))
 	if headRepo == baseRepo {
 		return nil
 	}
@@ -1990,7 +1992,7 @@ func (m *Manager) existingWorkspaceWorktreeProvenance(
 		return workspaceWorktreeProvenance{}, err
 	}
 	base, err := ValidateWorktreeBasePath(
-		ctx, ws.WorktreePath, ws.PlatformHost, ws.RepoOwner, ws.RepoName,
+		ctx, ws.WorktreePath, ws.Platform, ws.PlatformHost, ws.RepoOwner, ws.RepoName,
 		m.allowsInsecureHTTP(ws.Platform, ws.PlatformHost),
 	)
 	if err != nil {
@@ -2028,7 +2030,7 @@ func (m *Manager) existingWorktreeUsesManagedClone(
 		if pathMatches {
 			for _, candidate := range candidates {
 				if validateBaseRemoteURLs(
-					ctx, commonDir, originRemoteName, candidate.platformHost,
+					ctx, commonDir, originRemoteName, candidate.platform, candidate.platformHost,
 					candidate.owner, candidate.name,
 					m.allowsInsecureHTTP(candidate.platform, candidate.platformHost),
 				) == nil {
@@ -2055,7 +2057,7 @@ func (m *Manager) workspaceManagedCloneCandidates(
 	if err != nil {
 		return nil, err
 	}
-	cloneCtx := gitclone.WithRepositoryIdentity(ctx, repo.ProviderID)
+	cloneCtx := gitclone.WithRepositoryIdentity(ctx, repo.providerIdentity())
 	candidates := make([]managedCloneCandidate, 0, 4)
 	seen := make(map[string]struct{})
 	appendCandidate := func(
@@ -2136,7 +2138,7 @@ func (m *Manager) retargetManagedCloneOrigin(
 		}
 	}
 	if err := validateBaseRemoteURL(
-		remoteURL, originRemoteName, ws.PlatformHost, ws.RepoOwner, ws.RepoName,
+		remoteURL, originRemoteName, ws.Platform, ws.PlatformHost, ws.RepoOwner, ws.RepoName,
 		m.allowsInsecureHTTP(ws.Platform, ws.PlatformHost),
 	); err != nil {
 		return fmt.Errorf("validate managed clone origin after rename: %w", err)
@@ -2313,12 +2315,12 @@ func (m *Manager) workspaceSetupGitDir(
 		return workspaceGitDir{}, err
 	}
 	if launchSpec != nil {
-		repo.ProviderID = launchSpec.Repository.PlatformRepoID
+		repo.Key = launchSpec.Repository.Key
 	}
 	if ws.MRHeadRepo == nil {
 		if strings.TrimSpace(worktreeBasePath) != "" {
 			base, err := ValidateWorktreeBasePath(
-				ctx, worktreeBasePath, ws.PlatformHost, ws.RepoOwner, ws.RepoName,
+				ctx, worktreeBasePath, ws.Platform, ws.PlatformHost, ws.RepoOwner, ws.RepoName,
 				m.allowsInsecureHTTP(ws.Platform, ws.PlatformHost),
 			)
 			return workspaceGitDir{path: base.Path, remote: base.Remote, localBase: err == nil}, err
@@ -2344,7 +2346,7 @@ func (m *Manager) workspaceSetupGitDir(
 			return workspaceGitDir{}, err
 		}
 	}
-	cloneCtx := gitclone.WithRepositoryIdentity(ctx, repo.ProviderID)
+	cloneCtx := gitclone.WithRepositoryIdentity(ctx, repo.providerIdentity())
 	if err := m.clones.EnsureCloneValidated(
 		cloneCtx, ws.Platform, ws.PlatformHost, ws.RepoOwner, ws.RepoName, remoteURL,
 		nil,
@@ -2374,9 +2376,9 @@ func (m *Manager) workspaceSetupRemoteURL(
 		return "", fmt.Errorf("look up repo clone URL: %w", err)
 	}
 	if repo == nil {
-		return workspaceCloneRemoteURL(nil, platformHost, owner, name), nil
+		return workspaceCloneRemoteURL(nil, platform, platformHost, owner, name), nil
 	}
-	return workspaceCloneRemoteURL(repo.Row(), platformHost, owner, name), nil
+	return workspaceCloneRemoteURL(repo.Row(), platform, platformHost, owner, name), nil
 }
 
 func (m *Manager) localWorktreeBaseDir(
@@ -2386,11 +2388,11 @@ func (m *Manager) localWorktreeBaseDir(
 		return WorktreeBase{}, false, nil
 	}
 	raw, ok, err := m.worktreeBaseResolver(ctx, WorktreeBaseRepository{
-		Platform:       repo.Platform,
-		PlatformHost:   repo.PlatformHost,
-		PlatformRepoID: repo.ProviderID,
-		Owner:          repo.Owner,
-		Name:           repo.Name,
+		Platform:     repo.Platform,
+		PlatformHost: repo.PlatformHost,
+		Key:          repo.Key,
+		Owner:        repo.Owner,
+		Name:         repo.Name,
 	})
 	if err != nil {
 		return WorktreeBase{}, false, err
@@ -2400,7 +2402,7 @@ func (m *Manager) localWorktreeBaseDir(
 		return WorktreeBase{}, false, nil
 	}
 	base, err := ValidateWorktreeBasePath(
-		ctx, raw, repo.PlatformHost, repo.Owner, repo.Name,
+		ctx, raw, repo.Platform, repo.PlatformHost, repo.Owner, repo.Name,
 		m.allowsInsecureHTTP(repo.Platform, repo.PlatformHost),
 	)
 	if err != nil {
@@ -2431,7 +2433,7 @@ func (m *Manager) workspaceRepositoryRef(
 			"%w: workspace repository not found", ErrWorkspaceNotFound,
 		)
 	}
-	repoRef.ProviderID = repo.PlatformRepoID
+	repoRef.Key = repo.Key
 	return repoRef, nil
 }
 
@@ -2455,7 +2457,7 @@ type WorktreeBase struct {
 // ValidateWorktreeBasePath verifies that path is an existing local Git
 // worktree whose resolved remote matches the tracked repository identity.
 func ValidateWorktreeBasePath(
-	ctx context.Context, path, platformHost, owner, name string,
+	ctx context.Context, path, provider, platformHost, owner, name string,
 	allowInsecureHTTP bool,
 ) (WorktreeBase, error) {
 	abs, err := filepath.Abs(strings.TrimSpace(path))
@@ -2491,13 +2493,13 @@ func ValidateWorktreeBasePath(
 		return WorktreeBase{}, err
 	}
 	remote, err := resolveWorktreeBaseRemote(
-		ctx, abs, platformHost, owner, name, allowInsecureHTTP,
+		ctx, abs, provider, platformHost, owner, name, allowInsecureHTTP,
 	)
 	if err != nil {
 		return WorktreeBase{}, err
 	}
 	if err := validateBaseRemoteURLs(
-		ctx, abs, remote, platformHost, owner, name, allowInsecureHTTP,
+		ctx, abs, remote, provider, platformHost, owner, name, allowInsecureHTTP,
 	); err != nil {
 		return WorktreeBase{}, err
 	}
@@ -2601,7 +2603,7 @@ func localGitConfigKeyMayExecute(key string) bool {
 const originRemoteName = "origin"
 
 func resolveWorktreeBaseRemote(
-	ctx context.Context, dir, platformHost, owner, name string,
+	ctx context.Context, dir, provider, platformHost, owner, name string,
 	allowInsecureHTTP bool,
 ) (string, error) {
 	names, err := gitRemoteNames(ctx, dir)
@@ -2617,7 +2619,7 @@ func resolveWorktreeBaseRemote(
 		}
 		identityMatch := false
 		for _, remoteURL := range remoteURLs {
-			if remoteMatchesRepositoryIdentity(remoteURL, platformHost, owner, name) {
+			if remoteMatchesRepositoryIdentity(remoteURL, provider, platformHost, owner, name) {
 				identityMatch = true
 				break
 			}
@@ -2650,12 +2652,13 @@ func resolveWorktreeBaseRemote(
 }
 
 func remoteMatchesRepositoryIdentity(
-	remoteURL, platformHost, owner, name string,
+	remoteURL, provider, platformHost, owner, name string,
 ) bool {
 	return gitremote.RemoteHost(remoteURL) != "" &&
 		gitremote.RemoteRepoPath(remoteURL) != "" &&
-		gitremote.ValidateRemoteIdentity(gitremote.Identity{
-			Host: platformHost, Owner: owner, Name: name,
+		platform.ValidateRemoteIdentity(platform.RepoRef{
+			Platform: platform.Kind(provider),
+			Host:     platformHost, Owner: owner, Name: name,
 		}, remoteURL) == nil
 }
 
@@ -2665,7 +2668,7 @@ func validGitRemoteName(remote string) bool {
 }
 
 func validateBaseRemoteURLs(
-	ctx context.Context, dir, remote, platformHost, owner, name string,
+	ctx context.Context, dir, remote, provider, platformHost, owner, name string,
 	allowInsecureHTTP bool,
 ) error {
 	remoteURLs, err := gitConfigValues(ctx, dir, "remote."+remote+".url")
@@ -2677,7 +2680,7 @@ func validateBaseRemoteURLs(
 	}
 	for _, remoteURL := range remoteURLs {
 		if err := validateBaseRemoteURL(
-			remoteURL, remote, platformHost, owner, name, allowInsecureHTTP,
+			remoteURL, remote, provider, platformHost, owner, name, allowInsecureHTTP,
 		); err != nil {
 			return err
 		}
@@ -2686,7 +2689,7 @@ func validateBaseRemoteURLs(
 }
 
 func validateBaseRemoteURL(
-	remoteURL, remote, platformHost, owner, name string,
+	remoteURL, remote, provider, platformHost, owner, name string,
 	allowInsecureHTTP bool,
 ) error {
 	if gitremote.RemoteHost(remoteURL) == "" ||
@@ -2705,10 +2708,11 @@ func validateBaseRemoteURL(
 			remoteURLScheme(remoteURL), gitremote.RemoteHost(remoteURL),
 		)
 	}
-	if err := gitremote.ValidateRemoteIdentity(gitremote.Identity{
-		Host:  platformHost,
-		Owner: owner,
-		Name:  name,
+	if err := platform.ValidateRemoteIdentity(platform.RepoRef{
+		Platform: platform.Kind(provider),
+		Host:     platformHost,
+		Owner:    owner,
+		Name:     name,
 	}, remoteURL); err != nil {
 		return fmt.Errorf("%q remote does not match repository: %w", remote, err)
 	}
@@ -4489,8 +4493,7 @@ func (m *Manager) GetByLaunchSpecIdentity(
 	ctx context.Context, spec WorkspaceLaunchSpec,
 ) (*Workspace, error) {
 	existing, err := m.db.GetWorkspaceByLaunchSpecIdentity(
-		ctx, spec.Repository.Provider, spec.Repository.PlatformHost,
-		spec.Repository.PlatformRepoID, spec.ItemType, spec.ItemKey,
+		ctx, spec.Repository, spec.ItemType, spec.ItemKey,
 	)
 	if err != nil || existing == nil {
 		return existing, err
@@ -5782,6 +5785,20 @@ func fetchWorkspaceMergeRequestHeadRefWithGit(
 		return errors.New("pull-request launch specification is required for head fetch")
 	}
 	targetRef := workspaceMergeRequestHeadRef(ws)
+	if ws.Platform == string(platform.KindBitbucket) {
+		// Bitbucket Cloud exposes source branches, not synthetic pull refs.
+		// Store the fetched branch in our local pull ref for workspace consumers.
+		args := gitArgsWithoutHooks("fetch", "--no-tags", "--recurse-submodules=no")
+		refspec := "+refs/heads/" + launchSpec.Pull.HeadBranch + ":" + targetRef
+		switch launchSpec.Pull.HeadRepoKind {
+		case "same_repo":
+			return runBase(ctx, dir, append(args, remote, refspec)...)
+		case "fork":
+			return runFork(ctx, dir, append(args, launchSpec.Pull.HeadRepoCloneURL, refspec)...)
+		default:
+			return errors.New("pull-request head repository identity is unavailable")
+		}
+	}
 	switch launchSpec.Pull.HeadRepoKind {
 	case "same_repo":
 		return runBase(

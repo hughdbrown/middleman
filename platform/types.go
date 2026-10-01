@@ -8,17 +8,19 @@ import (
 type Kind string
 
 const (
-	KindGitHub  Kind = "github"
-	KindGitLab  Kind = "gitlab"
-	KindForgejo Kind = "forgejo"
-	KindGitea   Kind = "gitea"
+	KindGitHub    Kind = "github"
+	KindGitLab    Kind = "gitlab"
+	KindForgejo   Kind = "forgejo"
+	KindGitea     Kind = "gitea"
+	KindBitbucket Kind = "bitbucket"
 )
 
 const (
-	DefaultGitHubHost  = "github.com"
-	DefaultGitLabHost  = "gitlab.com"
-	DefaultForgejoHost = "codeberg.org"
-	DefaultGiteaHost   = "gitea.com"
+	DefaultGitHubHost    = "github.com"
+	DefaultGitLabHost    = "gitlab.com"
+	DefaultForgejoHost   = "codeberg.org"
+	DefaultGiteaHost     = "gitea.com"
+	DefaultBitbucketHost = "bitbucket.org"
 )
 
 type RepoRef struct {
@@ -27,9 +29,9 @@ type RepoRef struct {
 	Owner    string
 	Name     string
 	RepoPath string
-	// PlatformID is the provider's integer repository ID. It is the only
-	// repository ID: stable across renames and transfers, unique per host.
-	PlatformID    int64
+	// Key is the provider's stable repository key; zero until the provider
+	// has resolved the reference.
+	Key           RepositoryKey
 	WebURL        string
 	CloneURL      string
 	DefaultBranch string

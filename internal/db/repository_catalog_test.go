@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"testing"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,11 +16,11 @@ func observeCatalogRepository(
 ) *RepositoryCatalogEntry {
 	t.Helper()
 	entry, err := d.ObserveRepository(t.Context(), RepoIdentity{
-		Platform:       "github",
-		PlatformHost:   "github.com",
-		PlatformRepoID: providerID,
-		Owner:          owner,
-		Name:           name,
+		Platform:     "github",
+		PlatformHost: "github.com",
+		Key:          platform.RepositoryIDKey(providerID),
+		Owner:        owner,
+		Name:         name,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, entry)
@@ -29,7 +30,7 @@ func observeCatalogRepository(
 
 func githubRepositoryIdentity(providerID int64) platform.RepositoryIdentity {
 	return platform.RepositoryIdentity{
-		Provider: "github", PlatformHost: "github.com", PlatformRepoID: providerID,
+		Provider: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(providerID),
 	}
 }
 
@@ -55,20 +56,20 @@ func TestObserveRepositoryCreatesActiveRepository(t *testing.T) {
 
 	entry, err := d.ObserveRepository(t.Context(), RepoIdentity{
 		Platform: "gitlab", PlatformHost: "GitLab.Example.com",
-		PlatformRepoID: 250833, Owner: "Group-A", Name: "Project-A",
+		Key: platform.RepositoryIDKey(250833), Owner: "Group-A", Name: "Project-A",
 	})
 	require.NoError(err)
 	require.NotNil(entry)
 	assert.Equal(RepositoryLifecycleActive, entry.Lifecycle)
 	assert.Equal("gitlab.example.com", entry.Repository.PlatformHost)
-	assert.EqualValues(250833, entry.Repository.PlatformRepoID)
+	assert.Equal(platform.RepositoryIDKey(250833), entry.Repository.Key)
 	assert.Equal("Group-A/Project-A", entry.Repository.RepoPath)
 	assert.False(entry.Repository.ViewerCanMerge,
 		"a new repository must not inherit a permissive merge permission")
 
 	again, err := d.ObserveRepository(t.Context(), RepoIdentity{
 		Platform: "gitlab", PlatformHost: "gitlab.example.com",
-		PlatformRepoID: 250833, Owner: "Group-A", Name: "Project-A",
+		Key: platform.RepositoryIDKey(250833), Owner: "Group-A", Name: "Project-A",
 	})
 	require.NoError(err)
 	assert.Equal(entry.Repository.ID, again.Repository.ID)
@@ -82,7 +83,165 @@ func TestObserveRepositoryRejectsIncompleteIdentity(t *testing.T) {
 	for name, identity := range map[string]RepoIdentity{
 		"missing provider id": githubRoute("org-a", "project-a"),
 		"missing route": {
-			Platform: "github", PlatformHost: "github.com", PlatformRepoID: 1001,
+			Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := d.ObserveRepository(t.Context(), identity)
+			require.Error(t, err)
+		})
+	}
+	entries, err := d.ListRepositoryCatalog(t.Context(), RepositoryCatalogFilter{})
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestObserveBitbucketCloudRepositoryKeepsUUIDAcrossRename(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	repositoryUUID := uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	original, err := d.ObserveRepository(ctx, RepoIdentity{
+		Platform: "Bitbucket", PlatformHost: "Bitbucket.org",
+		Key:   platform.RepositoryUUIDKey(repositoryUUID),
+		Owner: "team", Name: "widgets",
+	})
+	require.NoError(err)
+	require.NotNil(original)
+	assert.Equal(RepositoryLifecycleActive, original.Lifecycle)
+	assert.Equal("bitbucket.org", original.Repository.PlatformHost)
+	assert.Equal(platform.RepositoryUUIDKey(repositoryUUID), original.Repository.Key)
+	active, err := original.ActiveRepo()
+	require.NoError(err)
+	assert.Equal(platform.RepositoryUUIDKey(repositoryUUID), active.Identity().Key)
+
+	var stored string
+	require.NoError(d.ReadDB().QueryRowContext(ctx, `
+		SELECT bitbucket_repository_uuid FROM forge_repos WHERE id = ?`,
+		original.Repository.ID,
+	).Scan(&stored))
+	assert.Equal("11111111-1111-4111-8111-111111111111", stored)
+
+	now := baseTime()
+	_, err = d.UpsertMergeRequest(ctx, &MergeRequest{
+		RepoID: original.Repository.ID, PlatformID: 9001, Number: 7,
+		Title: "carried over", State: MergeRequestStateOpen,
+		CreatedAt: now, UpdatedAt: now, LastActivityAt: now,
+	})
+	require.NoError(err)
+
+	renamed, err := d.ObserveRepository(ctx, RepoIdentity{
+		Platform: "bitbucket", PlatformHost: "bitbucket.org",
+		Key:   platform.RepositoryUUIDKey(repositoryUUID),
+		Owner: "new-team", Name: "renamed",
+	})
+	require.NoError(err)
+	assert.Equal(original.Repository.ID, renamed.Repository.ID)
+	assert.Equal("new-team/renamed", renamed.Repository.RepoPath)
+
+	mr, err := d.GetMergeRequest(ctx, "bitbucket", "bitbucket.org", "new-team", "renamed", 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	assert.Equal("carried over", mr.Title)
+
+	found, err := d.GetRepositoryByProviderID(ctx, platform.RepositoryIdentity{
+		Provider: "bitbucket", PlatformHost: "bitbucket.org",
+		Key: platform.RepositoryUUIDKey(repositoryUUID),
+	})
+	require.NoError(err)
+	require.NotNil(found)
+	assert.Equal(original.Repository.ID, found.Repository.ID)
+
+	missing, err := d.GetRepositoryByProviderID(ctx, platform.RepositoryIdentity{
+		Provider: "bitbucket", PlatformHost: "bitbucket.org",
+		Key: platform.RepositoryUUIDKey(uuid.MustParse("22222222-2222-4222-8222-222222222222")),
+	})
+	require.NoError(err)
+	assert.Nil(missing)
+}
+
+func TestObserveBitbucketCloudUUIDDisplacesRouteOccupant(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	firstID := uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	secondID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	first, err := d.ObserveRepository(ctx, RepoIdentity{
+		Platform: "bitbucket", PlatformHost: "bitbucket.org",
+		Key: platform.RepositoryUUIDKey(firstID), Owner: "team", Name: "widgets",
+	})
+	require.NoError(err)
+	second, err := d.ObserveRepository(ctx, RepoIdentity{
+		Platform: "bitbucket", PlatformHost: "bitbucket.org",
+		Key: platform.RepositoryUUIDKey(secondID), Owner: "team", Name: "widgets",
+	})
+	require.NoError(err)
+	assert.NotEqual(first.Repository.ID, second.Repository.ID)
+
+	displaced, err := d.GetRepositoryByProviderID(ctx, platform.RepositoryIdentity{
+		Provider: "bitbucket", PlatformHost: "bitbucket.org",
+		Key: platform.RepositoryUUIDKey(firstID),
+	})
+	require.NoError(err)
+	require.NotNil(displaced)
+	assert.Equal(RepositoryLifecycleInactive, displaced.Lifecycle)
+
+	route, err := d.ResolveActiveRepositoryRoute(ctx, RepoIdentity{
+		Platform: "bitbucket", PlatformHost: "bitbucket.org",
+		Owner: "team", Name: "widgets",
+	})
+	require.NoError(err)
+	require.NotNil(route)
+	assert.Equal(second.Repository.ID, route.Repository.ID)
+	occupant, err := route.ActiveRepo()
+	require.NoError(err)
+	assert.Equal(platform.RepositoryUUIDKey(secondID), occupant.Identity().Key)
+}
+
+func TestObserveBitbucketDataCenterUsesIntegerID(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	entry, err := d.ObserveRepository(t.Context(), RepoIdentity{
+		Platform: "bitbucket", PlatformHost: "code.example.test:8443",
+		Key: platform.RepositoryIDKey(17), Owner: "PROJECT", Name: "repo",
+	})
+	require.NoError(err)
+	assert.Equal(platform.RepositoryIDKey(17), entry.Repository.Key)
+	assert.False(entry.Repository.Key.IsUUID())
+	found, err := d.GetActiveRepoByProviderID(t.Context(), platform.RepositoryIdentity{
+		Provider: "bitbucket", PlatformHost: "code.example.test:8443",
+		Key: platform.RepositoryIDKey(17),
+	})
+	require.NoError(err)
+	require.NotNil(found)
+	assert.Equal(entry.Repository.ID, found.ID)
+}
+
+func TestObserveRepositoryRejectsBitbucketIdentity(t *testing.T) {
+	d := openTestDB(t)
+	repositoryUUID := uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	for name, identity := range map[string]RepoIdentity{
+		"cloud without uuid": {
+			Platform: "bitbucket", PlatformHost: "bitbucket.org",
+			Owner: "team", Name: "widgets",
+		},
+		"cloud integer id": {
+			Platform: "bitbucket", PlatformHost: "bitbucket.org",
+			Key:   platform.RepositoryIDKey(17),
+			Owner: "team", Name: "widgets",
+		},
+		"uuid on github": {
+			Platform: "github", PlatformHost: "github.com",
+			Key:   platform.RepositoryUUIDKey(repositoryUUID),
+			Owner: "acme", Name: "widget",
+		},
+		"uuid on data center host": {
+			Platform: "bitbucket", PlatformHost: "code.example.test",
+			Key:   platform.RepositoryUUIDKey(repositoryUUID),
+			Owner: "PROJECT", Name: "repo",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -129,7 +288,7 @@ func TestObserveRepositoryRefreshesCaseOnlyDisplayRoute(t *testing.T) {
 	d := openTestDB(t)
 	identity := RepoIdentity{
 		Platform: "gitlab", PlatformHost: "gitlab.example.com",
-		PlatformRepoID: 42, Owner: "Group-A", Name: "Project-A",
+		Key: platform.RepositoryIDKey(42), Owner: "Group-A", Name: "Project-A",
 	}
 	first, err := d.ObserveRepository(t.Context(), identity)
 	require.NoError(err)
@@ -299,7 +458,7 @@ func TestGetRepoByIdentityPrefersProviderID(t *testing.T) {
 	// A stale route paired with the provider ID still finds the renamed
 	// repository, not whichever repository now holds the route.
 	byID, err := d.GetRepoByIdentity(t.Context(), RepoIdentity{
-		Platform: "github", PlatformHost: "github.com", PlatformRepoID: 1001,
+		Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001),
 		Owner: "org-a", Name: "project-a",
 	})
 	require.NoError(err)
@@ -312,7 +471,7 @@ func TestGetRepoByIdentityPrefersProviderID(t *testing.T) {
 	assert.Equal(other.Repository.ID, byRoute.ID)
 
 	missing, err := d.GetRepoByIdentity(t.Context(), RepoIdentity{
-		Platform: "github", PlatformHost: "github.com", PlatformRepoID: 9999,
+		Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(9999),
 		Owner: "org-a", Name: "project-a",
 	})
 	require.NoError(err)
@@ -333,7 +492,7 @@ func TestActiveRepoCarriesProviderIdentity(t *testing.T) {
 	assert.Equal(want, active.Identity())
 	// The identity is fixed when the row is read; editing the row copy
 	// cannot redirect comparisons to another repository.
-	active.PlatformRepoID = 1001
+	active.Key = platform.RepositoryIDKey(1001)
 	assert.Equal(want, active.Identity())
 
 	byID, err := d.GetActiveRepoByID(t.Context(), oldID)
@@ -383,7 +542,7 @@ func TestListRepositoryCatalogFindsEveryRowAtRoute(t *testing.T) {
 func TestListRepositoryCatalogRejectsUnqualifiedProviderID(t *testing.T) {
 	d := openTestDB(t)
 	_, err := d.ListRepositoryCatalog(t.Context(), RepositoryCatalogFilter{
-		PlatformRepoID: 1001,
+		RepoKey: platform.RepositoryIDKey(1001),
 	})
 	require.ErrorContains(t, err, "platform and host")
 }
@@ -689,17 +848,17 @@ func TestObserveRepositoryWaitsForPendingGitHubConversion(t *testing.T) {
 	pendingID := insertPendingGitHubRepository(t, d, "R_kgDOexample", "org-a", "project-a")
 
 	_, err := d.ObserveRepository(t.Context(), RepoIdentity{
-		Platform: "github", PlatformHost: "github.com", PlatformRepoID: 1001,
+		Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001),
 		Owner: "org-a", Name: "project-a",
 	})
 	require.ErrorIs(err, ErrGitHubRepositoryConversionPending)
 	_, err = d.ObserveRepository(t.Context(), RepoIdentity{
-		Platform: "github", PlatformHost: "ghe.example.com", PlatformRepoID: 1001,
+		Platform: "github", PlatformHost: "ghe.example.com", Key: platform.RepositoryIDKey(1001),
 		Owner: "org-a", Name: "project-a",
 	})
 	require.NoError(err, "other hosts are not blocked")
 	_, err = d.ObserveRepository(t.Context(), RepoIdentity{
-		Platform: "gitlab", PlatformHost: "github.com", PlatformRepoID: 1001,
+		Platform: "gitlab", PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001),
 		Owner: "org-a", Name: "project-a",
 	})
 	require.NoError(err, "other providers are not blocked")
@@ -719,11 +878,9 @@ func TestCompleteGitHubRepositoryConversionRecordsIntegerID(t *testing.T) {
 	otherID := insertPendingGitHubRepository(t, d, "R_kgDOother", "org-a", "project-b")
 	// Migration 60 zeroes the node IDs launch specifications embedded.
 	insertLaunchSpecForTest(t, d, "ws-converted", pendingID, `{
-		"repository":{"provider":"github","platform_host":"github.com","platform_repo_id":0},
-		"pull":{"base_repo_id":0}}`)
+		"repository":{"provider":"github","platform_host":"github.com","platform_repo_id":0}}`)
 	insertLaunchSpecForTest(t, d, "ws-other", otherID, `{
-		"repository":{"provider":"github","platform_host":"github.com","platform_repo_id":0},
-		"pull":{"base_repo_id":0}}`)
+		"repository":{"provider":"github","platform_host":"github.com","platform_repo_id":0}}`)
 
 	pending, err := d.ListPendingGitHubRepositories(ctx)
 	require.NoError(err)
@@ -741,21 +898,16 @@ func TestCompleteGitHubRepositoryConversionRecordsIntegerID(t *testing.T) {
 	assert.Equal(RepositoryLifecycleInactive, entry.Lifecycle,
 		"conversion alone does not reactivate; the next observation does")
 
-	readSpecIDs := func(workspaceID string) (any, any) {
-		var repoID, baseRepoID any
+	readSpecRepoID := func(workspaceID string) any {
+		var repoID any
 		require.NoError(d.ReadDB().QueryRowContext(ctx, `
-			SELECT json_extract(spec_json, '$.repository.platform_repo_id'),
-			       json_extract(spec_json, '$.pull.base_repo_id')
+			SELECT json_extract(spec_json, '$.repository.platform_repo_id')
 			FROM forge_workspace_launch_specs WHERE workspace_id = ?`, workspaceID,
-		).Scan(&repoID, &baseRepoID))
-		return repoID, baseRepoID
+		).Scan(&repoID))
+		return repoID
 	}
-	repoID, baseRepoID := readSpecIDs("ws-converted")
-	assert.EqualValues(1001, repoID)
-	assert.EqualValues(1001, baseRepoID)
-	repoID, baseRepoID = readSpecIDs("ws-other")
-	assert.EqualValues(0, repoID, "other repositories' specifications wait for their own conversion")
-	assert.EqualValues(0, baseRepoID)
+	assert.EqualValues(1001, readSpecRepoID("ws-converted"))
+	assert.EqualValues(0, readSpecRepoID("ws-other"), "other repositories' specifications wait for their own conversion")
 
 	pending, err = d.ListPendingGitHubRepositories(ctx)
 	require.NoError(err)
@@ -779,7 +931,7 @@ func TestCompleteGitHubRepositoryConversionUnresolvableNode(t *testing.T) {
 	repo, err := d.GetRepoByID(ctx, pendingID)
 	require.NoError(err)
 	require.NotNil(repo, "an unresolvable repository keeps its row and history")
-	assert.Zero(repo.PlatformRepoID)
+	assert.Zero(repo.Key)
 	var lifecycle string
 	require.NoError(d.ReadDB().QueryRowContext(ctx,
 		`SELECT lifecycle_state FROM forge_repos WHERE id = ?`, pendingID,
@@ -812,8 +964,7 @@ func TestCompleteGitHubRepositoryConversionMergesDuplicateNodeIDs(t *testing.T) 
 	insertTestIssueWithOptions(t, d, testIssue(duplicateID, 2))
 	insertTestIssueWithOptions(t, d, testIssue(duplicateID, 3))
 	insertLaunchSpecForTest(t, d, "ws-duplicate", duplicateID, `{
-		"repository":{"provider":"github","platform_host":"github.com","platform_repo_id":0},
-		"pull":{"base_repo_id":0}}`)
+		"repository":{"provider":"github","platform_host":"github.com","platform_repo_id":0}}`)
 
 	require.NoError(d.CompleteGitHubRepositoryConversion(ctx, keptID, 1001))
 	require.NoError(d.CompleteGitHubRepositoryConversion(ctx, duplicateID, 1001))
@@ -868,7 +1019,7 @@ func TestCompleteGitHubRepositoryConversionRetiresDuplicateWithConflictingWorksp
 	duplicate, err := d.GetRepoByID(ctx, duplicateID)
 	require.NoError(err)
 	require.NotNil(duplicate, "a workspace that cannot move keeps its repository row")
-	assert.Zero(duplicate.PlatformRepoID)
+	assert.Zero(duplicate.Key)
 }
 
 func TestRepositoryOwnedColumnsCoverEveryRepositoryReference(t *testing.T) {

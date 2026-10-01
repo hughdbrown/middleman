@@ -532,12 +532,12 @@ type RepoRef struct {
 	Name         string
 	PlatformHost string
 	RepoPath     string
-	// PlatformRepoID is the provider's integer repository ID, the
-	// repository's identity. Zero until the provider has resolved the ref.
-	PlatformRepoID int64
-	WebURL         string
-	CloneURL       string
-	DefaultBranch  string
+	// Key is the provider's stable repository key, the repository's
+	// identity. Zero until the provider has resolved the ref.
+	Key           platform.RepositoryKey
+	WebURL        string
+	CloneURL      string
+	DefaultBranch string
 	// Archived marks a provider-archived repository: configured for archive
 	// collection only, skipped by live sync.
 	Archived bool
@@ -1330,8 +1330,8 @@ func (s *Syncer) ConfiguredRepositories(context.Context) ([]platform.RepoRef, er
 		host := repoHost(repo)
 		refs = append(refs, platform.RepoRef{
 			Platform: kind, Host: host, Owner: repo.Owner, Name: repo.Name,
-			RepoPath:   repo.Owner + "/" + repo.Name,
-			PlatformID: repo.PlatformRepoID,
+			RepoPath: repo.Owner + "/" + repo.Name,
+			Key:      repo.Key,
 		})
 	}
 	return refs, nil
@@ -1355,7 +1355,7 @@ func (s *Syncer) Admit(
 	repo := RepoRef{
 		Platform: ref.Platform, PlatformHost: ref.Host,
 		Owner: ref.Owner, Name: ref.Name, RepoPath: ref.RepoPath,
-		PlatformRepoID: ref.PlatformID,
+		Key: ref.Key,
 	}
 	if archive.InventoryProbeRequested(ctx) {
 		ctx = withRepositoryFeatureCooldownBypass(
@@ -1376,12 +1376,12 @@ func (s *Syncer) Admit(
 		return archive.AdmissionResult{RetryAt: &retryAt, Detail: "normal sync is active"}, nil
 	}
 	keyRepo := RepoRef{
-		Platform:       ref.Platform,
-		PlatformHost:   ref.Host,
-		Owner:          ref.Owner,
-		Name:           ref.Name,
-		RepoPath:       ref.RepoPath,
-		PlatformRepoID: ref.PlatformID,
+		Platform:     ref.Platform,
+		PlatformHost: ref.Host,
+		Owner:        ref.Owner,
+		Name:         ref.Name,
+		RepoPath:     ref.RepoPath,
+		Key:          ref.Key,
 	}
 	identity, err := s.archiveIdentityForRepo(keyRepo)
 	if err != nil {
@@ -2272,8 +2272,7 @@ func (s *Syncer) launchClaimedRun(
 // Identity returns the ref's canonical identity; see platform.RepoRef.Identity.
 func (r RepoRef) Identity() platform.RepositoryIdentity {
 	return platform.RepositoryIdentity{
-		Provider: string(repoPlatform(r)), PlatformHost: repoHost(r),
-		PlatformRepoID: r.PlatformRepoID,
+		Provider: string(repoPlatform(r)), PlatformHost: repoHost(r), Key: r.Key,
 	}.Canonical()
 }
 
@@ -2501,7 +2500,7 @@ func platformRepoRef(repo RepoRef) platform.RepoRef {
 		Owner:         repo.Owner,
 		Name:          repo.Name,
 		RepoPath:      repoPath,
-		PlatformID:    repo.PlatformRepoID,
+		Key:           repo.Key,
 		WebURL:        repo.WebURL,
 		CloneURL:      repo.CloneURL,
 		DefaultBranch: repo.DefaultBranch,
@@ -2516,11 +2515,11 @@ func cloneRemoteURL(repo RepoRef) string {
 	if repoPath == "" {
 		repoPath = strings.Trim(repo.Owner+"/"+repo.Name, "/")
 	}
-	return fmt.Sprintf("https://%s/%s.git", repoHost(repo), strings.Trim(repoPath, "/"))
+	return platform.DefaultCloneURL(repoPlatform(repo), repoHost(repo), repoPath)
 }
 
 func withCloneRepositoryIdentity(ctx context.Context, repo RepoRef) context.Context {
-	return gitclone.WithRepositoryIdentity(ctx, repo.PlatformRepoID)
+	return gitclone.WithRepositoryIdentity(ctx, repo.Identity())
 }
 
 func (s *Syncer) ensureClone(ctx context.Context, repo RepoRef) error {
@@ -2916,15 +2915,15 @@ func (s *Syncer) trackedRepoByIdentity(
 	return RepoRef{}, false
 }
 
-func (s *Syncer) trackedRepoByProviderID(
+func (s *Syncer) trackedRepoByProviderKey(
 	kind platform.Kind,
-	host string, providerID int64,
+	host string, key platform.RepositoryKey,
 ) (RepoRef, bool) {
 	if kind == "" {
 		kind = platform.KindGitHub
 	}
 	host = repoHost(RepoRef{Platform: kind, PlatformHost: host})
-	if providerID == 0 {
+	if key.IsZero() {
 		return RepoRef{}, false
 	}
 	s.reposMu.Lock()
@@ -2932,7 +2931,7 @@ func (s *Syncer) trackedRepoByProviderID(
 	for _, repo := range s.repos {
 		if repoPlatform(repo) == kind &&
 			strings.EqualFold(repoHost(repo), host) &&
-			repo.PlatformRepoID == providerID {
+			repo.Key == key {
 			return repo, true
 		}
 	}
@@ -4968,10 +4967,10 @@ func sameRepoIntent(a, b RepoRef) bool {
 		!strings.EqualFold(repoHost(a), repoHost(b)) {
 		return false
 	}
-	aID := a.PlatformRepoID
-	bID := b.PlatformRepoID
-	if aID != 0 && bID != 0 {
-		return aID == bID
+	aKey := a.Key
+	bKey := b.Key
+	if !aKey.IsZero() && !bKey.IsZero() {
+		return aKey == bKey
 	}
 	aRoute := repoPriorityKey(a)
 	return aRoute != "" && aRoute == repoPriorityKey(b)
@@ -5005,7 +5004,7 @@ func (s *Syncer) syncRepoIdentity(
 	identity := platformdb.DBRepoIdentity(platformRepoRef(repo))
 	reader, err := s.clients.RepositoryReader(repoPlatform(repo), repoHost(repo))
 	if err != nil {
-		if identity.PlatformRepoID != 0 && errors.Is(err, platform.ErrUnsupportedCapability) {
+		if !repo.Key.IsZero() && errors.Is(err, platform.ErrUnsupportedCapability) {
 			return identity, nil, nil
 		}
 		return db.RepoIdentity{}, nil, err
@@ -5018,7 +5017,7 @@ func (s *Syncer) syncRepoIdentity(
 		return db.RepoIdentity{}, nil, err
 	}
 	identity = platformdb.DBRepositoryIdentity(resolved)
-	if identity.PlatformRepoID == 0 {
+	if !resolved.Ref.Identity().Valid() {
 		return db.RepoIdentity{}, nil, errors.New("provider returned no repo id")
 	}
 	return identity, &resolved, nil
@@ -5098,24 +5097,24 @@ func (s *Syncer) reconcileArchiveRepositoryIfNeeded(
 
 func repoRefFromCatalog(previous RepoRef, stored db.Repo, resolved *platform.Repository) RepoRef {
 	repo := RepoRef{
-		Platform:       platform.Kind(stored.Platform),
-		RepoID:         stored.ID,
-		Owner:          stored.Owner,
-		Name:           stored.Name,
-		PlatformHost:   stored.PlatformHost,
-		RepoPath:       stored.RepoPath,
-		PlatformRepoID: stored.PlatformRepoID,
-		WebURL:         stored.WebURL,
-		CloneURL:       stored.CloneURL,
-		DefaultBranch:  stored.DefaultBranch,
+		Platform:      platform.Kind(stored.Platform),
+		RepoID:        stored.ID,
+		Owner:         stored.Owner,
+		Name:          stored.Name,
+		PlatformHost:  stored.PlatformHost,
+		RepoPath:      stored.RepoPath,
+		Key:           stored.Key,
+		WebURL:        stored.WebURL,
+		CloneURL:      stored.CloneURL,
+		DefaultBranch: stored.DefaultBranch,
 		// The repo catalog does not record archived state or config-entry
 		// provenance; without a fresh provider resolve, the previously
 		// tracked values stand.
 		Archived:           previous.Archived,
 		ConfiguredRepoPath: previous.ConfiguredRepoPath,
 	}
-	if repo.PlatformRepoID == 0 {
-		repo.PlatformRepoID = previous.PlatformRepoID
+	if repo.Key.IsZero() {
+		repo.Key = previous.Key
 	}
 	if repo.WebURL == "" {
 		repo.WebURL = previous.WebURL
@@ -5130,7 +5129,7 @@ func repoRefFromCatalog(previous RepoRef, stored db.Repo, resolved *platform.Rep
 		return repo
 	}
 	repo.Archived = resolved.Archived
-	repo.PlatformRepoID = resolved.Ref.PlatformID
+	repo.Key = resolved.Ref.Key
 	if resolved.WebURL != "" {
 		repo.WebURL = resolved.WebURL
 	} else if resolved.Ref.WebURL != "" {
@@ -5168,14 +5167,14 @@ func (s *Syncer) publishResolvedRepository(
 	// nothing about it. A conflicting slot id is cross-identity even
 	// when the snapshot carries no id: the slot's occupant is not the
 	// repository the provider response describes.
-	slotID := s.repos[i].PlatformRepoID
-	previousID := previous.PlatformRepoID
-	resolvedID := resolved.PlatformRepoID
-	crossIdentity := resolvedID != 0 &&
-		((previousID != 0 && resolvedID != previousID) ||
-			(slotID != 0 && resolvedID != slotID))
+	slotID := s.repos[i].Key
+	previousID := previous.Key
+	resolvedID := resolved.Key
+	crossIdentity := !resolvedID.IsZero() &&
+		((!previousID.IsZero() && resolvedID != previousID) ||
+			(!slotID.IsZero() && resolvedID != slotID))
 	sameIdentity := !crossIdentity &&
-		(slotID == 0 || previousID == 0 || slotID == previousID)
+		(slotID.IsZero() || previousID.IsZero() || slotID == previousID)
 	if sameIdentity && s.repos[i].Archived != previous.Archived {
 		// A concurrent resolution flipped archived state after this
 		// operation snapshotted the ref. The in-flight provider
@@ -5206,17 +5205,17 @@ func (s *Syncer) publishResolvedRepository(
 // keyed by a reused route lands on the successor, never on the repository
 // the snapshot named. Callers hold reposMu.
 func (s *Syncer) trackedRepoSlotLocked(previous, resolved RepoRef) (int, bool) {
-	previousID := previous.PlatformRepoID
-	resolvedID := resolved.PlatformRepoID
+	previousID := previous.Key
+	resolvedID := resolved.Key
 	lookupID := resolvedID
-	if lookupID == 0 {
+	if lookupID.IsZero() {
 		lookupID = previousID
 	}
-	if lookupID != 0 {
+	if !lookupID.IsZero() {
 		for i := range s.repos {
 			if repoPlatform(s.repos[i]) == repoPlatform(previous) &&
 				strings.EqualFold(repoHost(s.repos[i]), repoHost(previous)) &&
-				s.repos[i].PlatformRepoID == lookupID {
+				s.repos[i].Key == lookupID {
 				return i, true
 			}
 		}
@@ -5231,8 +5230,8 @@ func (s *Syncer) trackedRepoSlotLocked(previous, resolved RepoRef) (int, bool) {
 		if repoPriorityKey(s.repos[i]) != repoPriorityKey(previous) {
 			continue
 		}
-		trackedID := s.repos[i].PlatformRepoID
-		if trackedID != 0 && previousID != 0 && trackedID != previousID {
+		trackedID := s.repos[i].Key
+		if !trackedID.IsZero() && !previousID.IsZero() && trackedID != previousID {
 			continue
 		}
 		return i, true
@@ -5260,7 +5259,7 @@ func (s *Syncer) aliasRenamedCredentialRoute(previous, resolved RepoRef) {
 		Host:  repoHost(previous),
 		Owner: previous.Owner,
 		Name:  previous.Name,
-	}, resolved.PlatformRepoID)
+	}, resolved.Key)
 }
 
 // clearDisplacedCredentialAlias drops a credential alias for the resolved
@@ -5276,7 +5275,7 @@ func (s *Syncer) clearDisplacedCredentialAlias(resolved RepoRef) {
 		return
 	}
 	router.ClearDisplacedRepoCredentialAlias(
-		resolved.Owner, resolved.Name, resolved.PlatformRepoID,
+		resolved.Owner, resolved.Name, resolved.Key,
 	)
 }
 
@@ -5747,15 +5746,15 @@ func (s *Syncer) syncRepoLabelCatalog(ctx context.Context, repo RepoRef, repoID 
 
 func (s *Syncer) RefreshRepoLabelCatalog(ctx context.Context, repo db.Repo) error {
 	ref := RepoRef{
-		Platform:       platform.Kind(repo.Platform),
-		PlatformHost:   repoProviderHostFromDB(repo),
-		Owner:          repo.Owner,
-		Name:           repo.Name,
-		RepoPath:       repo.RepoPath,
-		PlatformRepoID: repo.PlatformRepoID,
-		CloneURL:       repo.CloneURL,
-		WebURL:         repo.WebURL,
-		DefaultBranch:  repo.DefaultBranch,
+		Platform:      platform.Kind(repo.Platform),
+		PlatformHost:  repoProviderHostFromDB(repo),
+		Owner:         repo.Owner,
+		Name:          repo.Name,
+		RepoPath:      repo.RepoPath,
+		Key:           repo.Key,
+		CloneURL:      repo.CloneURL,
+		WebURL:        repo.WebURL,
+		DefaultBranch: repo.DefaultBranch,
 	}
 	checkedAt := time.Now().UTC()
 	reader, err := s.labelReaderFor(ref)
@@ -6750,27 +6749,27 @@ func (s *Syncer) BackfillMergedActorEventOnProvider(
 		return false, fmt.Errorf("repo %d is not known for merged-actor backfill", repoID)
 	}
 	kind := platform.Kind(stored.Platform)
-	providerID := stored.PlatformRepoID
-	if providerID == 0 {
+	providerID := stored.Key
+	if providerID.IsZero() {
 		return false, fmt.Errorf(
 			"repo %d has no stable provider ID for merged-actor backfill", repoID,
 		)
 	}
-	repo, ok := s.trackedRepoByProviderID(kind, stored.PlatformHost, providerID)
+	repo, ok := s.trackedRepoByProviderKey(kind, stored.PlatformHost, providerID)
 	if !ok {
 		routed, routeOK := s.trackedRepoByIdentity(
 			kind, stored.Owner, stored.Name, stored.PlatformHost,
 		)
 		if !routeOK {
 			return false, fmt.Errorf(
-				"repo %s/%s on %s/%s with provider ID %d is %w",
+				"repo %s/%s on %s/%s with provider ID %s is %w",
 				stored.Owner, stored.Name, stored.Platform, stored.PlatformHost, providerID,
 				ErrRepoNotTracked,
 			)
 		}
-		if routedID := routed.PlatformRepoID; routedID != 0 {
+		if routedID := routed.Key; !routedID.IsZero() {
 			return false, fmt.Errorf(
-				"tracked repo %s/%s provider ID %d does not match stored provider ID %d",
+				"tracked repo %s/%s provider ID %s does not match stored provider ID %s",
 				stored.Owner, stored.Name, routedID, providerID,
 			)
 		}
@@ -6796,7 +6795,7 @@ func repoRefFromStoredIdentity(tracked RepoRef, stored db.Repo) RepoRef {
 	repo.Platform = platform.Kind(stored.Platform)
 	repo.PlatformHost = stored.PlatformHost
 	repo.RepoID = stored.ID
-	repo.PlatformRepoID = stored.PlatformRepoID
+	repo.Key = stored.Key
 	if repo.WebURL == "" {
 		repo.WebURL = stored.WebURL
 	}
@@ -6855,7 +6854,7 @@ func (s *Syncer) backfillMergedActorEvent(
 		return false, fmt.Errorf("repo %d disappeared during merged-actor backfill", repoID)
 	}
 	if err := s.verifyMergedActorBackfillIdentity(
-		ctx, repo, storedRepo.PlatformRepoID,
+		ctx, repo, storedRepo.Key,
 	); err != nil {
 		return false, err
 	}
@@ -6873,9 +6872,9 @@ func (s *Syncer) backfillMergedActorEvent(
 func (s *Syncer) verifyMergedActorBackfillIdentity(
 	ctx context.Context,
 	repo RepoRef,
-	expectedProviderID int64,
+	expectedProviderID platform.RepositoryKey,
 ) error {
-	if expectedProviderID == 0 {
+	if expectedProviderID.IsZero() {
 		return errors.New("merged-actor backfill requires a stable provider ID")
 	}
 	reader, err := s.clients.RepositoryReader(repoPlatform(repo), repoHost(repo))
@@ -6885,20 +6884,20 @@ func (s *Syncer) verifyMergedActorBackfillIdentity(
 	// The merge request was fetched by route, so the check resolves that
 	// route: a lookup by ID would always report the expected repository.
 	routeRef := platformRepoRef(repo)
-	routeRef.PlatformID = 0
+	routeRef.Key = platform.RepositoryKey{}
 	observed, err := reader.GetRepository(ctx, routeRef)
 	if err != nil {
 		return fmt.Errorf(
 			"verify repository identity before merged-actor persistence: %w", err,
 		)
 	}
-	observedProviderID := observed.Ref.PlatformID
-	if observedProviderID == 0 {
+	observedProviderID := observed.Ref.Key
+	if observedProviderID.IsZero() {
 		return errors.New("provider returned no repository ID during merged-actor identity check")
 	}
 	if observedProviderID != expectedProviderID {
 		return fmt.Errorf(
-			"repository route %s/%s changed provider ID from %d to %d during merged-actor backfill",
+			"repository route %s/%s changed provider ID from %s to %s during merged-actor backfill",
 			repo.Owner, repo.Name, expectedProviderID, observedProviderID,
 		)
 	}
@@ -10864,8 +10863,8 @@ func (s *Syncer) SyncClosedMROnProvider(
 		return fmt.Errorf("repo %d is not known for closed-MR resync", repoID)
 	}
 	kind := platform.Kind(stored.Platform)
-	repo, ok := s.trackedRepoByProviderID(
-		kind, stored.PlatformHost, stored.PlatformRepoID,
+	repo, ok := s.trackedRepoByProviderKey(
+		kind, stored.PlatformHost, stored.Key,
 	)
 	if !ok {
 		routed, routeOK := s.trackedRepoByIdentity(
@@ -10877,11 +10876,11 @@ func (s *Syncer) SyncClosedMROnProvider(
 				stored.Owner, stored.Name, stored.Platform, stored.PlatformHost, ErrRepoNotTracked,
 			)
 		}
-		if routedID := routed.PlatformRepoID; routedID != 0 &&
-			routedID != stored.PlatformRepoID {
+		if routedID := routed.Key; !routedID.IsZero() &&
+			routedID != stored.Key {
 			return fmt.Errorf(
-				"tracked repo %s/%s provider ID %d does not match stored provider ID %d",
-				stored.Owner, stored.Name, routedID, stored.PlatformRepoID,
+				"tracked repo %s/%s provider ID %s does not match stored provider ID %s",
+				stored.Owner, stored.Name, routedID, stored.Key,
 			)
 		}
 		repo = routed
@@ -11639,6 +11638,18 @@ func (s *Syncer) syncProviderMRDiff(
 		}
 	}
 	mb, err := s.clones.MergeBase(ctx, string(repoPlatform(repo)), host, repo.Owner, repo.Name, normalized.PlatformBaseSHA, normalized.PlatformHeadSHA)
+	if err != nil && repoPlatform(repo) == platform.KindBitbucket {
+		sourceBranch := normalized.HeadBranch
+		if normalized.HeadRepoCloneURLUnknown || normalized.HeadRepoIdentityStale {
+			sourceBranch = ""
+		}
+		fetchErr := s.clones.FetchBitbucketMergeRequestHead(ctx, host, repo.Owner, repo.Name, number, normalized.HeadRepoCloneURL, sourceBranch, normalized.PlatformHeadSHA)
+		if fetchErr != nil {
+			err = fmt.Errorf("fetch source head: %w", fetchErr)
+		} else {
+			mb, err = s.clones.MergeBase(ctx, string(repoPlatform(repo)), host, repo.Owner, repo.Name, normalized.PlatformBaseSHA, normalized.PlatformHeadSHA)
+		}
+	}
 	if err != nil {
 		return &DiffSyncError{
 			Code: DiffSyncCodeMergeBaseFailed,
@@ -11871,7 +11882,7 @@ func (s *Syncer) FinalizeArchiveItemSync(
 	s.reclassifyWorkspaceHeadRepoTrust(ctx, RepoRef{
 		Platform: platform.Kind(stored.Platform), PlatformHost: stored.PlatformHost,
 		Owner: stored.Owner, Name: stored.Name, RepoPath: stored.RepoPath,
-		PlatformRepoID: stored.PlatformRepoID,
+		Key: stored.Key,
 	}, repoID, number)
 }
 

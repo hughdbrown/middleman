@@ -4,9 +4,11 @@ import (
 	"context"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/forge/platform"
 )
 
 func workspaceLaunchFixture(t *testing.T, database *DB, id string) (*Workspace, WorkspaceLaunchSpec) {
@@ -27,8 +29,8 @@ func workspaceLaunchFixture(t *testing.T, database *DB, id string) (*Workspace, 
 		Version: WorkspaceLaunchSpecVersion,
 		Repository: WorkspaceLaunchRepository{
 			Provider: "github", PlatformHost: "github.com",
-			PlatformRepoID: verifiedTestRepoIdentity("github", "github.com", "acme", "widget").PlatformRepoID,
-			Owner:          "acme", Name: "widget",
+			Key:   verifiedTestRepoIdentity("github", "github.com", "acme", "widget").Key,
+			Owner: "acme", Name: "widget",
 			CloneURL: "https://github.com/acme/widget.git", DefaultBranch: "main",
 		},
 		ItemType: WorkspaceItemTypePullRequest, ItemNumber: 7,
@@ -47,7 +49,7 @@ func TestWorkspaceAndLaunchSpecPersistAtomically(t *testing.T) {
 	require := require.New(t)
 	database := openTestDB(t)
 	workspace, spec := workspaceLaunchFixture(t, database, "ws-atomic")
-	spec.Repository.PlatformRepoID = 0
+	spec.Repository.Key = platform.RepositoryKey{}
 	err := database.CreateWorkspaceWithLaunchSpec(t.Context(), workspace, spec)
 	require.Error(err)
 	stored, readErr := database.GetWorkspace(t.Context(), workspace.ID)
@@ -84,7 +86,7 @@ func TestCreateWorkspaceWithLaunchSpecRejectsCatalogIdentityMismatch(t *testing.
 	require := require.New(t)
 	database := openTestDB(t)
 	workspace, spec := workspaceLaunchFixture(t, database, "ws-catalog-mismatch")
-	spec.Repository.PlatformRepoID = 1002
+	spec.Repository.Key = platform.RepositoryIDKey(1002)
 
 	err := database.CreateWorkspaceWithLaunchSpec(t.Context(), workspace, spec)
 
@@ -94,12 +96,54 @@ func TestCreateWorkspaceWithLaunchSpecRejectsCatalogIdentityMismatch(t *testing.
 	require.Nil(stored)
 }
 
+func TestCreateWorkspaceWithLaunchSpecRejectsOtherBitbucketCloudUUID(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	database := openTestDB(t)
+	repoUUID := uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	otherUUID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	observed, err := database.ObserveRepository(t.Context(), RepoIdentity{
+		Platform: "bitbucket", PlatformHost: "bitbucket.org",
+		Key: platform.RepositoryUUIDKey(repoUUID), Owner: "team", Name: "widgets",
+	})
+	require.NoError(err)
+	workspace := &Workspace{
+		ID: "ws-cloud-uuid", Platform: "bitbucket", PlatformHost: "bitbucket.org",
+		RepoOwner: "team", RepoName: "widgets", RepoID: observed.Repository.ID,
+		ItemType: WorkspaceItemTypePullRequest, ItemNumber: 7,
+		ItemKey: "7", GitHeadRef: "feature/seven", WorkspaceBranch: "feature/seven",
+		WorktreePath: "/tmp/ws-cloud-uuid", TmuxSession: "ws-cloud-uuid", Status: "ready",
+	}
+	issuedAt := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	spec := WorkspaceLaunchSpec{
+		Version: WorkspaceLaunchSpecVersion,
+		Repository: WorkspaceLaunchRepository{
+			Provider: "bitbucket", PlatformHost: "bitbucket.org",
+			Key: platform.RepositoryUUIDKey(otherUUID), Owner: "team", Name: "widgets",
+			CloneURL: "https://bitbucket.org/team/widgets.git", DefaultBranch: "main",
+		},
+		ItemType: WorkspaceItemTypePullRequest, ItemNumber: 7,
+		ItemKey: "7", GitHeadRef: "feature/seven",
+		Pull: &WorkspaceLaunchPull{
+			HeadBranch: "feature/seven", HeadRepoKind: "same_repo", SnapshotRevision: 1,
+		},
+		SourceVisible: true, IssuedAt: issuedAt,
+		SourceVisibleUntil: issuedAt.Add(WorkspaceLaunchSpecVisibilityLease),
+	}
+
+	err = database.CreateWorkspaceWithLaunchSpec(t.Context(), workspace, spec)
+	require.ErrorIs(err, ErrRepositoryIdentityChanged)
+
+	spec.Repository.Key = platform.RepositoryUUIDKey(repoUUID)
+	require.NoError(database.CreateWorkspaceWithLaunchSpec(t.Context(), workspace, spec))
+}
+
 func TestPutWorkspaceLaunchSpecRejectsCatalogIdentityMismatch(t *testing.T) {
 	require := require.New(t)
 	database := openTestDB(t)
 	workspace, spec := workspaceLaunchFixture(t, database, "ws-put-mismatch")
 	require.NoError(database.InsertWorkspace(t.Context(), workspace))
-	spec.Repository.PlatformRepoID = 1002
+	spec.Repository.Key = platform.RepositoryIDKey(1002)
 
 	err := database.PutWorkspaceLaunchSpec(t.Context(), workspace.ID, spec)
 
@@ -115,7 +159,7 @@ func TestRefreshWorkspaceLaunchSpecRejectsSameRouteIdentityMismatch(t *testing.T
 	workspace, spec := workspaceLaunchFixture(t, database, "ws-refresh-mismatch")
 	require.NoError(database.CreateWorkspaceWithLaunchSpec(t.Context(), workspace, spec))
 	refreshed := spec
-	refreshed.Repository.PlatformRepoID = 1002
+	refreshed.Repository.Key = platform.RepositoryIDKey(1002)
 	refreshed.IssuedAt = spec.IssuedAt.Add(time.Minute)
 	refreshed.SourceVisibleUntil = refreshed.IssuedAt.Add(WorkspaceLaunchSpecVisibilityLease)
 
@@ -127,7 +171,7 @@ func TestRefreshWorkspaceLaunchSpecRejectsSameRouteIdentityMismatch(t *testing.T
 	stored, readErr := database.GetWorkspaceLaunchSpec(t.Context(), workspace.ID)
 	require.NoError(readErr)
 	require.NotNil(stored)
-	require.Equal(spec.Repository.PlatformRepoID, stored.Repository.PlatformRepoID)
+	require.Equal(spec.Repository.Key, stored.Repository.Key)
 }
 
 func TestWorkspaceLaunchSpecRoundTripsCanonicalUTCTimestamps(t *testing.T) {
@@ -148,5 +192,5 @@ func TestWorkspaceLaunchSpecRoundTripsCanonicalUTCTimestamps(t *testing.T) {
 	require.NoError(err)
 	got, err = database.GetWorkspaceLaunchSpec(t.Context(), workspace.ID)
 	require.NoError(err)
-	assert.Equal(spec.Repository.PlatformRepoID, got.Repository.PlatformRepoID)
+	assert.Equal(spec.Repository.Key, got.Repository.Key)
 }

@@ -1,9 +1,10 @@
+import type { RepositoryKey } from "./repository-key.js";
 import { configuredAPIPath } from "./runtime-base.js";
 
 export type ProviderRouteRef = {
   provider: string;
   platformHost?: string | undefined;
-  platformRepoId?: number | undefined;
+  repositoryKey?: RepositoryKey | undefined;
   owner: string;
   name: string;
   repoPath: string;
@@ -19,6 +20,7 @@ const defaultHosts: Record<string, string> = {
   forgejo: "codeberg.org",
   fj: "codeberg.org",
   gitea: "gitea.com",
+  bitbucket: "bitbucket.org",
 };
 
 export function canonicalProvider(provider: string): string {

@@ -139,9 +139,81 @@ Public-host defaults are:
 - GitLab `gitlab.com`: no implicit variable, then the GitLab CLI.
 - Forgejo `codeberg.org`: `KENN_FORGE_FORGEJO_TOKEN`, then the Forgejo CLI.
 - Gitea `gitea.com`: `KENN_FORGE_GITEA_TOKEN`, then the Forgejo CLI.
+- Bitbucket Cloud `bitbucket.org`: `KENN_FORGE_BITBUCKET_TOKEN`, then host-scoped `BKT_*` settings.
 
 Grant read access for monitoring. Add write access only for comments, reviews,
 state changes, edits, or merges.
+
+### Bitbucket Cloud
+
+Add your repository using its workspace name and repository slug:
+
+```toml
+[[repos]]
+platform = "bitbucket"
+owner = "example-workspace"
+name = "widgets"
+token_env = "KENN_FORGE_BITBUCKET_TOKEN"
+```
+
+Set `KENN_FORGE_BITBUCKET_TOKEN` to `account-email:api-token` for an Atlassian
+API token, or to the token alone for an OAuth or repository access token.
+You can use `token_file` instead of `token_env`. Grant read access to
+repositories and pull requests for monitoring. Add write access for actions
+such as commenting, reviewing, and merging. To select reviewers by name, also
+grant `read:workspace:bitbucket`. Forge lists workspace members and submits their
+account IDs. Existing reviewers outside the workspace can still be removed.
+
+Merging in Forge requires an account API token whose repository write permission
+can be checked. OAuth and repository access tokens can read data, but Forge
+does not enable merges with those credentials. Branch restrictions and token
+scopes still apply.
+
+If you use the community `bkt` CLI, Forge can read its environment settings.
+Set `BKT_HOST=https://bitbucket.org` and `BKT_TOKEN`. For bearer tokens, set
+`BKT_AUTH_METHOD=bearer`. For basic authentication, set `BKT_USERNAME`.
+Forge uses its own configured credentials first. It does not read saved `bkt`
+logins or Atlassian `acli` credentials.
+
+With Cloud, you can:
+
+- Discover repositories and follow pull requests, tags, and commit statuses.
+- Read, create, and comment on issues when the repository has issues enabled.
+- Comment, reply, view and resolve inline threads, and change reviewers.
+- Approve pull requests, request changes, and merge using merge, squash, or rebase.
+
+Forge does not yet support Cloud workflow controls, notifications, labels,
+publishing review drafts, editing pull requests or changing their state outside
+a merge, or collecting historical archives.
+
+### Bitbucket Data Center
+
+Set `platform_host` to your server's hostname, `owner` to the project key,
+and `name` to the repository slug. Forge uses Cloud for `bitbucket.org` and
+Data Center for other hosts.
+
+```toml
+[[repos]]
+platform = "bitbucket"
+platform_host = "bitbucket.example.com"
+owner = "PROJECT"
+name = "widgets"
+token_env = "BITBUCKET_DC_CREDENTIAL"
+```
+
+Set `BITBUCKET_DC_CREDENTIAL` to `username:personal-access-token`. Forge uses
+this credential for both the API and Git.
+
+With Data Center, you can discover repositories, follow pull requests, tags,
+and commit statuses, and approve, edit, reopen, or merge pull requests.
+Merging requires a user personal access token with repository write permission.
+Forge offers merge, squash, and rebase when enabled in the repository settings;
+branch restrictions still apply.
+
+Forge does not yet support Data Center comments or inline threads, issues,
+workflows, notifications, reviewer changes, or publishing review drafts. Your server must serve Bitbucket
+at the hostname root, such as `https://bitbucket.example.com/`. A path such as
+`https://example.com/bitbucket/` is not supported.
 
 ### GitHub credentials by owner
 

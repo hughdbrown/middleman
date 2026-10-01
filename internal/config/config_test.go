@@ -11,6 +11,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uuid"
+
+	platformpkg "go.kenn.io/forge/platform"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -2853,9 +2856,9 @@ repos = [{ provider = "GitHub", platform_host = "github.com", platform_repo_id =
 			presets: `
 [[repo_presets]]
 name = "Review queue"
-repos = [{ provider = "bitbucket", platform_host = "bitbucket.org", platform_repo_id = 1001, repo_path = "acme/widgets" }]
+repos = [{ provider = "unsupported", platform_host = "forge.example.test", platform_repo_id = 1001, repo_path = "acme/widgets" }]
 `,
-			wantErr: `repo_presets[0].repos[0]: unsupported provider "bitbucket"`,
+			wantErr: `repo_presets[0].repos[0]: unsupported provider "unsupported"`,
 		},
 		{
 			name: "stable repository id is required",
@@ -4777,4 +4780,65 @@ outbound_disabled = true
 	require.NoError(err)
 	require.Len(loaded.Fleet.Members, 1)
 	assert.True(t, loaded.Fleet.Members[0].OutboundDisabled)
+}
+
+func TestBitbucketCloneURLConfiguration(t *testing.T) {
+	for _, tc := range []struct{ name, provider, remote, owner, repo string }{
+		{"data center", "bitbucket", "https://code.example.test:8443/scm/PROJECT/widgets.git", "PROJECT", "widgets"},
+		{"cloud workspace named scm", "bitbucket", "https://bitbucket.org/scm/widgets.git", "scm", "widgets"},
+		{"gitlab group named scm", "gitlab", "https://code.example.test/scm/PROJECT/widgets.git", "scm/PROJECT", "widgets"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := Repo{Platform: tc.provider, Name: tc.remote}
+			require.NoError(t, repo.normalize(""))
+			assert.Equal(t, tc.owner, repo.Owner)
+			assert.Equal(t, tc.repo, repo.Name)
+		})
+	}
+}
+
+func TestRepoPresetKeysBitbucketCloudRepositoryByUUID(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	cfg, err := Load(writeConfig(t, `
+[[repo_presets]]
+name = "Cloud"
+repos = [{ provider = "bitbucket", platform_host = "bitbucket.org", bitbucket_repository_uuid = "{11111111-1111-4111-8111-111111111111}", repo_path = "team/widgets" }]
+`))
+	require.NoError(err)
+	require.Len(cfg.RepoPresets, 1)
+
+	member := cfg.RepoPresets[0].Repos[0]
+	assert.Equal(
+		platformpkg.RepositoryUUIDKey(uuid.MustParse("11111111-1111-4111-8111-111111111111")),
+		member.RepositoryKey(),
+	)
+	assert.Equal("11111111-1111-4111-8111-111111111111", member.BitbucketRepositoryUUID)
+}
+
+func TestRepositoryKeyConfigErrorsNameTheField(t *testing.T) {
+	tests := map[string]struct {
+		entry   string
+		wantErr string
+	}{
+		"both keys": {
+			entry:   `platform_repo_id = 7` + "\n" + `bitbucket_repository_uuid = "11111111-1111-4111-8111-111111111111"`,
+			wantErr: "set platform_repo_id or bitbucket_repository_uuid, not both",
+		},
+		"malformed uuid": {
+			entry:   `bitbucket_repository_uuid = "not-a-uuid"`,
+			wantErr: "bitbucket_repository_uuid:",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, `
+[[repos]]
+owner = "acme"
+name = "widget"
+`+tt.entry+`
+`))
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
 }

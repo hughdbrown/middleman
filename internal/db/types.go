@@ -37,7 +37,7 @@ type Repo struct {
 	ID                    int64
 	Platform              string
 	PlatformHost          string
-	PlatformRepoID        int64 `json:"-"`
+	Key                   platform.RepositoryKey `json:"-"`
 	Owner                 string
 	Name                  string
 	RepoPath              string `json:"-"`
@@ -85,8 +85,7 @@ func (r *ActiveRepo) Row() *Repo {
 
 func newActiveRepo(repo Repo) (*ActiveRepo, error) {
 	identity := platform.RepositoryIdentity{
-		Provider: repo.Platform, PlatformHost: repo.PlatformHost,
-		PlatformRepoID: repo.PlatformRepoID,
+		Provider: repo.Platform, PlatformHost: repo.PlatformHost, Key: repo.Key,
 	}.Canonical()
 	if !identity.Valid() {
 		return nil, fmt.Errorf("active repository %d has no provider identity", repo.ID)
@@ -95,26 +94,31 @@ func newActiveRepo(repo Repo) (*ActiveRepo, error) {
 }
 
 // RepoIdentity is a repository route (owner/name) plus, once the provider has
-// verified it, the provider's integer repository ID. Lookups by route resolve
-// user input; the provider ID is the key everywhere else.
+// verified it, the provider's stable repository key. Lookups by route resolve
+// user input; the provider key is the key everywhere else.
 type RepoIdentity struct {
-	Platform       string
-	PlatformHost   string
-	PlatformRepoID int64
-	Owner          string
-	Name           string
-	RepoPath       string
-	OwnerKey       string
-	NameKey        string
-	RepoPathKey    string
+	Platform     string
+	PlatformHost string
+	Key          platform.RepositoryKey
+	Owner        string
+	Name         string
+	RepoPath     string
+	OwnerKey     string
+	NameKey      string
+	RepoPathKey  string
 }
 
 // ProviderIdentity returns the provider identity part of the route.
 func (r RepoIdentity) ProviderIdentity() platform.RepositoryIdentity {
 	return platform.RepositoryIdentity{
-		Provider: r.Platform, PlatformHost: r.PlatformHost,
-		PlatformRepoID: r.PlatformRepoID,
+		Provider: r.Platform, PlatformHost: r.PlatformHost, Key: r.Key,
 	}.Canonical()
+}
+
+// hasStableProviderIdentity reports whether a lookup should use the provider
+// key instead of the owner/name route.
+func (r RepoIdentity) hasStableProviderIdentity() bool {
+	return !r.Key.IsZero()
 }
 
 type RepoProviderMetadata struct {
@@ -868,7 +872,7 @@ type ListWorkflowStatesOpts struct {
 type WorkflowStateListRow struct {
 	Platform       string
 	PlatformHost   string
-	PlatformRepoID int64
+	RepoKey        platform.RepositoryKey
 	Owner          string
 	Name           string
 	RepoPath       string
@@ -923,17 +927,17 @@ type WorkspaceSubjectKey struct {
 }
 
 type WorkspaceSubjectMetadata struct {
-	Key            WorkspaceSubjectKey
-	Platform       string
-	PlatformHost   string
-	PlatformRepoID int64
-	RepoOwner      string
-	RepoName       string
-	RepoPath       string
-	Title          string
-	State          string
-	URL            string
-	Author         string
+	Key          WorkspaceSubjectKey
+	Platform     string
+	PlatformHost string
+	RepoKey      platform.RepositoryKey
+	RepoOwner    string
+	RepoName     string
+	RepoPath     string
+	Title        string
+	State        string
+	URL          string
+	Author       string
 }
 
 // RepoViewerLogin binds a provider-authenticated login to the stable local
@@ -944,12 +948,12 @@ type RepoViewerLogin struct {
 }
 
 type RepoFilter struct {
-	Platform       string
-	PlatformHost   string
-	PlatformRepoID int64
-	RepoOwner      string
-	RepoName       string
-	RepoPath       string
+	Platform     string
+	PlatformHost string
+	RepoKey      platform.RepositoryKey
+	RepoOwner    string
+	RepoName     string
+	RepoPath     string
 }
 
 type Issue struct {
@@ -1132,22 +1136,22 @@ type RateLimit struct {
 
 // ActivityItem represents one row in the unified activity feed.
 type ActivityItem struct {
-	ActivityType   string // new_pr, new_issue, comment, review, commit, default_branch_*
-	Source         string // pr, issue, pre, ise, bc, bfp
-	SourceID       int64  // PK from the source table
-	RepoID         int64
-	Platform       string
-	PlatformHost   string
-	PlatformRepoID int64
-	RepoOwner      string
-	RepoName       string
-	RepoPath       string
-	ItemType       string // pr, issue, or empty for repo-level activity
-	ItemNumber     int
-	ItemTitle      string
-	ItemURL        string
-	ItemState      string // open, merged, closed
-	Author         string
+	ActivityType string // new_pr, new_issue, comment, review, commit, default_branch_*
+	Source       string // pr, issue, pre, ise, bc, bfp
+	SourceID     int64  // PK from the source table
+	RepoID       int64
+	Platform     string
+	PlatformHost string
+	RepoKey      platform.RepositoryKey
+	RepoOwner    string
+	RepoName     string
+	RepoPath     string
+	ItemType     string // pr, issue, or empty for repo-level activity
+	ItemNumber   int
+	ItemTitle    string
+	ItemURL      string
+	ItemState    string // open, merged, closed
+	Author       string
 	// ItemAuthor is the author of the parent PR/issue, carried on every
 	// PR/issue row (open, comment, review, commit, force_push) so the
 	// threaded feed can show the item's author rather than the latest
@@ -1352,26 +1356,37 @@ var (
 	ErrLaunchSpecSourceHidden    = errors.New("workspace launch source is not visible")
 )
 
+// WorkspaceLaunchRepository is the repository a launch specification names.
+// Its JSON encoding is WorkspaceLaunchRepositoryJSON, stored in launch spec
+// rows and exchanged with hubs, so the key keeps its flat wire fields.
 type WorkspaceLaunchRepository struct {
-	Provider       string `json:"provider"`
-	PlatformHost   string `json:"platform_host"`
-	PlatformRepoID int64  `json:"platform_repo_id"`
-	Owner          string `json:"owner"`
-	Name           string `json:"name"`
-	CloneURL       string `json:"clone_url"`
-	DefaultBranch  string `json:"default_branch"`
+	Provider      string                 `json:"provider"`
+	PlatformHost  string                 `json:"platform_host"`
+	Key           platform.RepositoryKey `json:"-" repokey:"platform_repo_id,bitbucket_repository_uuid"`
+	Owner         string                 `json:"owner"`
+	Name          string                 `json:"name"`
+	CloneURL      string                 `json:"clone_url"`
+	DefaultBranch string                 `json:"default_branch"`
+}
+
+func (r WorkspaceLaunchRepository) MarshalJSON() ([]byte, error) {
+	type plain WorkspaceLaunchRepository
+	return platform.MarshalKeyedJSON(plain(r))
+}
+
+func (r *WorkspaceLaunchRepository) UnmarshalJSON(data []byte) error {
+	type plain WorkspaceLaunchRepository
+	return platform.UnmarshalKeyedJSON(data, (*plain)(r))
 }
 
 // Identity returns the launch repository's provider identity.
 func (r WorkspaceLaunchRepository) Identity() platform.RepositoryIdentity {
 	return platform.RepositoryIdentity{
-		Provider: r.Provider, PlatformHost: r.PlatformHost,
-		PlatformRepoID: r.PlatformRepoID,
+		Provider: r.Provider, PlatformHost: r.PlatformHost, Key: r.Key,
 	}.Canonical()
 }
 
 type WorkspaceLaunchPull struct {
-	BaseRepoID       int64  `json:"base_repo_id,omitempty"`
 	BaseBranch       string `json:"base_branch,omitempty"`
 	BaseOID          string `json:"base_oid,omitempty"`
 	HeadOID          string `json:"head_oid,omitempty"`
@@ -1414,8 +1429,8 @@ func (spec WorkspaceLaunchSpec) Validate() error {
 		{name: "clone_url", value: spec.Repository.CloneURL},
 		{name: "default_branch", value: spec.Repository.DefaultBranch},
 	}
-	if spec.Repository.PlatformRepoID <= 0 {
-		return errors.New("workspace launch repository platform_repo_id is required")
+	if !spec.Repository.Identity().Valid() {
+		return errors.New("workspace launch repository identity is required")
 	}
 	for _, field := range repositoryFields {
 		if strings.TrimSpace(field.value) == "" {
@@ -1517,16 +1532,16 @@ func (spec WorkspaceLaunchSpec) RequireVisible(now time.Time) error {
 }
 
 type UnpreparedWorkspace struct {
-	Workspace      Workspace `json:"workspace"`
-	Reason         string    `json:"reason"`
-	PlatformRepoID int64     `json:"-"`
+	Workspace Workspace              `json:"workspace"`
+	Reason    string                 `json:"reason"`
+	RepoKey   platform.RepositoryKey `json:"-"`
 }
 
 // WorkspaceSummary extends Workspace with joined source-item metadata.
 type WorkspaceSummary struct {
 	Workspace
-	RepoID         int64
-	RepoPlatformID int64
+	RepoID  int64
+	RepoKey platform.RepositoryKey
 	// SourceItemVisible and AssociatedPRVisible are false only at the public
 	// removed-upstream boundary. Inaccessible and not-yet-synced items remain
 	// visible by number, matching the rest of the public read contract.

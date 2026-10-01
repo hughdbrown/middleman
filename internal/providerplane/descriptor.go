@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	gitremote "go.kenn.io/kit/git/remote"
-
 	"go.kenn.io/forge/internal/federation"
 	"go.kenn.io/forge/platform"
 )
@@ -42,9 +40,20 @@ type RepositoryRoute struct {
 }
 
 // RepositoryDescriptorRequest may bind a cached route to a selected repository.
+// Its JSON form flattens the key; see platform.MarshalKeyedJSON.
 type RepositoryDescriptorRequest struct {
 	RepositoryRoute
-	PlatformRepoID int64 `json:"platform_repo_id,omitempty"`
+	Key platform.RepositoryKey `json:"-" repokey:"platform_repo_id,bitbucket_repository_uuid,omitempty"`
+}
+
+func (r RepositoryDescriptorRequest) MarshalJSON() ([]byte, error) {
+	type plain RepositoryDescriptorRequest
+	return platform.MarshalKeyedJSON(plain(r))
+}
+
+func (r *RepositoryDescriptorRequest) UnmarshalJSON(data []byte) error {
+	type plain RepositoryDescriptorRequest
+	return platform.UnmarshalKeyedJSON(data, (*plain)(r))
 }
 
 // CanonicalRepositoryRoute normalizes route spellings accepted by public API
@@ -90,30 +99,41 @@ func (r RepositoryRoute) Validate() error {
 // RepositorySnapshot is the hub-owned input used to construct one
 // repository descriptor from a stable database snapshot.
 type RepositorySnapshot struct {
-	Provider       string
-	PlatformHost   string
-	PlatformRepoID int64
-	Owner          string
-	Name           string
-	CloneURL       string
-	DefaultBranch  string
-	ObservedAt     time.Time
-	Stale          bool
+	Provider      string
+	PlatformHost  string
+	Key           platform.RepositoryKey
+	Owner         string
+	Name          string
+	CloneURL      string
+	DefaultBranch string
+	ObservedAt    time.Time
+	Stale         bool
 }
 
 // RepositoryDescriptor carries only provider-verified facts a spoke needs to
-// reconcile a repository and perform Git work locally.
+// reconcile a repository and perform Git work locally. Its JSON encoding is
+// RepositoryDescriptorJSON.
 type RepositoryDescriptor struct {
-	ProtocolVersion int       `json:"protocol_version"`
-	Provider        string    `json:"provider"`
-	PlatformHost    string    `json:"platform_host"`
-	PlatformRepoID  int64     `json:"platform_repo_id"`
-	Owner           string    `json:"owner"`
-	Name            string    `json:"name"`
-	CloneURL        string    `json:"clone_url"`
-	DefaultBranch   string    `json:"default_branch"`
-	ObservedAt      time.Time `json:"observed_at"`
-	Stale           bool      `json:"stale"`
+	ProtocolVersion int                    `json:"protocol_version"`
+	Provider        string                 `json:"provider"`
+	PlatformHost    string                 `json:"platform_host"`
+	Key             platform.RepositoryKey `json:"-" repokey:"platform_repo_id,bitbucket_repository_uuid"`
+	Owner           string                 `json:"owner"`
+	Name            string                 `json:"name"`
+	CloneURL        string                 `json:"clone_url"`
+	DefaultBranch   string                 `json:"default_branch"`
+	ObservedAt      time.Time              `json:"observed_at"`
+	Stale           bool                   `json:"stale"`
+}
+
+func (r RepositoryDescriptor) MarshalJSON() ([]byte, error) {
+	type plain RepositoryDescriptor
+	return platform.MarshalKeyedJSON(plain(r))
+}
+
+func (r *RepositoryDescriptor) UnmarshalJSON(data []byte) error {
+	type plain RepositoryDescriptor
+	return platform.UnmarshalKeyedJSON(data, (*plain)(r))
 }
 
 // BuildRepositoryDescriptor constructs and validates the wire value at the
@@ -123,7 +143,7 @@ func BuildRepositoryDescriptor(snapshot RepositorySnapshot) (RepositoryDescripto
 		ProtocolVersion: federation.ProtocolVersion,
 		Provider:        snapshot.Provider,
 		PlatformHost:    snapshot.PlatformHost,
-		PlatformRepoID:  snapshot.PlatformRepoID,
+		Key:             snapshot.Key,
 		Owner:           snapshot.Owner,
 		Name:            snapshot.Name,
 		CloneURL:        snapshot.CloneURL,
@@ -148,8 +168,7 @@ func (d RepositoryDescriptor) Route() RepositoryRoute {
 // Identity returns the descriptor's stable cross-spoke identity.
 func (d RepositoryDescriptor) Identity() platform.RepositoryIdentity {
 	return platform.RepositoryIdentity{
-		Provider: d.Provider, PlatformHost: d.PlatformHost,
-		PlatformRepoID: d.PlatformRepoID,
+		Provider: d.Provider, PlatformHost: d.PlatformHost, Key: d.Key,
 	}
 }
 
@@ -179,8 +198,9 @@ func (d RepositoryDescriptor) Validate() error {
 	if err := validateFederationNetworkRemote(d.CloneURL); err != nil {
 		return fmt.Errorf("repository descriptor clone URL: %w", err)
 	}
-	if err := gitremote.ValidateRemoteIdentity(gitremote.Identity{
-		Host: d.PlatformHost, Owner: d.Owner, Name: d.Name,
+	if err := platform.ValidateRemoteIdentity(platform.RepoRef{
+		Platform: platform.Kind(d.Provider),
+		Host:     d.PlatformHost, Owner: d.Owner, Name: d.Name,
 	}, d.CloneURL); err != nil {
 		return fmt.Errorf("repository descriptor clone URL: %w", err)
 	}
@@ -293,7 +313,7 @@ func (d DiffDescriptor) Validate() error {
 func validateProviderHostPair(kind platform.Kind, host string) error {
 	for _, other := range []platform.Kind{
 		platform.KindGitHub, platform.KindGitLab,
-		platform.KindForgejo, platform.KindGitea,
+		platform.KindForgejo, platform.KindGitea, platform.KindBitbucket,
 	} {
 		if other == kind {
 			continue

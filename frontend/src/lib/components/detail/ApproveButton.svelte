@@ -10,6 +10,7 @@
   import type { ProviderRouteRef } from "../../api/provider-routes.js";
   import { showFlash } from "../../stores/flash.svelte.js";
   import { runApprovePR, type PRDetailActionInput } from "./keyboard-actions.js";
+  import type { RepositoryKey } from "../../api/repository-key.js";
 
   const { detail } = getStores();
   const runtime = getAppRuntime();
@@ -20,7 +21,7 @@
     number: number;
     provider: string;
     platformHost?: string | undefined;
-    platformRepoId?: number | undefined;
+    repositoryKey?: RepositoryKey | undefined;
     repoPath: string;
     size?: "sm" | "md";
     disabled?: boolean;
@@ -51,7 +52,7 @@
     number,
     provider,
     platformHost,
-    platformRepoId,
+    repositoryKey,
     repoPath,
     size = "md",
     disabled = false,
@@ -84,6 +85,7 @@
   let submittingAction = $state<"approve" | "request_changes" | null>(null);
   let sectionEl = $state<HTMLDivElement | undefined>();
   let commentInput = $state<HTMLTextAreaElement | undefined>();
+  const canComment = $derived(supportedReviewActions.includes("comment"));
   const canRequestChanges = $derived(supportedReviewActions.includes("request_changes"));
 
   // Reset draft state on full provider-aware PR identity change so an
@@ -93,7 +95,7 @@
   $effect(() => {
     void provider;
     void platformHost;
-    void platformRepoId;
+    void repositoryKey;
     void repoPath;
     void owner;
     void name;
@@ -132,7 +134,7 @@
         State: "open", IsDraft: false, MergeableState: "",
         platform_head_sha: pinAtOpen,
       },
-      ref: { provider, platformHost, platformRepoId, owner, name, repoPath },
+      ref: { provider, platformHost, repositoryKey, owner, name, repoPath },
       number,
       viewerCan: {
         approve: true, merge: false, markReady: false,
@@ -142,7 +144,7 @@
       stale: disabled,
       requireHeadPin,
       stores: { detail },
-      approveCommentBody: body,
+      approveCommentBody: canComment ? body : "",
       ...(pinAtOpen !== "" && { expectedHeadSha: pinAtOpen }),
       onHeadConflict: (...args) => {
         callbacks.onHandledHeadConflict();
@@ -202,7 +204,7 @@
     submitting = true;
     submittingAction = "request_changes";
     let handledHeadConflict = false;
-    const ref = { provider, platformHost, platformRepoId, owner, name, repoPath };
+    const ref = { provider, platformHost, repositoryKey, owner, name, repoPath };
     detail.requestPullChanges(
       ref,
       number,
@@ -400,14 +402,16 @@
   {#if expanded}
     <div class="approve-popover" role="dialog" aria-label="Submit pull request review">
       <Card level="default" padding="sm" class="approve-popover-card">
-        <textarea
-          bind:this={commentInput}
-          class="approve-comment"
-          aria-label={requestChangesForm ? "Requested changes" : "Review comment"}
-          placeholder={requestChangesForm ? "Explain the changes you are requesting…" : "Leave an optional comment…"}
-          bind:value={body}
-          rows={3}
-        ></textarea>
+        {#if canComment || requestChangesForm}
+          <textarea
+            bind:this={commentInput}
+            class="approve-comment"
+            aria-label={requestChangesForm ? "Requested changes" : "Review comment"}
+            placeholder={requestChangesForm ? "Explain the changes you are requesting…" : "Leave an optional comment…"}
+            bind:value={body}
+            rows={3}
+          ></textarea>
+        {/if}
         <div class="approve-actions">
         <Button
           class="btn btn--secondary"

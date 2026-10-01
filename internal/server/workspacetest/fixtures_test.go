@@ -26,6 +26,7 @@ import (
 	"go.kenn.io/forge/internal/testutil/gitfixture"
 	"go.kenn.io/forge/internal/testutil/reposeed"
 	"go.kenn.io/forge/internal/testutil/servertest"
+	"go.kenn.io/forge/platform"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -135,7 +136,7 @@ func setupWorkspaceServerFixtureWithTmuxInjection(
 	// server shutdown cleanup, this runs after it and before TempDir removal.
 	t.Cleanup(clones.Wait)
 	bare, err := clones.ClonePathForContext(
-		gitclone.WithRepositoryIdentity(t.Context(), testutil.FixtureRepoID("acme", "widget")),
+		gitclone.WithRepositoryIdentity(t.Context(), platform.RepositoryIdentity{Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget"))}),
 		"github", "github.com", "acme", "widget",
 	)
 	require.NoError(t, err)
@@ -352,7 +353,7 @@ func seedIssue(
 
 func verifiedGitHubRepoIdentity(host, owner, name string) db.RepoIdentity {
 	identity := db.GitHubRepoIdentity(host, owner, name)
-	identity.PlatformRepoID = reposeed.SyntheticID(identity)
+	identity.Key = platform.RepositoryIDKey(reposeed.SyntheticID(identity))
 	return identity
 }
 

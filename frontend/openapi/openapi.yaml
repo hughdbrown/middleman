@@ -198,6 +198,8 @@ components:
     ActivityRepoRefResponse:
       additionalProperties: false
       properties:
+        bitbucket_repository_uuid:
+          type: string
         name:
           type: string
         owner:
@@ -1455,6 +1457,8 @@ components:
     ConfiguredRepoStatus:
       additionalProperties: false
       properties:
+        bitbucket_repository_uuid:
+          type: string
         hidden_from_ui:
           type: boolean
         is_glob:
@@ -1581,6 +1585,9 @@ components:
           format: uri
           readOnly: true
           type: string
+        bitbucket_repository_uuid:
+          description: Bitbucket Cloud repository UUID; set instead of platform_repo_id for Bitbucket Cloud
+          type: string
         branch:
           description: Branch for the new worktree; generated when empty
           type: string
@@ -1601,6 +1608,9 @@ components:
           format: uri
           readOnly: true
           type: string
+        bitbucket_repository_uuid:
+          description: Bitbucket Cloud repository UUID; set instead of platform_repo_id for Bitbucket Cloud
+          type: string
         branch:
           description: Branch for the new worktree; generated when empty
           type: string
@@ -1620,6 +1630,8 @@ components:
             - /api/v1/schemas/CreateDevboxWorkspaceInputBody.json
           format: uri
           readOnly: true
+          type: string
+        bitbucket_repository_uuid:
           type: string
         branch:
           type: string
@@ -1787,6 +1799,9 @@ components:
           format: uri
           readOnly: true
           type: string
+        bitbucket_repository_uuid:
+          description: Bitbucket Cloud repository UUID; set instead of platform_repo_id for Bitbucket Cloud
+          type: string
         git_head_ref:
           type: string
         platform_repo_id:
@@ -1809,6 +1824,9 @@ components:
           format: uri
           readOnly: true
           type: string
+        bitbucket_repository_uuid:
+          description: Bitbucket Cloud repository UUID; set instead of platform_repo_id for Bitbucket Cloud
+          type: string
         git_head_ref:
           type: string
         platform_repo_id:
@@ -1830,6 +1848,9 @@ components:
             - /api/v1/schemas/CreateWorkspaceInputBody.json
           format: uri
           readOnly: true
+          type: string
+        bitbucket_repository_uuid:
+          description: Bitbucket Cloud repository UUID; set instead of platform_repo_id for Bitbucket Cloud
           type: string
         mr_number:
           format: int64
@@ -2793,16 +2814,16 @@ components:
           format: uri
           readOnly: true
           type: string
+        bitbucket_repository_uuid:
+          type: string
         head_sha:
           maxLength: 128
           minLength: 1
           type: string
         platform_repo_id:
           format: int64
-          minimum: 1
           type: integer
       required:
-        - platform_repo_id
         - head_sha
       type: object
     ExternalContextCard:
@@ -2900,6 +2921,8 @@ components:
     FederationActivityRepositoryIdentity:
       additionalProperties: false
       properties:
+        bitbucket_repository_uuid:
+          type: string
         platform_host:
           type: string
         platform_repo_id:
@@ -3053,6 +3076,8 @@ components:
     FederationWorkflowItemIdentity:
       additionalProperties: false
       properties:
+        bitbucket_repository_uuid:
+          type: string
         name:
           type: string
         number:
@@ -3154,6 +3179,8 @@ components:
     FederationWorkflowRepositoryIdentity:
       additionalProperties: false
       properties:
+        bitbucket_repository_uuid:
+          type: string
         name:
           type: string
         owner:
@@ -6546,6 +6573,8 @@ components:
     ProviderRepositoryObservation:
       additionalProperties: false
       properties:
+        bitbucket_repository_uuid:
+          type: string
         name:
           type: string
         owner:
@@ -6672,6 +6701,8 @@ components:
     ProviderStateRepository:
       additionalProperties: false
       properties:
+        bitbucket_repository_uuid:
+          type: string
         name:
           type: string
         owner:
@@ -6804,6 +6835,8 @@ components:
           format: uri
           readOnly: true
           type: string
+        bitbucket_repository_uuid:
+          type: string
         item_number:
           format: int64
           type: integer
@@ -6811,7 +6844,6 @@ components:
           type: string
         platform_repo_id:
           format: int64
-          minimum: 1
           type: integer
         repository:
           $ref: "#/components/schemas/RepositoryRoute"
@@ -7897,6 +7929,8 @@ components:
           type: boolean
         AllowSquashMerge:
           type: boolean
+        BitbucketRepositoryUUID:
+          type: string
         CreatedAt:
           format: date-time
           type: string
@@ -8071,6 +8105,8 @@ components:
     RepoPresetRepository:
       additionalProperties: false
       properties:
+        bitbucket_repository_uuid:
+          type: string
         platform_host:
           type: string
         platform_repo_id:
@@ -8182,6 +8218,8 @@ components:
     RepoRefResponse:
       additionalProperties: false
       properties:
+        bitbucket_repository_uuid:
+          type: string
         capabilities:
           $ref: "#/components/schemas/ProviderCapabilitiesResponse"
         default_branch:
@@ -8225,6 +8263,8 @@ components:
           type: boolean
         AllowSquashMerge:
           type: boolean
+        BitbucketRepositoryUUID:
+          type: string
         CreatedAt:
           format: date-time
           type: string
@@ -8468,6 +8508,8 @@ components:
           format: uri
           readOnly: true
           type: string
+        bitbucket_repository_uuid:
+          type: string
         clone_url:
           type: string
         default_branch:
@@ -8513,6 +8555,8 @@ components:
           format: uri
           readOnly: true
           type: string
+        bitbucket_repository_uuid:
+          type: string
         name:
           type: string
         owner:
@@ -8533,6 +8577,8 @@ components:
     RepositoryIdentity:
       additionalProperties: false
       properties:
+        bitbucketRepositoryUUID:
+          type: string
         name:
           type: string
         owner:
@@ -8652,6 +8698,43 @@ components:
         - item_type
         - number
         - repo_tracked
+      type: object
+    ReviewerAccount:
+      additionalProperties: false
+      properties:
+        avatar_url:
+          type: string
+        display_name:
+          type: string
+        id:
+          type: string
+        nickname:
+          type: string
+      required:
+        - id
+        - display_name
+        - nickname
+        - avatar_url
+      type: object
+    ReviewerAccounts:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/ReviewerAccounts.json
+          format: uri
+          readOnly: true
+          type: string
+        accounts:
+          items:
+            $ref: "#/components/schemas/ReviewerAccount"
+          type: array
+        candidate_error:
+          type: string
+      required:
+        - accounts
+        - candidate_error
       type: object
     RoborevConfiguredRepositoriesResponse:
       additionalProperties: false
@@ -9448,6 +9531,8 @@ components:
     SnapshotRepository:
       additionalProperties: false
       properties:
+        bitbucket_repository_uuid:
+          type: string
         coverage:
           $ref: "#/components/schemas/SnapshotCoverage"
         default_branch:
@@ -10859,9 +10944,6 @@ components:
           type: string
         base_oid:
           type: string
-        base_repo_id:
-          format: int64
-          type: integer
         head_branch:
           type: string
         head_oid:
@@ -10887,6 +10969,8 @@ components:
     WorkspaceLaunchRepository:
       additionalProperties: false
       properties:
+        bitbucket_repository_uuid:
+          type: string
         clone_url:
           type: string
         default_branch:
@@ -10920,6 +11004,8 @@ components:
             - /api/v1/schemas/WorkspaceLaunchRequest.json
           format: uri
           readOnly: true
+          type: string
+        bitbucket_repository_uuid:
           type: string
         for_creation:
           type: boolean
@@ -11022,6 +11108,8 @@ components:
     WorkspaceRepositorySummary:
       additionalProperties: false
       properties:
+        bitbucket_repository_uuid:
+          type: string
         name:
           type: string
         owner:
@@ -11938,6 +12026,11 @@ paths:
           schema:
             format: int64
             type: integer
+        - explode: false
+          in: query
+          name: bitbucket_repository_uuid
+          schema:
+            type: string
         - explode: false
           in: query
           name: item_type
@@ -18061,11 +18154,14 @@ paths:
         - explode: false
           in: query
           name: platform_repo_id
-          required: true
           schema:
             format: int64
-            minimum: 1
             type: integer
+        - explode: false
+          in: query
+          name: bitbucket_repository_uuid
+          schema:
+            type: string
         - explode: false
           in: query
           name: refresh
@@ -19223,6 +19319,52 @@ paths:
                 $ref: "#/components/schemas/ProblemError"
           description: Error
       summary: Review pull request diff
+      tags:
+        - Pull Requests
+  /host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/reviewer-accounts:
+    get:
+      operationId: get-pr-reviewer-accounts-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: number
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewerAccounts"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: List pull request reviewer accounts
       tags:
         - Pull Requests
   /host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/reviewers:
@@ -23023,11 +23165,14 @@ paths:
         - explode: false
           in: query
           name: platform_repo_id
-          required: true
           schema:
             format: int64
-            minimum: 1
             type: integer
+        - explode: false
+          in: query
+          name: bitbucket_repository_uuid
+          schema:
+            type: string
         - explode: false
           in: query
           name: refresh
@@ -24075,6 +24220,47 @@ paths:
                 $ref: "#/components/schemas/ProblemError"
           description: Error
       summary: Review pull request diff
+      tags:
+        - Pull Requests
+  /pulls/{provider}/{owner}/{name}/{number}/reviewer-accounts:
+    get:
+      operationId: get-pr-reviewer-accounts
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: number
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewerAccounts"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: List pull request reviewer accounts
       tags:
         - Pull Requests
   /pulls/{provider}/{owner}/{name}/{number}/reviewers:

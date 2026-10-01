@@ -199,7 +199,7 @@ func repoListFilterCondition(repoAlias string, filters []RepoFilter, args *[]any
 	var groups []string
 	for _, filter := range filters {
 		var clauses []string
-		if filter.PlatformRepoID != 0 {
+		if !filter.RepoKey.IsZero() {
 			if filter.Platform != "" {
 				clauses = append(clauses, repoAlias+".platform = ?")
 				*args = append(*args, strings.ToLower(strings.TrimSpace(filter.Platform)))
@@ -209,8 +209,7 @@ func repoListFilterCondition(repoAlias string, filters []RepoFilter, args *[]any
 				clauses = append(clauses, repoAlias+".platform_host = ?")
 				*args = append(*args, host)
 			}
-			clauses = append(clauses, repoAlias+".platform_repo_id = ?")
-			*args = append(*args, filter.PlatformRepoID)
+			clauses = append(clauses, repositoryKeyCondition(repoAlias, filter.RepoKey, args))
 		} else if filter.RepoPath != "" {
 			if filter.Platform != "" {
 				clauses = append(clauses, repoAlias+".platform = ?")
@@ -980,6 +979,7 @@ func (d *DB) PurgeOtherHosts(ctx context.Context, keepHost string) error {
 func (d *DB) ListRepos(ctx context.Context) ([]Repo, error) {
 	rows, err := d.roQueryContext(ctx,
 		`SELECT id, platform, platform_host, platform_repo_id,
+		        bitbucket_repository_uuid,
 		        owner, name, repo_path,
 		        owner_key, name_key, repo_path_key,
 		        web_url, clone_url, default_branch,
@@ -1001,8 +1001,9 @@ func (d *DB) ListRepos(ctx context.Context) ([]Repo, error) {
 	var repos []Repo
 	for rows.Next() {
 		var r Repo
+		keyID, keyUUID := repositoryKeyColumns(&r.Key)
 		if err := rows.Scan(
-			&r.ID, &r.Platform, &r.PlatformHost, &r.PlatformRepoID,
+			&r.ID, &r.Platform, &r.PlatformHost, keyID, keyUUID,
 			&r.Owner, &r.Name, &r.RepoPath,
 			&r.OwnerKey, &r.NameKey, &r.RepoPathKey,
 			&r.WebURL, &r.CloneURL, &r.DefaultBranch,
@@ -1051,7 +1052,7 @@ func (d *DB) UpdateRepoSyncCompleted(ctx context.Context, id int64, t time.Time,
 // found. A provider ID, when present, decides the repository; otherwise the
 // owner/name route is resolved to its current occupant.
 func (d *DB) GetRepoByIdentity(ctx context.Context, identity RepoIdentity) (*ActiveRepo, error) {
-	if identity.PlatformRepoID != 0 {
+	if identity.hasStableProviderIdentity() {
 		repo, err := d.GetActiveRepoByProviderID(ctx, identity.ProviderIdentity())
 		if err != nil {
 			return nil, fmt.Errorf("get repo by identity: %w", err)
@@ -1094,6 +1095,7 @@ func (d *DB) GetActiveRepoByID(ctx context.Context, id int64) (*ActiveRepo, erro
 func (d *DB) getRepoByID(ctx context.Context, id int64, activeOnly bool) (*Repo, error) {
 	var r Repo
 	query := `SELECT id, platform, platform_host, platform_repo_id,
+		        bitbucket_repository_uuid,
 		        owner, name, repo_path,
 		        owner_key, name_key, repo_path_key,
 		        web_url, clone_url, default_branch,
@@ -1107,8 +1109,9 @@ func (d *DB) getRepoByID(ctx context.Context, id int64, activeOnly bool) (*Repo,
 	if activeOnly {
 		query += ` AND lifecycle_state = 'active'`
 	}
+	keyID, keyUUID := repositoryKeyColumns(&r.Key)
 	err := d.roQueryRowContext(ctx, query, id).Scan(
-		&r.ID, &r.Platform, &r.PlatformHost, &r.PlatformRepoID,
+		&r.ID, &r.Platform, &r.PlatformHost, keyID, keyUUID,
 		&r.Owner, &r.Name, &r.RepoPath,
 		&r.OwnerKey, &r.NameKey, &r.RepoPathKey,
 		&r.WebURL, &r.CloneURL, &r.DefaultBranch,
@@ -5423,7 +5426,7 @@ const workspaceSummaryColumns = `
 	w.git_head_ref, w.mr_head_repo, w.workspace_branch,
 	w.worktree_path, w.tmux_session, w.terminal_backend, w.status,
 	w.error_message, w.created_at, w.kata_metadata,
-	r.id, r.platform_repo_id,
+	r.id, r.platform_repo_id, r.bitbucket_repository_uuid,
 	CASE
 	    WHEN r.id IS NULL THEN 0
 	    WHEN w.item_type = 'pull_request' THEN NOT EXISTS (
@@ -5517,7 +5520,7 @@ func scanWorkspaceSummary(
 	var itemLastActivityAt sql.NullString
 	var workspaceRepoID sql.NullInt64
 	var repoID sql.NullInt64
-	var repoPlatformID sql.NullInt64
+	keyID, keyUUID := repositoryKeyColumns(&s.RepoKey)
 	err := scanner.Scan(
 		&s.ID, &s.Platform, &s.PlatformHost, &s.RepoOwner, &s.RepoName,
 		&workspaceRepoID,
@@ -5525,7 +5528,7 @@ func scanWorkspaceSummary(
 		&s.GitHeadRef, &s.MRHeadRepo, &s.WorkspaceBranch,
 		&s.WorktreePath, &s.TmuxSession, &s.TerminalBackend, &s.Status,
 		&s.ErrorMessage, &s.CreatedAt, &kataMetadataJSON,
-		&repoID, &repoPlatformID,
+		&repoID, keyID, keyUUID,
 		&s.SourceItemVisible, &s.AssociatedPRVisible,
 		&s.SourceTitle, &s.SourceState, &s.SourceURL,
 		&s.MRIsDraft, &s.MRCIStatus,
@@ -5542,9 +5545,6 @@ func scanWorkspaceSummary(
 	}
 	if repoID.Valid {
 		s.RepoID = repoID.Int64
-	}
-	if repoPlatformID.Valid {
-		s.RepoPlatformID = repoPlatformID.Int64
 	}
 	s.CreatedAt = s.CreatedAt.UTC()
 	s.MRTitle = s.SourceTitle
