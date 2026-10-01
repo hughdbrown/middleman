@@ -650,8 +650,14 @@ path, so an ownerless path silently skips the App candidate and pays with the
 PAT for a read the route's tracker bills to the installation
 (`internal/github/auth_router.go::RoutedClient.GetUserForRepo`).
 
-Managed Git uses exact-repository or owner PAT routes with mutation context and
-must never expose an App installation token to smart HTTP. Thread full provider,
+Workspace Git (fetch and push against a workspace remote, and ownerless host
+Git) uses exact-repository or owner PAT routes with mutation context and must
+never receive an App installation token. Clones and fetches into Forge's own
+clone store never push, so they use the normal read chain: a covering App
+installation token takes priority over the route's PAT. Pass the repository
+owner so the chain selects only that owner's installation; App-only Forge
+can maintain clones without a user identity
+(`cmd/kenn-forge/provider_startup.go::gitStartup.ReadSourceForRepo`). Thread full provider,
 host, owner, and repository identity through clone/fetch and local reads, passing
 the normalized platform (`repoPlatform(repo)`) so an unqualified GitHub ref still
 picks its credential route instead of none. Partition sync, diff, and repository
@@ -661,6 +667,10 @@ path-scoped, so shared full-stack fixtures must seed both namespaces
 (`internal/testutil/diff_repo.go::SetupDiffRepo`). Before injecting
 a PAT into workspace fetch or push, require the branch upstream to be `origin`,
 reject repository-local URL rewrites, and validate every origin fetch/push URL.
+
+Spoke clone-read admission must also use read credentials, or App-only routes
+fail before fetching; workspace launch still requires a mutation credential
+(`internal/gitclone/clone.go::Manager.RequireReadCredentialRoute`).
 
 A nil `tokenauth.Source` is not fail-closed: `gitclone` reads it as permission to
 run git with no credential, which succeeds against any public repository and
@@ -782,7 +792,7 @@ GitHub App installation tokens are account-scoped, not host-scoped. An app
 installation for one owner must not authenticate reads for another owner just
 because both repos share the same host. Repo-scoped GitHub reads must resolve app
 tokens with the repository owner in context, and ownerless contexts such as
-clone auth must fall through to PAT/`gh` credentials. This owner scoping governs
+host-level Git auth must fall through to PAT/`gh` credentials. This owner scoping governs
 endpoint selection, not just token resolution: choose an installation-token-only
 read endpoint (such as installation-repositories listing) only when the requested
 owner actually resolves to an app installation. Gating it on whether the host has
