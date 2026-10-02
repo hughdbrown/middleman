@@ -1209,6 +1209,38 @@ func (o *SendDevboxInitialMessageRequestOptions) GetHeader() (map[string]string,
 	return nil, nil
 }
 
+// ListDevboxWorkspaceTargetsRequestOptions is the options needed to make a request to ListDevboxWorkspaceTargets.
+type ListDevboxWorkspaceTargetsRequestOptions struct {
+	PathParams *ListDevboxWorkspaceTargetsPath
+}
+
+// GetPathParams returns the path params as a map.
+func (o *ListDevboxWorkspaceTargetsRequestOptions) GetPathParams() (map[string]any, error) {
+	params, err := paramcodec.Map(o.PathParams)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range params {
+		params[key] = url.PathEscape(fmt.Sprint(value))
+	}
+	return params, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *ListDevboxWorkspaceTargetsRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *ListDevboxWorkspaceTargetsRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *ListDevboxWorkspaceTargetsRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
 // GetDevboxWorkspaceViewStateRequestOptions is the options needed to make a request to GetDevboxWorkspaceViewState.
 type GetDevboxWorkspaceViewStateRequestOptions struct {
 	PathParams *GetDevboxWorkspaceViewStatePath
@@ -4004,6 +4036,38 @@ func (o *GetFleetWorkspaceRuntimeSessionAttachSpecRequestOptions) GetBody() any 
 
 // GetHeader returns the headers as a map.
 func (o *GetFleetWorkspaceRuntimeSessionAttachSpecRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// ListFleetWorkspaceTargetsRequestOptions is the options needed to make a request to ListFleetWorkspaceTargets.
+type ListFleetWorkspaceTargetsRequestOptions struct {
+	PathParams *ListFleetWorkspaceTargetsPath
+}
+
+// GetPathParams returns the path params as a map.
+func (o *ListFleetWorkspaceTargetsRequestOptions) GetPathParams() (map[string]any, error) {
+	params, err := paramcodec.Map(o.PathParams)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range params {
+		params[key] = url.PathEscape(fmt.Sprint(value))
+	}
+	return params, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *ListFleetWorkspaceTargetsRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *ListFleetWorkspaceTargetsRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *ListFleetWorkspaceTargetsRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }
 
@@ -11663,6 +11727,38 @@ func (o *SubmitWorkspaceRuntimeSessionInitialMessageRequestOptions) GetHeader() 
 	return nil, nil
 }
 
+// ListWorkspaceTargetsRequestOptions is the options needed to make a request to ListWorkspaceTargets.
+type ListWorkspaceTargetsRequestOptions struct {
+	PathParams *ListWorkspaceTargetsPath
+}
+
+// GetPathParams returns the path params as a map.
+func (o *ListWorkspaceTargetsRequestOptions) GetPathParams() (map[string]any, error) {
+	params, err := paramcodec.Map(o.PathParams)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range params {
+		params[key] = url.PathEscape(fmt.Sprint(value))
+	}
+	return params, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *ListWorkspaceTargetsRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *ListWorkspaceTargetsRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *ListWorkspaceTargetsRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
 // GetWorkspaceViewStateRequestOptions is the options needed to make a request to GetWorkspaceViewState.
 type GetWorkspaceViewStateRequestOptions struct {
 	PathParams *GetWorkspaceViewStatePath
@@ -11920,6 +12016,7 @@ type ClientInterface interface {
 	RenameDevboxSessionWithResponse(ctx context.Context, options *RenameDevboxSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RenameDevboxSessionResp, error)
 	GetDevboxAttachSpecWithResponse(ctx context.Context, options *GetDevboxAttachSpecRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetDevboxAttachSpecResp, error)
 	SendDevboxInitialMessageWithResponse(ctx context.Context, options *SendDevboxInitialMessageRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SendDevboxInitialMessageResp, error)
+	ListDevboxWorkspaceTargetsWithResponse(ctx context.Context, options *ListDevboxWorkspaceTargetsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListDevboxWorkspaceTargetsResp, error)
 	GetDevboxWorkspaceViewStateWithResponse(ctx context.Context, options *GetDevboxWorkspaceViewStateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetDevboxWorkspaceViewStateResp, error)
 	UpdateDevboxWorkspaceViewStateWithResponse(ctx context.Context, options *UpdateDevboxWorkspaceViewStateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*UpdateDevboxWorkspaceViewStateResp, error)
 	BrowseDocsFoldersWithResponse(ctx context.Context, options *BrowseDocsFoldersRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BrowseDocsFoldersResp, error)
@@ -12018,6 +12115,7 @@ type ClientInterface interface {
 	StopFleetWorkspaceRuntimeSessionWithResponse(ctx context.Context, options *StopFleetWorkspaceRuntimeSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*StopFleetWorkspaceRuntimeSessionResp, error)
 	RenameFleetWorkspaceRuntimeSessionWithResponse(ctx context.Context, options *RenameFleetWorkspaceRuntimeSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RenameFleetWorkspaceRuntimeSessionResp, error)
 	GetFleetWorkspaceRuntimeSessionAttachSpecWithResponse(ctx context.Context, options *GetFleetWorkspaceRuntimeSessionAttachSpecRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetFleetWorkspaceRuntimeSessionAttachSpecResp, error)
+	ListFleetWorkspaceTargetsWithResponse(ctx context.Context, options *ListFleetWorkspaceTargetsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListFleetWorkspaceTargetsResp, error)
 	GetFleetWorkspaceViewStateWithResponse(ctx context.Context, options *GetFleetWorkspaceViewStateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetFleetWorkspaceViewStateResp, error)
 	UpdateFleetWorkspaceViewStateWithResponse(ctx context.Context, options *UpdateFleetWorkspaceViewStateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*UpdateFleetWorkspaceViewStateResp, error)
 	CreateFleetBrowserLoginWithResponse(ctx context.Context, options *CreateFleetBrowserLoginRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CreateFleetBrowserLoginResp, error)
@@ -12282,6 +12380,7 @@ type ClientInterface interface {
 	GetWorkspaceRuntimeSessionAttachSpecWithResponse(ctx context.Context, options *GetWorkspaceRuntimeSessionAttachSpecRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetWorkspaceRuntimeSessionAttachSpecResp, error)
 	GetWorkspaceRuntimeSessionInitialMessageWithResponse(ctx context.Context, options *GetWorkspaceRuntimeSessionInitialMessageRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetWorkspaceRuntimeSessionInitialMessageResp, error)
 	SubmitWorkspaceRuntimeSessionInitialMessageWithResponse(ctx context.Context, options *SubmitWorkspaceRuntimeSessionInitialMessageRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SubmitWorkspaceRuntimeSessionInitialMessageResp, error)
+	ListWorkspaceTargetsWithResponse(ctx context.Context, options *ListWorkspaceTargetsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListWorkspaceTargetsResp, error)
 	GetWorkspaceViewStateWithResponse(ctx context.Context, options *GetWorkspaceViewStateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetWorkspaceViewStateResp, error)
 	UpdateWorkspaceViewStateWithResponse(ctx context.Context, options *UpdateWorkspaceViewStateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*UpdateWorkspaceViewStateResp, error)
 	RemoveStaleWorktreeWithResponse(ctx context.Context, options *RemoveStaleWorktreeRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RemoveStaleWorktreeResp, error)
@@ -14627,6 +14726,62 @@ func (c *Client) SendDevboxInitialMessageWithResponse(ctx context.Context, optio
 					ContentType:   resp.Headers.Get("Content-Type"),
 					ContentLength: len(bodyBytes),
 					TargetType:    "SendDevboxInitialMessageResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, nil
+	case 500:
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	default:
+		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	}
+}
+
+// ListDevboxWorkspaceTargets Forward an execution operation to its owning devbox
+func (c *Client) ListDevboxWorkspaceTargetsWithResponse(ctx context.Context, options *ListDevboxWorkspaceTargetsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListDevboxWorkspaceTargetsResp, error) {
+	var err error
+
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/devboxes/{connection_id}/workspaces/{id}/targets",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/devboxes/{connection_id}/workspaces/{id}/targets")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+
+	out := &ListDevboxWorkspaceTargetsResp{
+		HTTPResponse: resp.Raw,
+		Body:         resp.Content,
+		StatusCode:   resp.StatusCode,
+	}
+	if resp.StatusCode >= 400 && len(resp.Content) > 0 {
+		problem := new(ListDevboxWorkspaceTargetsErrorResponse)
+		if err := json.Unmarshal(resp.Content, problem); err != nil {
+			return out, fmt.Errorf("decode API error response: %w", err)
+		}
+		out.Error = problem
+	}
+	switch resp.StatusCode {
+	case 200:
+		out.JSON200 = new(ListDevboxWorkspaceTargetsResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON200); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "ListDevboxWorkspaceTargetsResponse",
 					Body:          bodyBytes,
 					Err:           err,
 				}
@@ -18894,6 +19049,62 @@ func (c *Client) GetFleetWorkspaceRuntimeSessionAttachSpecWithResponse(ctx conte
 	switch resp.StatusCode {
 	case 200:
 		return out, nil
+	default:
+		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	}
+}
+
+// ListFleetWorkspaceTargets List workspace targets on fleet host
+func (c *Client) ListFleetWorkspaceTargetsWithResponse(ctx context.Context, options *ListFleetWorkspaceTargetsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListFleetWorkspaceTargetsResp, error) {
+	var err error
+
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/fleet/hosts/{host_key}/workspaces/{id}/targets",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/fleet/hosts/{host_key}/workspaces/{id}/targets")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+
+	out := &ListFleetWorkspaceTargetsResp{
+		HTTPResponse: resp.Raw,
+		Body:         resp.Content,
+		StatusCode:   resp.StatusCode,
+	}
+	if resp.StatusCode >= 400 && len(resp.Content) > 0 {
+		problem := new(ListFleetWorkspaceTargetsErrorResponse)
+		if err := json.Unmarshal(resp.Content, problem); err != nil {
+			return out, fmt.Errorf("decode API error response: %w", err)
+		}
+		out.Error = problem
+	}
+	switch resp.StatusCode {
+	case 200:
+		out.JSON200 = new(ListFleetWorkspaceTargetsResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON200); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "ListFleetWorkspaceTargetsResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, nil
+	case 500:
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	default:
 		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	}
@@ -33459,6 +33670,62 @@ func (c *Client) SubmitWorkspaceRuntimeSessionInitialMessageWithResponse(ctx con
 	}
 }
 
+// ListWorkspaceTargets List workspace targets
+func (c *Client) ListWorkspaceTargetsWithResponse(ctx context.Context, options *ListWorkspaceTargetsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListWorkspaceTargetsResp, error) {
+	var err error
+
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/workspaces/{id}/targets",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/workspaces/{id}/targets")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+
+	out := &ListWorkspaceTargetsResp{
+		HTTPResponse: resp.Raw,
+		Body:         resp.Content,
+		StatusCode:   resp.StatusCode,
+	}
+	if resp.StatusCode >= 400 && len(resp.Content) > 0 {
+		problem := new(ListWorkspaceTargetsErrorResponse)
+		if err := json.Unmarshal(resp.Content, problem); err != nil {
+			return out, fmt.Errorf("decode API error response: %w", err)
+		}
+		out.Error = problem
+	}
+	switch resp.StatusCode {
+	case 200:
+		out.JSON200 = new(ListWorkspaceTargetsResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON200); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "ListWorkspaceTargetsResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, nil
+	case 500:
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	default:
+		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	}
+}
+
 // GetWorkspaceViewState Get workspace view state
 func (c *Client) GetWorkspaceViewStateWithResponse(ctx context.Context, options *GetWorkspaceViewStateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetWorkspaceViewStateResp, error) {
 	var err error
@@ -34351,6 +34618,21 @@ func (c *Client) SendDevboxInitialMessageRaw(ctx context.Context, httpClient *ht
 		Method:      "POST",
 		Options:     options,
 		ContentType: "application/json",
+	}
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return httpClient.Do(req)
+}
+
+// ListDevboxWorkspaceTargetsRaw returns an unread response. The caller must close its body.
+func (c *Client) ListDevboxWorkspaceTargetsRaw(ctx context.Context, httpClient *http.Client, options *ListDevboxWorkspaceTargetsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/devboxes/{connection_id}/workspaces/{id}/targets",
+		Method:     "GET",
+		Options:    options,
 	}
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
 	if err != nil {
@@ -35875,6 +36157,21 @@ func (c *Client) GetFleetWorkspaceRuntimeSessionAttachSpecRaw(ctx context.Contex
 
 	reqParams := runtime.RequestOptionsParameters{
 		RequestURL: c.apiClient.GetBaseURL() + "/fleet/hosts/{host_key}/workspaces/{id}/runtime/sessions/{session_key}/attach-spec",
+		Method:     "GET",
+		Options:    options,
+	}
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return httpClient.Do(req)
+}
+
+// ListFleetWorkspaceTargetsRaw returns an unread response. The caller must close its body.
+func (c *Client) ListFleetWorkspaceTargetsRaw(ctx context.Context, httpClient *http.Client, options *ListFleetWorkspaceTargetsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/fleet/hosts/{host_key}/workspaces/{id}/targets",
 		Method:     "GET",
 		Options:    options,
 	}
@@ -40237,6 +40534,21 @@ func (c *Client) SubmitWorkspaceRuntimeSessionInitialMessageRaw(ctx context.Cont
 	return httpClient.Do(req)
 }
 
+// ListWorkspaceTargetsRaw returns an unread response. The caller must close its body.
+func (c *Client) ListWorkspaceTargetsRaw(ctx context.Context, httpClient *http.Client, options *ListWorkspaceTargetsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/workspaces/{id}/targets",
+		Method:     "GET",
+		Options:    options,
+	}
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return httpClient.Do(req)
+}
+
 // GetWorkspaceViewStateRaw returns an unread response. The caller must close its body.
 func (c *Client) GetWorkspaceViewStateRaw(ctx context.Context, httpClient *http.Client, options *GetWorkspaceViewStateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
 
@@ -41049,6 +41361,22 @@ func NewSendDevboxInitialMessageRequest(ctx context.Context, baseURL string, opt
 		Method:      "POST",
 		Options:     options,
 		ContentType: "application/json",
+	}
+	return apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+}
+
+// NewListDevboxWorkspaceTargetsRequest constructs a typed request for a caller-owned transport.
+func NewListDevboxWorkspaceTargetsRequest(ctx context.Context, baseURL string, options *ListDevboxWorkspaceTargetsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Request, error) {
+	apiClient, err := runtime.NewAPIClient(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	c := NewClient(apiClient)
+
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/devboxes/{connection_id}/workspaces/{id}/targets",
+		Method:     "GET",
+		Options:    options,
 	}
 	return apiClient.CreateRequest(ctx, reqParams, reqEditors...)
 }
@@ -42669,6 +42997,22 @@ func NewGetFleetWorkspaceRuntimeSessionAttachSpecRequest(ctx context.Context, ba
 
 	reqParams := runtime.RequestOptionsParameters{
 		RequestURL: c.apiClient.GetBaseURL() + "/fleet/hosts/{host_key}/workspaces/{id}/runtime/sessions/{session_key}/attach-spec",
+		Method:     "GET",
+		Options:    options,
+	}
+	return apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+}
+
+// NewListFleetWorkspaceTargetsRequest constructs a typed request for a caller-owned transport.
+func NewListFleetWorkspaceTargetsRequest(ctx context.Context, baseURL string, options *ListFleetWorkspaceTargetsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Request, error) {
+	apiClient, err := runtime.NewAPIClient(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	c := NewClient(apiClient)
+
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/fleet/hosts/{host_key}/workspaces/{id}/targets",
 		Method:     "GET",
 		Options:    options,
 	}
@@ -47291,6 +47635,22 @@ func NewSubmitWorkspaceRuntimeSessionInitialMessageRequest(ctx context.Context, 
 	return apiClient.CreateRequest(ctx, reqParams, reqEditors...)
 }
 
+// NewListWorkspaceTargetsRequest constructs a typed request for a caller-owned transport.
+func NewListWorkspaceTargetsRequest(ctx context.Context, baseURL string, options *ListWorkspaceTargetsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Request, error) {
+	apiClient, err := runtime.NewAPIClient(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	c := NewClient(apiClient)
+
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/workspaces/{id}/targets",
+		Method:     "GET",
+		Options:    options,
+	}
+	return apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+}
+
 // NewGetWorkspaceViewStateRequest constructs a typed request for a caller-owned transport.
 func NewGetWorkspaceViewStateRequest(ctx context.Context, baseURL string, options *GetWorkspaceViewStateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Request, error) {
 	apiClient, err := runtime.NewAPIClient(baseURL)
@@ -47789,6 +48149,23 @@ const (
 	WorkspaceSettingsUpdateDefaultSidebarViewItem WorkspaceSettingsUpdateDefaultSidebarView = "item"
 )
 
+type WorkspaceTargetSource string
+
+const (
+	WorkspaceTargetSourceBranch    WorkspaceTargetSource = "branch"
+	WorkspaceTargetSourceInherited WorkspaceTargetSource = "inherited"
+	WorkspaceTargetSourceOwner     WorkspaceTargetSource = "owner"
+	WorkspaceTargetSourceTracked   WorkspaceTargetSource = "tracked"
+)
+
+type WorkspaceTargetType string
+
+const (
+	WorkspaceTargetTypeIssue WorkspaceTargetType = "issue"
+	WorkspaceTargetTypeKata  WorkspaceTargetType = "kata"
+	WorkspaceTargetTypePr    WorkspaceTargetType = "pr"
+)
+
 type WorkspacesDefaultSidebarView string
 
 const (
@@ -48086,6 +48463,11 @@ type GetDevboxAttachSpecPath struct {
 type SendDevboxInitialMessagePath struct {
 	ID           string `json:"id"`
 	SessionKey   string `json:"session_key"`
+	ConnectionID string `json:"connection_id"`
+}
+
+type ListDevboxWorkspaceTargetsPath struct {
+	ID           string `json:"id"`
 	ConnectionID string `json:"connection_id"`
 }
 
@@ -48431,6 +48813,11 @@ type GetFleetWorkspaceRuntimeSessionAttachSpecPath struct {
 	HostKey    string `json:"host_key"`
 	ID         string `json:"id"`
 	SessionKey string `json:"session_key"`
+}
+
+type ListFleetWorkspaceTargetsPath struct {
+	HostKey string `json:"host_key"`
+	ID      string `json:"id"`
 }
 
 type GetFleetWorkspaceViewStatePath struct {
@@ -49829,6 +50216,10 @@ type SubmitWorkspaceRuntimeSessionInitialMessagePath struct {
 	SessionKey string `json:"session_key"`
 }
 
+type ListWorkspaceTargetsPath struct {
+	ID string `json:"id"`
+}
+
 type GetWorkspaceViewStatePath struct {
 	ID string `json:"id"`
 }
@@ -51024,6 +51415,10 @@ type SendDevboxInitialMessageResponse = AgentInitialMessageStatusResponse
 
 type SendDevboxInitialMessageErrorResponse = ProblemError
 
+type ListDevboxWorkspaceTargetsResponse = WorkspaceTargetsResponse
+
+type ListDevboxWorkspaceTargetsErrorResponse = ProblemError
+
 type GetDevboxWorkspaceViewStateResponse = WorkspaceViewState
 
 type GetDevboxWorkspaceViewStateErrorResponse = ProblemError
@@ -51297,6 +51692,14 @@ type StopFleetWorkspaceRuntimeSessionResponse map[string]any
 type RenameFleetWorkspaceRuntimeSessionResponse map[string]any
 
 type GetFleetWorkspaceRuntimeSessionAttachSpecResponse map[string]any
+
+type ListFleetWorkspaceTargetsResponse = WorkspaceTargetsResponse
+
+type ListFleetWorkspaceTargetsErrorResponse map[string]any
+
+func (r ListFleetWorkspaceTargetsErrorResponse) Error() string {
+	return "unmapped client error"
+}
 
 type GetFleetWorkspaceViewStateResponse = WorkspaceViewState
 
@@ -52278,6 +52681,10 @@ type SubmitWorkspaceRuntimeSessionInitialMessageResponse = AgentInitialMessageSt
 
 type SubmitWorkspaceRuntimeSessionInitialMessageErrorResponse = ProblemError
 
+type ListWorkspaceTargetsResponse = WorkspaceTargetsResponse
+
+type ListWorkspaceTargetsErrorResponse = ProblemError
+
 type GetWorkspaceViewStateResponse = WorkspaceViewState
 
 type GetWorkspaceViewStateErrorResponse = ProblemError
@@ -52612,6 +53019,14 @@ type SendDevboxInitialMessageResp struct {
 	StatusCode   int
 	Error        *SendDevboxInitialMessageErrorResponse
 	JSON200      *SendDevboxInitialMessageResponse
+}
+
+type ListDevboxWorkspaceTargetsResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	Error        *ListDevboxWorkspaceTargetsErrorResponse
+	JSON200      *ListDevboxWorkspaceTargetsResponse
 }
 
 type GetDevboxWorkspaceViewStateResp struct {
@@ -53286,6 +53701,14 @@ type GetFleetWorkspaceRuntimeSessionAttachSpecResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
 	StatusCode   int
+}
+
+type ListFleetWorkspaceTargetsResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	Error        *ListFleetWorkspaceTargetsErrorResponse
+	JSON200      *ListFleetWorkspaceTargetsResponse
 }
 
 type GetFleetWorkspaceViewStateResp struct {
@@ -55391,6 +55814,14 @@ type SubmitWorkspaceRuntimeSessionInitialMessageResp struct {
 	StatusCode   int
 	Error        *SubmitWorkspaceRuntimeSessionInitialMessageErrorResponse
 	JSON200      *SubmitWorkspaceRuntimeSessionInitialMessageResponse
+}
+
+type ListWorkspaceTargetsResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	Error        *ListWorkspaceTargetsErrorResponse
+	JSON200      *ListWorkspaceTargetsResponse
 }
 
 type GetWorkspaceViewStateResp struct {
@@ -59617,6 +60048,13 @@ type WorkspaceKataSummary struct {
 	Title       *string `json:"title,omitempty"`
 }
 
+type WorkspaceKataTarget struct {
+	DaemonID   string  `json:"daemon_id"`
+	IssueUID   string  `json:"issue_uid"`
+	ProjectUID string  `json:"project_uid"`
+	Reference  *string `json:"reference,omitempty"`
+}
+
 type WorkspaceLaunchPull struct {
 	BaseBranch       *string                         `json:"base_branch,omitempty"`
 	BaseOid          *string                         `json:"base_oid,omitempty"`
@@ -59810,6 +60248,29 @@ type WorkspaceSummary struct {
 	Visible               bool                       `json:"visible"`
 	WorktreeDirty         *bool                      `json:"worktree_dirty,omitempty"`
 	WorktreePath          string                     `json:"worktree_path"`
+}
+
+type WorkspaceTarget struct {
+	// ID Explicit link ID; zero for an implicit target
+	ID     int64                 `json:"id"`
+	Kata   *WorkspaceKataTarget  `json:"kata,omitempty"`
+	Number int64                 `json:"number"`
+	Repo   *RepoRefResponse      `json:"repo,omitempty"`
+	Source WorkspaceTargetSource `json:"source"`
+	State  string                `json:"state"`
+	Title  string                `json:"title"`
+	Type   WorkspaceTargetType   `json:"type"`
+
+	// Unavailable Provider metadata is currently unavailable; the link is retained
+	Unavailable bool   `json:"unavailable"`
+	URL         string `json:"url"`
+}
+
+type WorkspaceTargetsResponse struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema        *string           `json:"$schema,omitempty"`
+	KataAvailable bool              `json:"kata_available"`
+	Targets       []WorkspaceTarget `json:"targets"`
 }
 
 type WorkspaceViewState struct {

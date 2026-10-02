@@ -107,6 +107,7 @@ import type {
   ListFleetProjectBranchesPathParameters,
   ListFleetProjectWorktreesDefaultOne,
   ListFleetProjectWorktreesPathParameters,
+  ListFleetWorkspaceTargetsPathParameters,
   ListFleetWorkspacesDefaultOne,
   ListFleetWorkspacesPathParameters,
   LocalEnrollment,
@@ -177,6 +178,7 @@ import type {
   WatchFleetWorkspaceDiffPathParameters,
   WorkspaceLaunchRequest,
   WorkspaceLaunchSpec,
+  WorkspaceTargetsResponse,
   WorkspaceViewState,
 } from "../models";
 
@@ -1980,6 +1982,23 @@ export const getFleetWorkspaceRuntimeSessionAttachSpec = async (
       method: "GET",
     },
   );
+};
+
+export const getListFleetWorkspaceTargetsUrl = ({ hostKey, id }: ListFleetWorkspaceTargetsPathParameters) => {
+  return `/fleet/hosts/${encodeURIComponent(String(hostKey))}/workspaces/${encodeURIComponent(String(id))}/targets`;
+};
+
+/**
+ * @summary List workspace targets on fleet host
+ */
+export const listFleetWorkspaceTargets = async (
+  { hostKey, id }: ListFleetWorkspaceTargetsPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorkspaceTargetsResponse> => {
+  return orvalFetch<WorkspaceTargetsResponse>(getListFleetWorkspaceTargetsUrl({ hostKey, id }), {
+    ...options,
+    method: "GET",
+  });
 };
 
 export const getGetFleetWorkspaceViewStateUrl = ({ hostKey, id }: GetFleetWorkspaceViewStatePathParameters) => {

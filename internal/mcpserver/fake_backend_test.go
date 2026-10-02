@@ -11,6 +11,10 @@ import (
 )
 
 type fakeBackend struct {
+	kataTargetsAvailableFn       func() bool
+	addWorkspaceTargetFn         func(context.Context, string, WorkspaceTargetRequest) (WorkspaceTarget, error)
+	listWorkspaceTargetsFn       func(context.Context, string) (WorkspaceTargets, error)
+	removeWorkspaceTargetFn      func(context.Context, string, string, int64) error
 	listRepositoriesFn           func(context.Context) ([]RepositorySummary, error)
 	listActivityFn               func(context.Context, ActivityQuery) (ActivityPage, error)
 	listPullsFn                  func(context.Context, ItemListQuery) ([]Pull, error)
@@ -214,4 +218,29 @@ func testItemIdentity(itemType string, number int) ItemIdentity {
 		RepoKey: platform.RepositoryIDKey(1001),
 		Owner:   "acme", Name: "widget", Number: number,
 	}
+}
+
+func (b *fakeBackend) KataTargetsAvailable() bool {
+	return b.kataTargetsAvailableFn != nil && b.kataTargetsAvailableFn()
+}
+
+func (b *fakeBackend) AddWorkspaceTarget(ctx context.Context, id string, in WorkspaceTargetRequest) (WorkspaceTarget, error) {
+	if b.addWorkspaceTargetFn != nil {
+		return b.addWorkspaceTargetFn(ctx, id, in)
+	}
+	return WorkspaceTarget{}, nil
+}
+
+func (b *fakeBackend) ListWorkspaceTargets(ctx context.Context, id string) (WorkspaceTargets, error) {
+	if b.listWorkspaceTargetsFn != nil {
+		return b.listWorkspaceTargetsFn(ctx, id)
+	}
+	return WorkspaceTargets{Targets: []WorkspaceTarget{}}, nil
+}
+
+func (b *fakeBackend) RemoveWorkspaceTarget(ctx context.Context, id, kind string, targetID int64) error {
+	if b.removeWorkspaceTargetFn != nil {
+		return b.removeWorkspaceTargetFn(ctx, id, kind, targetID)
+	}
+	return nil
 }

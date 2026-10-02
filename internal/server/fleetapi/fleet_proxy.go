@@ -161,6 +161,17 @@ func (s *Handler) registerFleetOperationRoutes(api huma.API) {
 			},
 		},
 		{
+			operationID:  "list-fleet-workspace-targets",
+			method:       http.MethodGet,
+			path:         "/fleet/hosts/{host_key}/workspaces/{id}/targets",
+			summary:      "List workspace targets on fleet host",
+			pathParams:   []string{"host_key", "id"},
+			responseType: reflect.TypeFor[workspaceapi.WorkspaceTargetsResponse](),
+			targetPath: func(r *http.Request) string {
+				return "/api/v1/workspaces/" + escapePath(r.PathValue("id")) + "/targets"
+			},
+		},
+		{
 			operationID:  "get-fleet-workspace-view-state",
 			responseType: reflect.TypeFor[workspaceapi.WorkspaceViewState](),
 			method:       http.MethodGet,

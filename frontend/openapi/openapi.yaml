@@ -11032,6 +11032,22 @@ components:
         - project_uid
         - issue_uid
       type: object
+    WorkspaceKataTarget:
+      additionalProperties: false
+      properties:
+        daemon_id:
+          type: string
+        issue_uid:
+          type: string
+        project_uid:
+          type: string
+        reference:
+          type: string
+      required:
+        - daemon_id
+        - project_uid
+        - issue_uid
+      type: object
     WorkspaceLaunchPull:
       additionalProperties: false
       properties:
@@ -11522,6 +11538,72 @@ components:
         - status
         - created_at
         - visible
+      type: object
+    WorkspaceTarget:
+      additionalProperties: false
+      properties:
+        id:
+          description: Explicit link ID; zero for an implicit target
+          format: int64
+          type: integer
+        kata:
+          $ref: "#/components/schemas/WorkspaceKataTarget"
+        number:
+          format: int64
+          type: integer
+        repo:
+          $ref: "#/components/schemas/RepoRefResponse"
+        source:
+          enum:
+            - owner
+            - branch
+            - tracked
+            - inherited
+          type: string
+        state:
+          type: string
+        title:
+          type: string
+        type:
+          enum:
+            - pr
+            - issue
+            - kata
+          type: string
+        unavailable:
+          description: Provider metadata is currently unavailable; the link is retained
+          type: boolean
+        url:
+          type: string
+      required:
+        - id
+        - type
+        - number
+        - url
+        - title
+        - state
+        - source
+        - unavailable
+      type: object
+    WorkspaceTargetsResponse:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/WorkspaceTargetsResponse.json
+          format: uri
+          readOnly: true
+          type: string
+        kata_available:
+          type: boolean
+        targets:
+          items:
+            $ref: "#/components/schemas/WorkspaceTarget"
+          type: array
+      required:
+        - targets
+        - kata_available
       type: object
     WorkspaceViewState:
       additionalProperties: false
@@ -13419,6 +13501,36 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AgentInitialMessageStatusResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Forward an execution operation to its owning devbox
+      tags:
+        - Devboxes
+  /devboxes/{connection_id}/workspaces/{id}/targets:
+    get:
+      operationId: list-devbox-workspace-targets
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: connection_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceTargetsResponse"
           description: OK
         default:
           content:
@@ -16376,6 +16488,40 @@ paths:
                 $ref: "#/components/schemas/ProblemError"
           description: Response returned by the owning fleet host.
       summary: Get workspace session attach spec on fleet host
+      tags:
+        - Fleet
+  /fleet/hosts/{host_key}/workspaces/{id}/targets:
+    get:
+      operationId: list-fleet-workspace-targets
+      parameters:
+        - in: path
+          name: host_key
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceTargetsResponse"
+          description: Response returned by the owning fleet host.
+        default:
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Response returned by the owning fleet host.
+      summary: List workspace targets on fleet host
       tags:
         - Fleet
   /fleet/hosts/{host_key}/workspaces/{id}/view-state:
@@ -27310,6 +27456,31 @@ paths:
                 $ref: "#/components/schemas/ProblemError"
           description: Error
       summary: Submit initial agent message
+      tags:
+        - Workspaces
+  /workspaces/{id}/targets:
+    get:
+      operationId: list-workspace-targets
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceTargetsResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: List workspace targets
       tags:
         - Workspaces
   /workspaces/{id}/view-state:

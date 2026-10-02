@@ -32,6 +32,7 @@ import type {
   LaunchWorkspaceRuntimeSessionPathParameters,
   ListWorkspaceAgentSessionsOutputBody,
   ListWorkspaceAgentSessionsPathParameters,
+  ListWorkspaceTargetsPathParameters,
   ListWorkspacesOutputBody,
   PullWorkspaceBranchPathParameters,
   PushWorkspaceBranchPathParameters,
@@ -52,6 +53,7 @@ import type {
   WorkspaceDiffWatchResponse,
   WorkspaceResponse,
   WorkspaceRuntimeResponse,
+  WorkspaceTargetsResponse,
   WorkspaceViewState,
 } from "../models";
 
@@ -651,6 +653,23 @@ export const submitWorkspaceRuntimeSessionInitialMessage = async (
       body: JSON.stringify(submitInitialMessageInputBody),
     },
   );
+};
+
+export const getListWorkspaceTargetsUrl = ({ id }: ListWorkspaceTargetsPathParameters) => {
+  return `/workspaces/${encodeURIComponent(String(id))}/targets`;
+};
+
+/**
+ * @summary List workspace targets
+ */
+export const listWorkspaceTargets = async (
+  { id }: ListWorkspaceTargetsPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorkspaceTargetsResponse> => {
+  return orvalFetch<WorkspaceTargetsResponse>(getListWorkspaceTargetsUrl({ id }), {
+    ...options,
+    method: "GET",
+  });
 };
 
 export const getGetWorkspaceViewStateUrl = ({ id }: GetWorkspaceViewStatePathParameters) => {

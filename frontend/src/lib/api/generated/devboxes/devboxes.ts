@@ -32,6 +32,7 @@ import type {
   LaunchWorkspaceAgentHandoffInputBody,
   LaunchWorkspaceRuntimeSessionInputBody,
   ListDevboxAgentSessionsPathParameters,
+  ListDevboxWorkspaceTargetsPathParameters,
   ListDevboxWorkspacesPathParameters,
   ListWorkspaceAgentSessionsOutputBody,
   ListWorkspacesOutputBody,
@@ -62,6 +63,7 @@ import type {
   WorkspaceLaunchSpec,
   WorkspaceResponse,
   WorkspaceRuntimeResponse,
+  WorkspaceTargetsResponse,
   WorkspaceViewState,
 } from "../models";
 
@@ -698,6 +700,23 @@ export const sendDevboxInitialMessage = async (
       body: JSON.stringify(submitInitialMessageInputBody),
     },
   );
+};
+
+export const getListDevboxWorkspaceTargetsUrl = ({ connectionId, id }: ListDevboxWorkspaceTargetsPathParameters) => {
+  return `/devboxes/${encodeURIComponent(String(connectionId))}/workspaces/${encodeURIComponent(String(id))}/targets`;
+};
+
+/**
+ * @summary Forward an execution operation to its owning devbox
+ */
+export const listDevboxWorkspaceTargets = async (
+  { connectionId, id }: ListDevboxWorkspaceTargetsPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorkspaceTargetsResponse> => {
+  return orvalFetch<WorkspaceTargetsResponse>(getListDevboxWorkspaceTargetsUrl({ connectionId, id }), {
+    ...options,
+    method: "GET",
+  });
 };
 
 export const getGetDevboxWorkspaceViewStateUrl = ({ connectionId, id }: GetDevboxWorkspaceViewStatePathParameters) => {
