@@ -964,6 +964,9 @@
   let launcherShownFor = $state<string[]>([]);
 
   function openLauncher(leaf?: WorkspaceRuntimeLaunchLeaf): void {
+    if (externalDockVisible && !terminalLayout.open) {
+      terminalLayout = { ...terminalLayout, open: true };
+    }
     if (!launcherShownFor.includes(viewWorkspaceKey)) {
       launcherShownFor = [...launcherShownFor, viewWorkspaceKey];
     }
@@ -1250,8 +1253,9 @@
   // the collapsed row is the only honest rendering of "no terminals here". Not
   // while a launch is in flight - toggling the panel open auto-launches, and
   // closing it under that race would flicker the dock shut on its own opening.
+  // The external launcher also needs the dock height until it is dismissed.
   $effect(() => {
-    if (!runtimeLive || terminalLaunching) return;
+    if (!runtimeLive || terminalLaunching || (externalDockVisible && launcherOpen)) return;
     // Bottom only. Docked to the top the dock is a workflow TAB, and an empty one
     // is the drop target for moving a session into the terminal region - closing
     // it there takes away the affordance instead of a hole.
@@ -4898,27 +4902,8 @@
                     </WorkflowSplitTree>
                   {/if}
                 {/if}
-                {#if workspace !== null && launcherOverlayAllowed}
-                  <WorkspaceLauncherOverlay
-                    open={launcherOpen && interactionVisible}
-                    launchTargets={launchTargets}
-                    sessions={runtimeSessions}
-                    displayLabels={sessionDisplayLabels}
-                    {launchingKey}
-                    readonly={actionsBlocked}
-                    quickActions={workspaceQuickActions}
-                    onClose={closeLauncher}
-                    onLaunch={(key) => handleLaunch(key, undefined, launcherState?.leaf)}
-                    onQuickAction={(action) => {
-                      const leaf = launcherState?.leaf;
-                      closeLauncher();
-                      handleQuickAction(action, leaf);
-                    }}
-                    onOpenSession={(sessionKey) => {
-                      closeLauncher();
-                      openSession(sessionKey);
-                    }}
-                  />
+                {#if !externalDockVisible}
+                  {@render workspaceLauncher()}
                 {/if}
               </div>
               <!-- Kept even in a chrome-free pane. The header bar and the one-tab
@@ -5220,7 +5205,35 @@
      retired. Its own visible placement, not the parked host wrapper, owns whether
      terminal slots may attach. -->
 {#snippet workspaceDockRow()}
-  {@render workspaceDockRowBody(true, true)}
+  <div class={["workspace-dock-launcher-host", terminalLayout.dock]}>
+    {@render workspaceDockRowBody(true, true)}
+    {@render workspaceLauncher()}
+  </div>
+{/snippet}
+
+{#snippet workspaceLauncher()}
+  {#if workspace !== null && launcherOverlayAllowed}
+    <WorkspaceLauncherOverlay
+      open={launcherOpen && interactionVisible}
+      launchTargets={launchTargets}
+      sessions={runtimeSessions}
+      displayLabels={sessionDisplayLabels}
+      {launchingKey}
+      readonly={actionsBlocked}
+      quickActions={workspaceQuickActions}
+      onClose={closeLauncher}
+      onLaunch={(key) => handleLaunch(key, undefined, launcherState?.leaf)}
+      onQuickAction={(action) => {
+        const leaf = launcherState?.leaf;
+        closeLauncher();
+        handleQuickAction(action, leaf);
+      }}
+      onOpenSession={(sessionKey) => {
+        closeLauncher();
+        openSession(sessionKey);
+      }}
+    />
+  {/if}
 {/snippet}
 
 {#snippet workspaceDockHeaderActions()}
@@ -5784,6 +5797,15 @@
     background: color-mix(in srgb, var(--accent-red) 12%, var(--bg-surface));
     color: var(--accent-red);
     font-size: var(--font-size-sm);
+  }
+
+  .workspace-dock-launcher-host {
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .workspace-dock-launcher-host.top {
+    height: 100%;
   }
 
   .workspace-stage {
