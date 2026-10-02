@@ -7,25 +7,27 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"math"
-	"os"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/posthog/posthog-go"
 	"go.kenn.io/forge/internal/db"
+	kittelemetry "go.kenn.io/kit/telemetry"
 )
 
 const (
 	EnabledEnv           = "TELEMETRY_ENABLED"
 	applicationSlug      = "kenn-forge"
+	envPrefix            = "KENN_FORGE"
 	installIDMetadataKey = "telemetry.install_id"
+	installedAtKey       = "telemetry.install_created_at"
 	postHogAPIKey        = "phc_AzHd9YvuHR7M5poKzC6eW654d3SgKyBdoQPuwkWhimUf"
 	postHogEndpoint      = "https://us.i.posthog.com"
 )
+
+// HeartbeatInterval is how often a running daemon reports daemon_active.
+const HeartbeatInterval = 24 * time.Hour
 
 var ErrUnsupportedEvent = errors.New("unsupported telemetry event")
 
@@ -46,17 +48,11 @@ type Client interface {
 	Enabled() bool
 }
 
+// Reporter routes each event to the kit reporter for its source, since kit
+// fixes the source property per reporter.
 type Reporter struct {
-	client     enqueueCloser
-	distinctID string
-	enabled    bool
-	version    string
-	commit     string
-}
-
-type enqueueCloser interface {
-	Enqueue(posthog.Message) error
-	Close() error
+	daemon  kittelemetry.PostHogClient
+	backend kittelemetry.PostHogClient
 }
 
 type Options struct {
@@ -65,8 +61,16 @@ type Options struct {
 	Commit   string
 }
 
+// newKitReporter builds one kit reporter; tests replace it.
+var newKitReporter = func(opts kittelemetry.PostHogOptions, options ...kittelemetry.PostHogOption) (kittelemetry.PostHogClient, error) {
+	return kittelemetry.NewPostHogReporter(opts, options...)
+}
+
+// EnabledFromEnv reports whether the environment allows telemetry. Kit honors
+// both the documented generic TELEMETRY_ENABLED=0 opt-out and the prefixed
+// KENN_FORGE_TELEMETRY_ENABLED=0 one.
 func EnabledFromEnv() bool {
-	return strings.TrimSpace(os.Getenv(EnabledEnv)) != "0"
+	return kittelemetry.PostHogTelemetryEnabledFromEnv(envPrefix)
 }
 
 func EventAllowed(event string) bool {
@@ -98,34 +102,65 @@ func SanitizeProperties(event string, properties map[string]any) (map[string]any
 }
 
 func NewReporter(opts Options) (*Reporter, error) {
-	if !enabledInBuild() || !EnabledFromEnv() || testing.Testing() {
+	if testing.Testing() {
+		return DisabledReporter(), nil
+	}
+	return newReporter(opts, time.Now())
+}
+
+// newReporter is NewReporter without the go test guard.
+func newReporter(opts Options, now time.Time) (*Reporter, error) {
+	if !enabledInBuild() || !EnabledFromEnv() {
 		return DisabledReporter(), nil
 	}
 	if opts.Database == nil {
 		return nil, errors.New("telemetry database is required")
 	}
 
-	distinctID, err := loadOrCreateInstallID(context.Background(), opts.Database)
+	distinctID, installedAt, err := loadOrCreateInstallID(context.Background(), opts.Database, now)
 	if err != nil {
 		return nil, err
 	}
 
-	disableGeoIP := true
-	client, err := posthog.NewWithConfig(postHogAPIKey, posthog.Config{
-		Endpoint:     postHogEndpoint,
-		DisableGeoIP: &disableGeoIP,
-	})
+	base := kittelemetry.PostHogOptions{
+		APIKey:      postHogAPIKey,
+		Endpoint:    postHogEndpoint,
+		Application: applicationSlug,
+		EnvPrefix:   envPrefix,
+		DistinctID:  distinctID,
+		Version:     opts.Version,
+		Commit:      opts.Commit,
+		InstalledAt: installedAt,
+	}
+	daemonOpts := base
+	daemonOpts.Source = "daemon"
+	daemon, err := newKitReporter(daemonOpts, kitAllowedEvents("daemon")...)
 	if err != nil {
 		return nil, err
 	}
+	backendOpts := base
+	backendOpts.Source = "backend"
+	backend, err := newKitReporter(backendOpts, kitAllowedEvents("backend")...)
+	if err != nil {
+		return nil, errors.Join(err, daemon.Close())
+	}
+	return &Reporter{daemon: daemon, backend: backend}, nil
+}
 
-	return &Reporter{
-		client:     client,
-		distinctID: distinctID,
-		enabled:    true,
-		version:    opts.Version,
-		commit:     opts.Commit,
-	}, nil
+// kitAllowedEvents builds kit's allowlist for one source from allowedEvents.
+func kitAllowedEvents(source string) []kittelemetry.PostHogOption {
+	var options []kittelemetry.PostHogOption
+	for event, properties := range allowedEvents {
+		if sourceForEvent(event) != source {
+			continue
+		}
+		allowed := make([]kittelemetry.AllowedTelemetryProperty, 0, len(properties))
+		for name, filter := range properties {
+			allowed = append(allowed, kittelemetry.AllowTelemetryProperty(name, kittelemetry.TelemetryPropertyFilter(filter)))
+		}
+		options = append(options, kittelemetry.WithAllowedEvent(event, allowed...))
+	}
+	return options
 }
 
 func DisabledReporter() *Reporter {
@@ -142,7 +177,10 @@ func NewReporterOrDisabled(opts Options) *Reporter {
 }
 
 func (r *Reporter) Enabled() bool {
-	return r != nil && r.enabled && r.client != nil
+	if r == nil {
+		return false
+	}
+	return (r.daemon != nil && r.daemon.Enabled()) || (r.backend != nil && r.backend.Enabled())
 }
 
 func (r *Reporter) Capture(event string, properties map[string]any) error {
@@ -154,33 +192,18 @@ func (r *Reporter) Capture(event string, properties map[string]any) error {
 	if event == "" {
 		return errors.New("telemetry event is required")
 	}
-
-	safeProperties, err := SanitizeProperties(event, properties)
-	if err != nil {
-		return err
+	if !EventAllowed(event) {
+		return ErrUnsupportedEvent
 	}
 
-	props := posthog.Properties{}
-	maps.Copy(props, safeProperties)
-	r.addDefaultProperties(event, props)
-
-	return r.client.Enqueue(posthog.Capture{
-		DistinctId: r.distinctID,
-		Event:      event,
-		Timestamp:  time.Now().UTC(),
-		Properties: props,
-	})
-}
-
-func (r *Reporter) addDefaultProperties(event string, props posthog.Properties) {
-	props["$process_person_profile"] = false
-	props["$geoip_disable"] = true
-	props["application"] = applicationSlug
-	props["version"] = r.version
-	props["commit"] = r.commit
-	props["goos"] = runtime.GOOS
-	props["goarch"] = runtime.GOARCH
-	props["source"] = sourceForEvent(event)
+	client := r.backend
+	if sourceForEvent(event) == "daemon" {
+		client = r.daemon
+	}
+	if client == nil {
+		return nil
+	}
+	return client.Capture(event, properties)
 }
 
 func sourceForEvent(event string) string {
@@ -191,10 +214,16 @@ func sourceForEvent(event string) string {
 }
 
 func (r *Reporter) Close() error {
-	if !r.Enabled() {
+	if r == nil {
 		return nil
 	}
-	return r.client.Close()
+	var err error
+	for _, client := range []kittelemetry.PostHogClient{r.daemon, r.backend} {
+		if client != nil {
+			err = errors.Join(err, client.Close())
+		}
+	}
+	return err
 }
 
 func safeTelemetryToken(value any) (any, bool) {
@@ -236,8 +265,36 @@ func safeTelemetryNumber(value any) (any, bool) {
 	}
 }
 
-func loadOrCreateInstallID(ctx context.Context, database *db.DB) (string, error) {
-	return database.GetOrCreateAppMetadataValue(ctx, installIDMetadataKey, randomInstallID)
+// loadOrCreateInstallID returns the install ID and when it was created. A zero
+// time means the age is unknown (the ID predates install-age tracking or the
+// stored time is unreadable), so events go untagged.
+func loadOrCreateInstallID(ctx context.Context, database *db.DB, now time.Time) (string, time.Time, error) {
+	_, found, err := database.AppMetadataValue(ctx, installIDMetadataKey)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	if !found {
+		// Write the creation time first so a crash between writes can't leave a new ID that looks old.
+		if _, err := database.GetOrCreateAppMetadataValue(ctx, installedAtKey, func() (string, error) {
+			return now.UTC().Format(time.RFC3339Nano), nil
+		}); err != nil {
+			return "", time.Time{}, err
+		}
+	}
+	id, err := database.GetOrCreateAppMetadataValue(ctx, installIDMetadataKey, randomInstallID)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	raw, found, err := database.AppMetadataValue(ctx, installedAtKey)
+	if err != nil || !found {
+		return id, time.Time{}, err
+	}
+	installedAt, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		slog.Warn("telemetry install age unavailable", "err", err)
+		return id, time.Time{}, nil
+	}
+	return id, installedAt, nil
 }
 
 func randomInstallID() (string, error) {
