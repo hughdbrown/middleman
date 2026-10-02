@@ -113,7 +113,13 @@ describe("ACPWorkspace elicitations", () => {
     expect((screen.getByLabelText(/Replicas/) as HTMLInputElement).value).toBe("2");
     expect((screen.getByLabelText(/Ratio/) as HTMLInputElement).value).toBe("");
     expect((screen.getByRole("checkbox", { name: /Verbose/ }) as HTMLInputElement).checked).toBe(true);
-    expect(screen.getByRole("combobox", { name: /Tier \(required\)/ })).toBeTruthy();
+    const tier = screen.getByRole("radiogroup", { name: /Tier/ });
+    expect(tier.getAttribute("aria-required")).toBe("true");
+    expect(
+      within(tier)
+        .getAllByRole("radio")
+        .map((radio) => (radio as HTMLInputElement).checked),
+    ).toEqual([false, false]);
     const tags = screen.getByRole("group", { name: /Tags/ });
     expect(
       within(tags)
@@ -154,8 +160,7 @@ describe("ACPWorkspace elicitations", () => {
 
     await fireEvent.input(screen.getByLabelText(/Project name/), { target: { value: "web" } });
     await fireEvent.input(screen.getByLabelText(/Replicas/), { target: { value: "3" } });
-    await fireEvent.click(screen.getByRole("combobox", { name: /Tier/ }));
-    await fireEvent.click(screen.getByRole("option", { name: "Pro" }));
+    await fireEvent.click(screen.getByRole("radio", { name: "Pro" }));
     await fireEvent.click(within(screen.getByRole("group", { name: /Tags/ })).getByRole("checkbox", { name: "gamma" }));
     await fireEvent.click(within(screen.getByRole("group", { name: /Tags/ })).getByRole("checkbox", { name: "alpha" }));
     await fireEvent.input(screen.getByLabelText(/Extra/), { target: { value: "anything" } });
@@ -171,46 +176,154 @@ describe("ACPWorkspace elicitations", () => {
     ]);
   });
 
-  it("keeps Submit disabled until required fields are filled and values are valid", async () => {
+  // The shape claude-agent-acp sends for an AskUserQuestion tool call: titled
+  // options with descriptions, an optional preview in _meta, and an optional
+  // free-text "Other" companion field.
+  const askForm = {
+    id: "elicit-ask",
+    message: "Which cache should the service use?",
+    schema: {
+      properties: {
+        question_0: {
+          type: "string",
+          title: "Cache",
+          oneOf: [
+            { const: "Redis", title: "Redis", description: "Shared across replicas; needs a new service." },
+            {
+              const: "In-process",
+              title: "In-process",
+              description: "No new dependency; each replica warms its own copy.",
+              _meta: { "_claude/askUserQuestionOption": { preview: "cache := lru.New(1024)" } },
+            },
+          ],
+        },
+        question_0_custom: {
+          type: "string",
+          title: "Other",
+          description: "Type your own answer, or add a note to the option you chose above (optional).",
+        },
+      },
+    },
+  };
+
+  it("reports every problem on submit instead of sending, then sends once fixed", async () => {
     await openChat({ elicitations: [deployForm] });
     const submit = screen.getByRole("button", { name: "Submit" }) as HTMLButtonElement;
-    expect(submit.disabled).toBe(true);
-
-    await fireEvent.input(screen.getByLabelText(/Project name/), { target: { value: "web" } });
-    expect(submit.disabled).toBe(true);
-    await fireEvent.click(screen.getByRole("combobox", { name: /Tier/ }));
-    await fireEvent.click(screen.getByRole("option", { name: "Free" }));
     expect(submit.disabled).toBe(false);
+    expect(screen.queryByText("Enter a value.")).toBeNull();
 
-    await fireEvent.input(screen.getByLabelText(/Replicas/), { target: { value: "2.5" } });
-    expect(submit.disabled).toBe(true);
-    expect(screen.getByText("Enter a whole number.")).toBeTruthy();
-    await fireEvent.input(screen.getByLabelText(/Replicas/), { target: { value: "0" } });
-    expect(submit.disabled).toBe(true);
-    await fireEvent.input(screen.getByLabelText(/Replicas/), { target: { value: "4" } });
-    expect(submit.disabled).toBe(false);
-
-    await fireEvent.input(screen.getByLabelText(/Contact/), { target: { value: "not-an-email" } });
-    expect(submit.disabled).toBe(true);
-    await fireEvent.input(screen.getByLabelText(/Contact/), { target: { value: "dev@example.com" } });
-    expect(submit.disabled).toBe(false);
-
-    await fireEvent.input(screen.getByLabelText(/Project name/), { target: { value: "w" } });
-    expect(submit.disabled).toBe(true);
     await fireEvent.click(submit);
     expect(sentCommands()).toEqual([]);
+    expect(screen.getByText("Enter a value.")).toBeTruthy();
+    expect(screen.getByText("Choose an answer.")).toBeTruthy();
+    expect(screen.getByRole("radiogroup", { name: /Tier/ }).getAttribute("aria-invalid")).toBe("true");
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText(/Project name/)));
+
+    await fireEvent.input(screen.getByLabelText(/Project name/), { target: { value: "web" } });
+    await fireEvent.click(screen.getByRole("radio", { name: "Free" }));
+    expect(screen.queryByText("Enter a value.")).toBeNull();
+    expect(screen.queryByText("Choose an answer.")).toBeNull();
+
+    await fireEvent.input(screen.getByLabelText(/Replicas/), { target: { value: "2.5" } });
+    expect(screen.getByText("Enter a whole number.")).toBeTruthy();
+    await fireEvent.input(screen.getByLabelText(/Contact/), { target: { value: "not-an-email" } });
+    await fireEvent.click(submit);
+    expect(sentCommands()).toEqual([]);
+
+    await fireEvent.input(screen.getByLabelText(/Replicas/), { target: { value: "4" } });
+    await fireEvent.input(screen.getByLabelText(/Contact/), { target: { value: "dev@example.com" } });
+    await fireEvent.click(submit);
+    expect(sentCommands()).toEqual([
+      {
+        type: "elicitation",
+        id: "elicit-1",
+        action: "accept",
+        content: { name: "web", replicas: 4, verbose: true, tier: "free", contact: "dev@example.com" },
+      },
+    ]);
   });
 
-  it("sends decline and cancel without content", async () => {
-    await openChat({ elicitations: [deployForm] });
+  it("sends one answer per request until a reconnect allows a resend", async () => {
+    await openChat({ elicitations: [askForm] });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Decline" }));
-    await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await fireEvent.click(screen.getByRole("radio", { name: /Redis/ }));
+    await fireEvent.click(screen.getByRole("button", { name: "Submit" }));
+    for (const name of ["Submit", "Decline", "Cancel"]) {
+      expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(true);
+    }
+    expect(sentCommands()).toHaveLength(1);
+
+    // The connection drops before the agent answers, then comes back with the
+    // request still pending: the user can send again.
+    socket.options!.onDisconnected?.();
+    await tick();
+    socket.options!.onOpen?.();
+    await push({ elicitations: [askForm] });
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Submit" }) as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
+  it("shows the schema's own title and description under the message", async () => {
+    await openChat({
+      elicitations: [
+        {
+          id: "elicit-schema",
+          message: "The deploy needs a target",
+          schema: {
+            title: "Deploy target",
+            description: "Staging resets nightly.",
+            properties: { env: { type: "string", enum: ["staging", "production"] } },
+          },
+        },
+      ],
+    });
+
+    expect(screen.getByText("Deploy target")).toBeTruthy();
+    expect(screen.getByText("Staging resets nightly.")).toBeTruthy();
+  });
+
+  it("shows each option's description and the chosen option's preview", async () => {
+    await openChat({ elicitations: [askForm] });
+
+    const cache = screen.getByRole("radiogroup", { name: /Cache/ });
+    expect(
+      within(cache)
+        .getAllByRole("radio")
+        .map((radio) => radio.closest("label")?.textContent?.trim()),
+    ).toEqual([
+      "Redis Shared across replicas; needs a new service.",
+      "In-process No new dependency; each replica warms its own copy.",
+    ]);
+    expect(screen.queryByLabelText("Cache preview")).toBeNull();
+
+    await fireEvent.click(screen.getByRole("radio", { name: /In-process/ }));
+    expect(screen.getByLabelText("Cache preview").textContent).toBe("cache := lru.New(1024)");
+    await fireEvent.click(screen.getByRole("radio", { name: /Redis/ }));
+    expect(screen.queryByLabelText("Cache preview")).toBeNull();
+  });
+
+  it("lets an optional choice be cleared so only the typed answer is sent", async () => {
+    await openChat({ elicitations: [askForm] });
+
+    expect(screen.queryByRole("button", { name: "Clear selection" })).toBeNull();
+    await fireEvent.click(screen.getByRole("radio", { name: /Redis/ }));
+    await fireEvent.click(screen.getByRole("button", { name: "Clear selection" }));
+    expect((screen.getByRole("radio", { name: /Redis/ }) as HTMLInputElement).checked).toBe(false);
+    await fireEvent.input(screen.getByLabelText(/Other/), { target: { value: "Memcached" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Submit" }));
 
     expect(sentCommands()).toEqual([
-      { type: "elicitation", id: "elicit-1", action: "decline" },
-      { type: "elicitation", id: "elicit-1", action: "cancel" },
+      { type: "elicitation", id: "elicit-ask", action: "accept", content: { question_0_custom: "Memcached" } },
     ]);
+  });
+
+  it.each(["Decline", "Cancel"])("sends %s without content", async (name) => {
+    await openChat({ elicitations: [deployForm] });
+
+    await fireEvent.click(screen.getByRole("button", { name }));
+
+    expect(sentCommands()).toEqual([{ type: "elicitation", id: "elicit-1", action: name.toLowerCase() }]);
   });
 
   it("disables every elicitation control while the chat is disabled", async () => {
