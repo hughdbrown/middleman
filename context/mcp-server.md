@@ -1,5 +1,18 @@
 # MCP Companion
 
+- Interactive components are agent-authored; Forge supplies generic rendering and
+  cached data primitives, not built-in dashboard layouts (`internal/mcpserver/apps.go`).
+- Keep the ACP app kind marker in text and structured output: real agent adapters
+  flatten resources and may discard text in favor of structured data.
+  (`internal/mcpserver/apps.go::AppDescriptorKind`)
+- The first-party ACP app descriptor selects a renderer, not an authority. It
+  does not establish third-party MCP server identity (`frontend/src/lib/components/acp/mcp-app.ts`).
+- Generated anchors must cross the same host-confirmed link path as `openLink`;
+  confirmation links explicitly open a new tab and retain native browser navigation
+  (`internal/mcpserver/app.html`, `frontend/src/lib/components/acp/McpApp.svelte`).
+- Generated apps reread cached evidence and cannot perform mutations; freshness
+  and cached mergeability never certify permission to merge (`internal/mcpserver/apps.go::CallAppTool`).
+
 - Event excerpts must disclose whether more cached events exist so agents can
   decide whether to request more context; never silently truncate the list
   (`internal/mcpserver/tools_items.go::getItemContextOutput`).
