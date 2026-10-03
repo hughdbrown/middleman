@@ -208,6 +208,66 @@ describe("ACPWorkspace image output (browser)", () => {
   });
 });
 
+describe("ACPWorkspace grouped activity (browser)", () => {
+  it("expands interleaved thoughts with the keyboard in a narrow pane", async () => {
+    await page.viewport(420, 720);
+    const { host } = await renderChat(420);
+    socket.options!.onMessage(
+      JSON.stringify({
+        messages: [
+          { role: "tool", text: "Read options", status: "completed", toolCallId: "read" },
+          { role: "thought", text: "Compare the available options." },
+          { role: "tool", text: "Check result", status: "failed", toolCallId: "check" },
+          { role: "assistant", text: "Here is the result." },
+        ],
+        messageOffset: 0,
+        messageCount: 4,
+        configOptions: [],
+        configuring: false,
+        permissions: [],
+        busy: false,
+        connected: true,
+        error: "",
+      }),
+    );
+    const group = page.getByRole("button", { name: "2 tools · 1 thought · 1 failed" });
+    await expect.element(group).toHaveAttribute("aria-expanded", "false");
+    await expect.element(page.getByText("Compare the available options.")).not.toBeInTheDocument();
+    (group.element() as HTMLButtonElement).focus();
+    await userEvent.keyboard("{Enter}");
+    const thought = page.getByRole("button", { name: "Thinking" });
+    await expect.element(thought).toBeVisible();
+    const thoughtCopy = page
+      .getByRole("article", { name: "Assistant thinking", exact: true })
+      .getByRole("button", { name: "Copy message" });
+    await expect.element(thought).toHaveAttribute("aria-expanded", "false");
+    await expect.element(thoughtCopy).not.toBeInTheDocument();
+    (thought.element() as HTMLButtonElement).focus();
+    await userEvent.keyboard("{Enter}");
+    const thoughtText = page.getByText("Compare the available options.");
+    await expect.element(thoughtText).toBeVisible();
+    await expect.element(thoughtCopy).toBeVisible();
+    const toolFontSize = getComputedStyle(page.getByText("Read options").element()).fontSize;
+    expect(getComputedStyle(thoughtText.element()).fontSize).toBe(toolFontSize);
+    expect(getComputedStyle(thought.element()).fontSize).toBe(toolFontSize);
+    expect(getComputedStyle(group.element()).fontSize).toBe(toolFontSize);
+    const copyBounds = thoughtCopy.element().getBoundingClientRect();
+    const textBounds = thoughtText.element().getBoundingClientRect();
+    expect(copyBounds.right).toBeLessThanOrEqual(textBounds.left);
+    expect(copyBounds.top).toBeLessThan(textBounds.bottom);
+    expect(copyBounds.bottom).toBeGreaterThan(textBounds.top);
+    await thought.click();
+    await expect.element(thoughtCopy).not.toBeInTheDocument();
+    const conversation = host.querySelector<HTMLElement>(".conversation")!;
+    expect(conversation.scrollWidth).toBeLessThanOrEqual(conversation.clientWidth);
+    await group.click();
+    await expect.element(page.getByText("Compare the available options.")).not.toBeInTheDocument();
+    await expect
+      .element(page.getByRole("article", { name: "Assistant", exact: true }).getByText("Here is the result."))
+      .toBeVisible();
+  });
+});
+
 describe("ACPWorkspace transcript paging (browser)", () => {
   const message = (index: number) => ({
     role: index % 2 ? "assistant" : "user",

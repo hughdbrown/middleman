@@ -53,10 +53,7 @@
   const user = $derived(message.role === "user")
   const thought = $derived(message.role === "thought")
   const id = $props.id()
-  // Reasoning stays open while it is the live tail of a busy turn and folds
-  // away once anything follows it, unless the user chose otherwise.
-  let thoughtChoice = $state<boolean | null>(null)
-  const thoughtOpen = $derived(thoughtChoice ?? streaming)
+  let thoughtOpen = $state(false)
   let copied = $state(false)
   let copyError = $state("")
   let resetCopy: ReturnType<typeof setTimeout> | undefined
@@ -87,6 +84,18 @@
   {#if message.content}<ChatContentBlock content={message.content} />{/if}
 {/snippet}
 
+{#snippet copyAction()}
+  <CopyButton
+    {copied}
+    onclick={() => copy()}
+    ariaLabel="Copy message"
+    copiedAriaLabel="Copy message"
+    title="Copy message"
+  />
+  <span class="kit-sr-only" role="status">{copied ? "Copied" : ""}</span>
+  {#if copyError}<span class="copy-error" role="alert">{copyError}</span>{/if}
+{/snippet}
+
 <article
   class:user
   aria-label={user ? "You" : thought ? "Assistant thinking" : "Assistant"}
@@ -104,7 +113,7 @@
           class="thought-toggle"
           aria-expanded={thoughtOpen}
           aria-controls={`${id}-thought`}
-          onclick={() => (thoughtChoice = !thoughtOpen)}
+          onclick={() => (thoughtOpen = !thoughtOpen)}
         >
           <Brain size={13} aria-hidden="true" />Thinking<ChevronDown
             size={12}
@@ -113,8 +122,11 @@
           />
         </button>
         {#if thoughtOpen}
-          <div class="message-body thought-body" id={`${id}-thought`}>
-            {@render body()}
+          <div class="thought-body" id={`${id}-thought`}>
+            {#if !streaming && message.text}
+              <div class="thought-copy">{@render copyAction()}</div>
+            {/if}
+            <div class="message-body">{@render body()}</div>
           </div>
         {/if}
       </div>
@@ -124,7 +136,7 @@
     <!-- Time and copy. Wide panes reveal them on hover or focus in a gutter
          left of the cell, laid over reserved space so nothing reflows; panes
          too narrow for the gutter show them as a quiet line below the message. -->
-    {#if timestamp || (!streaming && message.text) || copyError}
+    {#if timestamp || (!thought && ((!streaming && message.text) || copyError))}
     <div class="gutter" class:pinned={!!copyError || copied}>
     {#if timestamp}
       <time datetime={message.createdAt} title={timestamp.toLocaleString()}
@@ -134,17 +146,7 @@
         })}</time
       >
     {/if}
-    {#if !streaming && message.text}
-      <CopyButton
-        {copied}
-        onclick={() => copy()}
-        ariaLabel="Copy message"
-        copiedAriaLabel="Copy message"
-        title="Copy message"
-      />
-    {/if}
-    <span class="kit-sr-only" role="status">{copied ? "Copied" : ""}</span>
-    {#if copyError}<span class="copy-error" role="alert">{copyError}</span>{/if}
+    {#if !thought && !streaming && message.text}{@render copyAction()}{/if}
     </div>
     {/if}
   </div>
@@ -217,10 +219,16 @@
     transform: rotate(180deg);
   }
   .thought-body {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
     margin-top: var(--space-2);
     padding-left: var(--space-5);
     color: var(--text-secondary);
-    font-size: var(--font-size-sm);
+    font-size: var(--font-size-xs);
+  }
+  .thought-copy {
+    flex: 0 0 auto;
   }
   .message-body :global(.markdown > :first-child) {
     margin-top: 0;
@@ -280,6 +288,10 @@
     word-break: normal;
     font-size: var(--font-size-sm);
   }
+  .thought-body :global(.kit-markdown),
+  .thought-body :global(.kit-markdown :is(h1, h2, h3, h4, h5, h6, pre, code, table)) {
+    font-size: var(--font-size-xs);
+  }
   .message-body :global(.markdown th) {
     white-space: nowrap;
   }
@@ -293,7 +305,8 @@
     .thought-toggle {
       min-height: var(--mobile-chrome-hit-target);
     }
-    .gutter :global(button) {
+    .gutter :global(button),
+    .thought-copy :global(button) {
       min-width: var(--mobile-chrome-hit-target);
       min-height: var(--mobile-chrome-hit-target);
     }
