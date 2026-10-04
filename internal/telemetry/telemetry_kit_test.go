@@ -9,11 +9,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/testutil/dbtest"
-	kittelemetry "go.kenn.io/kit/telemetry"
+	"go.kenn.io/kit/telemetry/posthog"
 )
 
 // swapKitReporter replaces newKitReporter for the test and restores it after.
-func swapKitReporter(t *testing.T, factory func(kittelemetry.PostHogOptions, ...kittelemetry.PostHogOption) (kittelemetry.PostHogClient, error)) {
+func swapKitReporter(t *testing.T, factory func(posthog.Options, ...posthog.Option) (posthog.Client, error)) {
 	t.Helper()
 	original := newKitReporter
 	newKitReporter = factory
@@ -26,8 +26,8 @@ func TestNewReporterHandsKitTheStoredInstallIdentity(t *testing.T) {
 
 	t.Setenv(EnabledEnv, "1")
 	t.Setenv("KENN_FORGE_TELEMETRY_ENABLED", "1")
-	var built []kittelemetry.PostHogOptions
-	swapKitReporter(t, func(opts kittelemetry.PostHogOptions, _ ...kittelemetry.PostHogOption) (kittelemetry.PostHogClient, error) {
+	var built []posthog.Options
+	swapKitReporter(t, func(opts posthog.Options, _ ...posthog.Option) (posthog.Client, error) {
 		built = append(built, opts)
 		return &fakeKitClient{}, nil
 	})
@@ -64,4 +64,30 @@ func TestNewReporterDisabledByEnvDoesNotCreateInstallID(t *testing.T) {
 		require.NoError(err)
 		assert.False(found, key)
 	}
+}
+
+func TestKitAllowlistFiltersUIProperties(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	t.Setenv(EnabledEnv, "0")
+	backend, err := posthog.NewReporter(posthog.Options{}, kitAllowedEvents("backend")...)
+	require.NoError(err)
+
+	assert.False(backend.EventAllowed("daemon_active"))
+	properties, err := backend.SanitizeProperties("app_opened", map[string]any{
+		"surface":                 "web",
+		"distinct_id":             "spoofed",
+		"$geoip_disable":          false,
+		"$process_person_profile": true,
+	})
+	require.NoError(err)
+	assert.Equal("web", properties["surface"])
+	assert.NotContains(properties, "distinct_id")
+	assert.Equal(true, properties["$geoip_disable"])
+	assert.Equal(false, properties["$process_person_profile"])
+
+	properties, err = backend.SanitizeProperties("app_opened", map[string]any{"surface": "owner/repo"})
+	require.NoError(err)
+	assert.NotContains(properties, "surface")
 }
