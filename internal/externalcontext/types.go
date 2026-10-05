@@ -57,9 +57,16 @@ func (*ExternalContextCard) TransformSchema(_ huma.Registry, schema *huma.Schema
 }
 
 type ExternalContextAction struct {
-	ID             string `json:"id"`
-	Label          string `json:"label"`
-	DisabledReason string `json:"disabled_reason,omitempty"`
+	ID             string                      `json:"id"`
+	Label          string                      `json:"label"`
+	DisabledReason string                      `json:"disabled_reason,omitempty"`
+	Input          *ExternalContextActionInput `json:"input,omitzero"`
+}
+
+// ExternalContextActionInput asks the user for text before submitting the action.
+type ExternalContextActionInput struct {
+	Placeholder string `json:"placeholder,omitempty"`
+	MaxLength   int    `json:"max_length,omitzero" minimum:"1" maximum:"16384"`
 }
 
 var (

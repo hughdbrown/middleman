@@ -126,40 +126,63 @@ func TestReadProtocolCacheAndAction(t *testing.T) {
 	require.Len(t, files, 1)
 	payload, err := os.ReadFile(filepath.Join(dir, files[0].Name()))
 	require.NoError(t, err)
-	assert.JSONEq(`{"version":1,"operation":"read","pull_request":{"provider":"gitlab","platform_host":"git.example.test","platform_repo_id":123,"repo_path":"group/subgroup/project","number":42,"url":"https://git.example.test/group/subgroup/project/-/merge_requests/42","state":"open","head_sha":"head-one","base_sha":"base-one"}}`, string(payload))
+	pullJSON := `{"provider":"gitlab","platform_host":"git.example.test","platform_repo_id":123,"repo_path":"group/subgroup/project","number":42,"url":"https://git.example.test/group/subgroup/project/-/merge_requests/42","state":"open","head_sha":"head-one","base_sha":"base-one"}`
+	assert.JSONEq(`{"version":1,"operation":"read","pull_request":`+pullJSON+`}`, string(payload))
 	_, err = runner.Read(t.Context(), "metrics", pull, false)
 	require.NoError(t, err)
 	assert.Len(invocations(t, dir), 1)
 	_, err = runner.Read(t.Context(), "metrics", pull, true)
 	require.NoError(t, err)
 	assert.Len(invocations(t, dir), 2)
-	result, err = runner.Action(t.Context(), "metrics", pull, "run")
+	result, err = runner.Action(t.Context(), "metrics", pull, "run", "")
 	require.NoError(t, err)
 	assert.Equal("action:head-one:run", result.Card.Summary)
 	assert.Len(invocations(t, dir), 3)
 	_, err = runner.Read(t.Context(), "metrics", pull, false)
 	require.NoError(t, err)
 	assert.Len(invocations(t, dir), 4)
+	result, err = runner.Action(t.Context(), "metrics", pull, "note", "Ship it\nafter review")
+	require.NoError(t, err)
+	assert.Equal("action:head-one:note", result.Card.Summary)
+	actions := map[string]string{}
+	for _, file := range invocations(t, dir) {
+		if strings.Contains(file.Name(), "-action-") {
+			payload, err := os.ReadFile(filepath.Join(dir, file.Name()))
+			require.NoError(t, err)
+			var request struct {
+				ActionID string `json:"action_id"`
+			}
+			require.NoError(t, json.Unmarshal(payload, &request))
+			actions[request.ActionID] = string(payload)
+		}
+	}
+	assert.JSONEq(`{"version":1,"operation":"action","pull_request":`+pullJSON+`,"action_id":"run"}`, actions["run"])
+	assert.JSONEq(`{"version":1,"operation":"action","pull_request":`+pullJSON+`,"action_id":"note","input":"Ship it\nafter review"}`, actions["note"])
 }
 
 func TestReadValidationAndFailureCache(t *testing.T) {
 	for _, tt := range []struct {
 		name, mode, output string
 		want               error
+		actions            []ExternalContextAction
 	}{
-		{"no card", "raw", `{"card":null}`, nil},
-		{"missing card", "raw", `{}`, ErrInvalidResponse},
-		{"trailing json", "raw", `{"card":null}{}`, ErrInvalidResponse},
-		{"malformed", "raw", `private output`, ErrInvalidResponse},
-		{"status", "raw", `{"card":{"status":"other","summary":"hello"}}`, ErrInvalidResponse},
-		{"summary", "raw", `{"card":{"status":"success","summary":" "}}`, ErrInvalidResponse},
-		{"summary limit", "raw", `{"card":{"status":"success","summary":"` + strings.Repeat("x", 4097) + `"}}`, ErrInvalidResponse},
-		{"duplicate action", "raw", `{"card":{"status":"success","summary":"hello","actions":[{"id":"run","label":"Run"},{"id":"run","label":"Again"}]}}`, ErrInvalidResponse},
-		{"stdout limit", "stdout", "", ErrOutputLimit},
-		{"stderr limit", "stderr", "", ErrOutputLimit},
-		{"exit", "exit", "", ErrInvocation},
-		{"deadline", "timeout", "", ErrTimeout},
-		{"inherited pipes", "inherited-pipes", "", ErrInvocation},
+		{"no card", "raw", `{"card":null}`, nil, nil},
+		{"missing card", "raw", `{}`, ErrInvalidResponse, nil},
+		{"trailing json", "raw", `{"card":null}{}`, ErrInvalidResponse, nil},
+		{"malformed", "raw", `private output`, ErrInvalidResponse, nil},
+		{"status", "raw", `{"card":{"status":"other","summary":"hello"}}`, ErrInvalidResponse, nil},
+		{"summary", "raw", `{"card":{"status":"success","summary":" "}}`, ErrInvalidResponse, nil},
+		{"summary limit", "raw", `{"card":{"status":"success","summary":"` + strings.Repeat("x", 4097) + `"}}`, ErrInvalidResponse, nil},
+		{"action input", "raw", `{"card":{"status":"success","summary":"hello","actions":[{"id":"note","label":"Add note","input":{"placeholder":"Leave a note"}}]}}`, nil, []ExternalContextAction{{ID: "note", Label: "Add note", Input: &ExternalContextActionInput{Placeholder: "Leave a note"}}}},
+		{"action input max length", "raw", `{"card":{"status":"success","summary":"hello","actions":[{"id":"note","label":"Add note","input":{"max_length":2000}}]}}`, nil, []ExternalContextAction{{ID: "note", Label: "Add note", Input: &ExternalContextActionInput{MaxLength: 2000}}}},
+		{"action input max length range", "raw", `{"card":{"status":"success","summary":"hello","actions":[{"id":"note","label":"Add note","input":{"max_length":16385}}]}}`, ErrInvalidResponse, nil},
+		{"action input placeholder limit", "raw", `{"card":{"status":"success","summary":"hello","actions":[{"id":"note","label":"Add note","input":{"placeholder":"` + strings.Repeat("x", 257) + `"}}]}}`, ErrInvalidResponse, nil},
+		{"duplicate action", "raw", `{"card":{"status":"success","summary":"hello","actions":[{"id":"run","label":"Run"},{"id":"run","label":"Again"}]}}`, ErrInvalidResponse, nil},
+		{"stdout limit", "stdout", "", ErrOutputLimit, nil},
+		{"stderr limit", "stderr", "", ErrOutputLimit, nil},
+		{"exit", "exit", "", ErrInvocation, nil},
+		{"deadline", "timeout", "", ErrTimeout, nil},
+		{"inherited pipes", "inherited-pipes", "", ErrInvocation, nil},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			assert := assert.New(t)
@@ -172,7 +195,12 @@ func TestReadValidationAndFailureCache(t *testing.T) {
 			for range 2 {
 				result, err := runner.Read(t.Context(), "metrics", fixturePull(), false)
 				require.ErrorIs(t, err, tt.want)
-				assert.Nil(result.Card)
+				if tt.actions == nil {
+					assert.Nil(result.Card)
+				} else {
+					require.NotNil(t, result.Card)
+					assert.Equal(tt.actions, result.Card.Actions)
+				}
 				if err != nil {
 					assert.NotContains(err.Error(), "private")
 				}
@@ -211,7 +239,7 @@ func TestInvalidationDiscardsInflightRead(t *testing.T) {
 			go func() { _, _ = runner.Read(t.Context(), "metrics", fixturePull(), false); close(readDone) }()
 			require.Eventually(t, func() bool { return len(invocations(t, dir)) == 1 }, 3*time.Second, time.Millisecond)
 			if action {
-				_, err := runner.Action(t.Context(), "metrics", fixturePull(), "run")
+				_, err := runner.Action(t.Context(), "metrics", fixturePull(), "run", "")
 				require.NoError(t, err)
 			} else {
 				runner.Update([]config.ExternalContextSource{source})
@@ -233,7 +261,7 @@ func TestActionsAreNotRetriedAndReportUncertainSubmission(t *testing.T) {
 	source, dir := fixtureSource(t, "exit")
 	runner := New([]config.ExternalContextSource{source})
 	t.Cleanup(runner.Close)
-	_, err := runner.Action(t.Context(), "metrics", fixturePull(), "run")
+	_, err := runner.Action(t.Context(), "metrics", fixturePull(), "run", "")
 	require.ErrorIs(t, err, ErrInvocation)
 	assert.Contains(t, err.Error(), "The action may have been submitted. Refresh to check its status.")
 	assert.NotContains(t, err.Error(), "private diagnostic")
@@ -256,7 +284,7 @@ func TestProcessLimitIncludesActionsAndQueuedDeadline(t *testing.T) {
 		}()
 	}
 	require.Eventually(t, func() bool { return len(invocations(t, dir)) == 2 }, 3*time.Second, time.Millisecond)
-	_, err := runner.Action(t.Context(), "queued", fixturePull(), "run")
+	_, err := runner.Action(t.Context(), "queued", fixturePull(), "run", "")
 	require.ErrorIs(t, err, ErrTimeout)
 	assert.Empty(t, invocations(t, queuedDir))
 	assert.NotContains(t, err.Error(), "may have been submitted")
@@ -347,7 +375,7 @@ func TestActionCompletionInvalidatesReadsOnSuccessAndFailure(t *testing.T) {
 			require.NoError(t, err)
 			actionDone := make(chan error, 1)
 			go func() {
-				_, err := runner.Action(t.Context(), "metrics", fixturePull(), "run")
+				_, err := runner.Action(t.Context(), "metrics", fixturePull(), "run", "")
 				actionDone <- err
 			}()
 			require.Eventually(t, func() bool { return len(invocations(t, dir)) == 2 }, 3*time.Second, time.Millisecond)

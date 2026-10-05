@@ -38,8 +38,10 @@ valid response. Bound stdout to 1 MiB and stderr to 64 KiB; errors returned to
 the browser exclude raw command output (`internal/externalcontext/runner.go`).
 
 Requests contain `version: 1`, `operation` (`read` or `action`), and
-`pull_request`. Actions also contain `action_id`. Adapters reject unsupported
-versions. The PR object contains `provider`, `platform_host`,
+`pull_request`. Actions also contain `action_id`, plus an `input` string only
+when the user submits text for an action that declared `input`. Adapters reject
+unsupported versions, input for actions that do not declare it, and missing
+input for actions that do. The PR object contains `provider`, `platform_host`,
 `platform_repo_id`, `repo_path`, `number`, `url`, `state` (`open`, `merged`,
 `closed`), `head_sha`, and `base_sha`, plus `bitbucket_repository_uuid` for
 Bitbucket Cloud, whose `platform_repo_id` is 0. All metadata is last-synced;
@@ -59,8 +61,11 @@ Responses contain `card`, with null meaning not applicable. A card has
 `status` (`neutral`, `pending`, `success`, `warning`, `error`) and `summary`.
 Optional fields are `markdown`, `result_head_sha`, `actions`, and
 `refresh_after_seconds`. Each action has `id`, `label`, and optional
-`disabled_reason`. Action responses use the same envelope. Preserve the
-nullable card in generated schemas and clients
+`disabled_reason` and `input`. An `input` object, with optional `placeholder`,
+makes the card collect nonblank text before submitting; drafts survive PR
+navigation and head changes and clear only after the action succeeds. Action
+responses use the same envelope. Preserve the nullable card in generated
+schemas and clients
 (`internal/externalcontext/types.go::ExternalContextCard.TransformSchema`).
 
 Pending reads without a card must stay out of the PR layout; a source returning
@@ -71,7 +76,14 @@ null must never flash a loading card. Keep existing cards visible during refresh
 
 Summaries allow 4096 bytes, Markdown 512 KiB, and up to 32 actions. Action IDs
 must be unique and nonblank (128 bytes maximum); labels allow 256 bytes and
-disabled reasons 4096 bytes (`internal/externalcontext/runner.go::decodeResult`).
+disabled reasons 4096 bytes, input placeholders 256 bytes, and an input's
+optional `max_length` up to 16384 characters, where omitted or zero means 16384
+(`internal/externalcontext/runner.go::decodeResult`). Submitted input allows
+16384 characters (`internal/server/external_context.go::externalContextActionRequest`).
+The card applies `max_length` to its text box only; the adapter still enforces
+its own limit. Browsers count `max_length` in UTF-16 code units and may cut a
+paste to fit, showing the cut text before submit, so adapters should accept at
+least that many characters.
 
 Poll only mounted, visible cards; requested intervals are at least five
 seconds. Manual Refresh bypasses completed cached results and shares an

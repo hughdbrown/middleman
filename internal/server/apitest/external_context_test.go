@@ -35,6 +35,7 @@ func TestExternalContextAdapterProcess(t *testing.T) { //nolint:paralleltest // 
 		Version     int            `json:"version"`
 		Operation   string         `json:"operation"`
 		ActionID    string         `json:"action_id"`
+		Input       string         `json:"input,omitempty"`
 		PullRequest map[string]any `json:"pull_request"`
 	}
 	if err := json.UnmarshalRead(os.Stdin, &request); err != nil {
@@ -57,7 +58,7 @@ func TestExternalContextAdapterProcess(t *testing.T) { //nolint:paralleltest // 
 	if err := json.MarshalWrite(os.Stdout, map[string]any{"card": map[string]any{
 		"status": "success", "summary": request.Operation,
 		"markdown": string(data), "result_head_sha": request.PullRequest["head_sha"],
-		"actions": []map[string]string{{"id": "request-run", "label": "Run check"}},
+		"actions": []map[string]any{{"id": "request-run", "label": "Run check"}, {"id": "comment", "label": "Comment", "input": map[string]any{}}},
 	}}); err != nil {
 		os.Exit(2)
 	}
@@ -105,6 +106,7 @@ command = [%q, "-test.run=^TestExternalContextAdapterProcess$", "--", "--context
 	require.NotNil(read.JSON200)
 	require.NotNil(read.JSON200.Card)
 	require.NotNil(read.JSON200.Card.Markdown)
+	assert.Contains(string(read.Body), `"id":"comment","label":"Comment","input":{}`, "an empty input object still marks the action")
 	assert.JSONEq(fmt.Sprintf(`{"version":1,"operation":"read","action_id":"","pull_request":{"provider":"github","platform_host":"github.com","platform_repo_id":%d,"repo_path":"acme/widget","number":1,"url":"https://github.com/acme/widget/pull/1","state":"open","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","base_sha":""}}`, widgetID), *read.JSON200.Card.Markdown)
 	for _, body := range []generated.ExternalContextActionRequest{
 		{PlatformRepoID: &widgetID, HeadSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
@@ -117,17 +119,24 @@ command = [%q, "-test.run=^TestExternalContextAdapterProcess$", "--", "--context
 		assert.Equal(http.StatusConflict, response.StatusCode)
 	}
 	action, err := client.HTTP.RunPullExternalContextActionWithResponse(t.Context(), &generated.RunPullExternalContextActionRequestOptions{
-		PathParams: &generated.RunPullExternalContextActionPath{Provider: "github", Owner: "acme", Name: "widget", Number: 1, SourceID: "checks", ActionID: "request-run"},
-		Body:       &generated.ExternalContextActionRequest{PlatformRepoID: &widgetID, HeadSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		PathParams: &generated.RunPullExternalContextActionPath{Provider: "github", Owner: "acme", Name: "widget", Number: 1, SourceID: "checks", ActionID: "comment"},
+		Body:       &generated.ExternalContextActionRequest{PlatformRepoID: &widgetID, HeadSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Input: new("Looks good")},
 	})
 	require.NoError(err)
 	require.Equal(http.StatusOK, action.StatusCode)
+	oversized, err := client.HTTP.RunPullExternalContextActionWithResponse(t.Context(), &generated.RunPullExternalContextActionRequestOptions{
+		PathParams: &generated.RunPullExternalContextActionPath{Provider: "github", Owner: "acme", Name: "widget", Number: 1, SourceID: "checks", ActionID: "comment"},
+		Body:       &generated.ExternalContextActionRequest{PlatformRepoID: &widgetID, HeadSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Input: new(strings.Repeat("x", 16385))},
+	})
+	require.Error(err)
+	assert.Equal(http.StatusUnprocessableEntity, oversized.StatusCode)
 	invocations, err := os.ReadFile(logPath)
 	require.NoError(err)
 	lines := strings.Split(strings.TrimSpace(string(invocations)), "\n")
 	require.Len(lines, 2, "rejected actions do not execute; accepted action has no pre-read")
 	assert.Contains(lines[1], `"operation":"action"`)
-	assert.Contains(lines[1], `"action_id":"request-run"`)
+	assert.Contains(lines[1], `"action_id":"comment"`)
+	assert.Contains(lines[1], `"input":"Looks good"`)
 	assert.Contains(lines[1], `"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`)
 
 	{

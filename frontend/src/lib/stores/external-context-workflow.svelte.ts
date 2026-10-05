@@ -1,6 +1,8 @@
 import { Context, Effect, Layer } from "effect";
+import { SvelteMap } from "svelte/reactivity";
 import { ApiProblemError, type TransientTransportError } from "../api/effect-errors.js";
 import { GeneratedApi } from "../api/generated-api.js";
+import { getCommentDraftKey } from "../components/detail/comment-drafts.svelte.js";
 import type { ExternalContextCard } from "../api/generated/models/externalContextCard.js";
 import type { ExternalContextSourceInfo } from "../api/generated/models/externalContextSourceInfo.js";
 import {
@@ -57,8 +59,15 @@ export interface ExternalContextWorkflowService {
   readonly invalidate: Effect.Effect<void>;
   readonly sources: Effect.Effect<ExternalContextSourceInfo[], ExternalContextError>;
   readonly state: (pull: ExternalContextPull, sourceId: string) => ExternalContextState;
+  readonly draft: (pull: ExternalContextPull, sourceId: string, actionId: string) => string;
+  readonly setDraft: (pull: ExternalContextPull, sourceId: string, actionId: string, text: string) => void;
   readonly read: (pull: ExternalContextPull, sourceId: string, refresh?: boolean) => Effect.Effect<void>;
-  readonly action: (pull: ExternalContextPull, sourceId: string, actionId: string) => Effect.Effect<void>;
+  readonly action: (
+    pull: ExternalContextPull,
+    sourceId: string,
+    actionId: string,
+    input?: string,
+  ) => Effect.Effect<void>;
 }
 
 export class ExternalContextWorkflow extends Context.Service<ExternalContextWorkflow, ExternalContextWorkflowService>()(
@@ -69,6 +78,19 @@ export const ExternalContextWorkflowLive = Layer.effect(ExternalContextWorkflow)
   Effect.gen(function* () {
     const api = yield* GeneratedApi;
     const entries = new Map<string, ExternalContextState>();
+    // Drafts outlive head changes, so they key on the PR without its head SHA.
+    const drafts = new SvelteMap<string, string>();
+    const draftKey = (pull: ExternalContextPull, sourceId: string, actionId: string) =>
+      JSON.stringify([
+        getCommentDraftKey("pull", {
+          ...pull.ref,
+          platformHost: pull.ref.platformHost ?? "",
+          repositoryKey: pull.repositoryKey,
+          number: pull.number,
+        }),
+        sourceId,
+        actionId,
+      ]);
     let revision = $state(0);
 
     function state(pull: ExternalContextPull, sourceId: string): ExternalContextState {
@@ -131,6 +153,7 @@ export const ExternalContextWorkflowLive = Layer.effect(ExternalContextWorkflow)
       pull: ExternalContextPull,
       sourceId: string,
       actionId: string,
+      input?: string,
     ) {
       const entry = state(pull, sourceId);
       if (entry.pendingAction !== null || entry.needsRefresh || !pull.headSha) return;
@@ -138,7 +161,11 @@ export const ExternalContextWorkflowLive = Layer.effect(ExternalContextWorkflow)
       entry.loading = false;
       entry.pendingAction = actionId;
       entry.error = null;
-      const body = { ...repositoryKeyToWire(pull.repositoryKey), head_sha: pull.headSha };
+      const body = {
+        ...repositoryKeyToWire(pull.repositoryKey),
+        head_sha: pull.headSha,
+        ...(input === undefined ? {} : { input }),
+      };
       yield* api
         .execute("run external context action", (signal) =>
           providerUsesHostRoute(pull.ref)
@@ -156,6 +183,9 @@ export const ExternalContextWorkflowLive = Layer.effect(ExternalContextWorkflow)
         .pipe(
           Effect.tap((result) =>
             Effect.sync(() => {
+              // A newer edit made while this submission was pending stays.
+              const key = draftKey(pull, sourceId, actionId);
+              if (drafts.get(key) === input) drafts.delete(key);
               if (entry.generation === generation) entry.card = result.card ?? null;
             }),
           ),
@@ -192,6 +222,10 @@ export const ExternalContextWorkflowLive = Layer.effect(ExternalContextWorkflow)
         )
         .pipe(Effect.map((result) => result.sources ?? [])),
       state,
+      draft: (pull, sourceId, actionId) => drafts.get(draftKey(pull, sourceId, actionId)) ?? "",
+      setDraft: (pull, sourceId, actionId, text) => {
+        drafts.set(draftKey(pull, sourceId, actionId), text);
+      },
       read,
       action,
     };
