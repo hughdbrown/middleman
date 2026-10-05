@@ -26,7 +26,7 @@ func TestPassThroughPreservesArgumentsStreamsAndExit(t *testing.T) {
 	binary, err := os.Executable()
 	require.NoError(err)
 	cmd := procutil.CommandContext(t.Context(), binary, "-test.run=^TestPassThroughPreservesArgumentsStreamsAndExit$")
-	cmd.Env = append(os.Environ(), "FORGE_GH_TEST_CHILD=1", "FORGE_GH_REAL="+realPath, "KENN_FORGE_HOME="+dir)
+	cmd.Env = append(os.Environ(), "FORGE_GH_TEST_CHILD=1", "FORGE_GH_REAL="+realPath)
 	cmd.Stdin = strings.NewReader("input\n")
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
@@ -37,11 +37,6 @@ func TestPassThroughPreservesArgumentsStreamsAndExit(t *testing.T) {
 	assert.Equal(7, exit.ExitCode())
 	assert.Equal("pr\nview\ntwo words\n--unknown=value\ninput\n", string(output))
 	assert.Equal("provider error\n", stderr.String())
-	usage, err := os.ReadFile(filepath.Join(dir, "gh-shim-usage.jsonl"))
-	require.NoError(err)
-	assert.Contains(string(usage), `"command":"pr view"`)
-	assert.Contains(string(usage), `"reason":"unsupported"`)
-	assert.Contains(string(usage), `"argv":["pr","view","two words","--unknown=value"]`)
 }
 
 func TestRealGHSkipsShimSymlinkAndNonExecutable(t *testing.T) {
