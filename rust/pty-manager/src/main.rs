@@ -255,7 +255,7 @@ fn run_owner(args: Args) -> Result<()> {
     strip_secret_env(&mut cmd);
 
     let mut child = pair.slave.spawn_command(cmd).context("spawn pty command")?;
-    let killer = child.clone_killer();
+    let killer = owner_killer(child.as_ref());
     cleanup.set_killer(killer.clone_killer());
     let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
     let writer = Arc::new(Mutex::new(
@@ -808,6 +808,75 @@ fn take_subscribers_if_complete(shared: &mut Shared) -> Vec<Subscriber> {
     } else {
         Vec::new()
     }
+}
+
+// portable-pty's cloned killer only sends SIGHUP to the child PID, which a
+// shell can ignore and which never reaches its background jobs. The child is
+// a session leader (portable-pty calls setsid), so its PID is also its
+// process group; SIGKILL the whole group like the Go owner does.
+#[cfg(unix)]
+fn owner_killer(
+    child: &(dyn portable_pty::Child + Send + Sync),
+) -> Box<dyn ChildKiller + Send + Sync> {
+    match child.process_id() {
+        Some(pid) => Box::new(ProcessGroupKiller { pid }),
+        None => child.clone_killer(),
+    }
+}
+
+#[cfg(windows)]
+fn owner_killer(
+    child: &(dyn portable_pty::Child + Send + Sync),
+) -> Box<dyn ChildKiller + Send + Sync> {
+    child.clone_killer()
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct ProcessGroupKiller {
+    pid: u32,
+}
+
+#[cfg(unix)]
+impl ChildKiller for ProcessGroupKiller {
+    fn kill(&mut self) -> io::Result<()> {
+        kill_process_group(self.pid)
+    }
+
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) -> io::Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    const ESRCH: i32 = 3;
+
+    // Process group 0 or 1 would signal this process's own group or every
+    // process the user owns, never a child session.
+    let pgid = i32::try_from(pid)
+        .ok()
+        .filter(|pgid| *pgid > 1)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid child pid {pid}"),
+            )
+        })?;
+    // SAFETY: kill takes plain integers and does not dereference pointers.
+    if unsafe { kill(-pgid, SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(ESRCH) {
+        // The group is already gone.
+        return Ok(());
+    }
+    Err(err)
 }
 
 fn ok<'a>() -> Response<'a> {
@@ -1723,6 +1792,67 @@ mod tests {
         mark_reader_done(&shared);
         assert!(rx.recv().is_err());
         assert_eq!(shared.lock().expect("shared poisoned").exit_code, 7);
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        // SAFETY: signal 0 only checks that the process exists.
+        unsafe { kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_killer_kills_hup_ignoring_child_and_background_jobs() {
+        let pair = native_pty_system().openpty(INITIAL_PTY_SIZE).unwrap();
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", "trap '' HUP; sleep 30 & echo \"bg=$!\"; sleep 30"]);
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let (line_tx, line_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&output);
+                if let Some(pid) = text
+                    .split("bg=")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|pid| pid.parse::<i32>().ok())
+                {
+                    let _ = line_tx.send(pid);
+                    break;
+                }
+            }
+        });
+        let background_pid = line_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        owner_killer(child.as_ref()).kill().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let shell_exited = child.try_wait().unwrap().is_some();
+        if !shell_exited {
+            let _ = child.kill();
+        }
+        assert!(shell_exited, "HUP-ignoring shell survived the owner killer");
+        while process_exists(background_pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_exists(background_pid),
+            "background job {background_pid} survived the owner killer"
+        );
     }
 
     #[test]
