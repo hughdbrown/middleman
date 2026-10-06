@@ -12,6 +12,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::Shutdown;
 #[cfg(windows)]
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
@@ -48,6 +49,7 @@ const MAX_OWNER_INPUT_SIZE: usize = 64 * 1024;
 const MAX_UNIX_SOCKET_PATH_LEN: usize = 100;
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 64;
 const OWNER_EXIT_CODE_GRACE_PERIOD: Duration = Duration::from_millis(200);
+const OWNER_POST_EXIT_LINGER: Duration = Duration::from_secs(5);
 const INITIAL_PTY_SIZE: PtySize = PtySize {
     rows: 24,
     cols: 80,
@@ -162,6 +164,7 @@ struct Shared {
     subscribers: Vec<Subscriber>,
     next_subscriber_id: u64,
     attached: bool,
+    attachment_ended_after_exit: bool,
     exited: bool,
     reader_done: bool,
     stopping: bool,
@@ -316,8 +319,9 @@ fn run_owner(args: Args) -> Result<()> {
         mark_child_exited(&wait_shared, exit_code);
     });
 
+    let mut completed_at = None;
     loop {
-        if owner_complete(&shared) {
+        if owner_should_exit(&shared, &mut completed_at) {
             break;
         }
         let stream = match listener.accept() {
@@ -385,8 +389,7 @@ fn handle_conn(
         }
         "stop" => {
             write_response(&mut response_stream, ok())?;
-            mark_stopping(&shared);
-            let _ = killer.kill();
+            stop_owner(&shared, killer);
         }
         "input" => {
             {
@@ -503,6 +506,9 @@ fn handle_attach(
         }
         let code = exit_code_after_output_close(&shared_for_output);
         let _ = write_response(&mut output_stream, exit(code));
+        // Unblock the request loop so the attachment is released only after
+        // the exit frame has been written.
+        let _ = output_stream.shutdown(Shutdown::Both);
     });
 
     while let Some(req) = read_request(&mut reader, MAX_OWNER_REQUEST_SIZE)? {
@@ -519,8 +525,7 @@ fn handle_attach(
                 resize_pty(&runtime.master, req.pty_size());
             }
             "stop" => {
-                mark_stopping(&runtime.shared);
-                let _ = killer.kill();
+                stop_owner(&runtime.shared, killer);
             }
             _ => {}
         }
@@ -752,18 +757,35 @@ fn add_subscriber(shared: &mut Shared, tx: mpsc::SyncSender<Vec<u8>>) -> u64 {
     id
 }
 
-fn owner_complete(shared: &Arc<Mutex<Shared>>) -> bool {
+// After the child exits, keep serving so the attached client can drain its
+// output and exit frame, or a client that reconnects can still collect them.
+// Leave once such an attachment ends, or after a bounded linger, matching the
+// Go owner's waitAfterNaturalExit.
+fn owner_should_exit(shared: &Arc<Mutex<Shared>>, completed_at: &mut Option<Instant>) -> bool {
     let shared = shared.lock().expect("shared poisoned");
-    shared.stopping || (shared.exited && shared.reader_done)
+    if shared.stopping {
+        return true;
+    }
+    if !(shared.exited && shared.reader_done) {
+        return false;
+    }
+    let completed_at = *completed_at.get_or_insert_with(Instant::now);
+    (!shared.attached && shared.attachment_ended_after_exit)
+        || completed_at.elapsed() >= OWNER_POST_EXIT_LINGER
 }
 
-fn mark_stopping(shared: &Arc<Mutex<Shared>>) {
-    let subscribers = {
+fn stop_owner(shared: &Arc<Mutex<Shared>>, killer: &mut Box<dyn ChildKiller + Send + Sync>) {
+    let (subscribers, child_running) = {
         let mut shared = shared.lock().expect("shared poisoned");
         shared.stopping = true;
-        std::mem::take(&mut shared.subscribers)
+        (std::mem::take(&mut shared.subscribers), !shared.exited)
     };
     drop(subscribers);
+    // The owner now outlives its child, and a reaped child's PID may have
+    // been reused; only signal a child that has not been waited on yet.
+    if child_running {
+        let _ = killer.kill();
+    }
 }
 
 fn mark_child_exited(shared: &Arc<Mutex<Shared>>, exit_code: i32) {
@@ -1235,6 +1257,9 @@ impl Drop for ActiveAttachment {
                 .retain(|subscriber| subscriber.id != subscriber_id);
         }
         shared.attached = false;
+        if shared.exited && shared.reader_done {
+            shared.attachment_ended_after_exit = true;
+        }
     }
 }
 
@@ -1381,7 +1406,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::io::Cursor;
     use std::sync::{
         Arc,
@@ -1853,6 +1878,124 @@ mod tests {
             !process_exists(background_pid),
             "background job {background_pid} survived the owner killer"
         );
+    }
+
+    #[cfg(unix)]
+    fn start_test_owner(command: &str) -> (PathBuf, thread::JoinHandle<Result<()>>, Value) {
+        let root = Path::new("/tmp").join(format!("mm-pty-owner-{}", &new_token()[..12]));
+        let args = Args {
+            root: root.clone(),
+            session: "s1".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            command: vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()],
+        };
+        let owner = thread::spawn(move || run_owner(args));
+        let state_path = root.join("s1").join("owner.json");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let state = loop {
+            if let Ok(data) = fs::read(&state_path)
+                && let Ok(state) = serde_json::from_slice::<Value>(&data)
+            {
+                break state;
+            }
+            assert!(Instant::now() < deadline, "owner never wrote its state");
+            thread::sleep(Duration::from_millis(10));
+        };
+        (root, owner, state)
+    }
+
+    #[cfg(unix)]
+    fn attach_and_collect(state: &Value) -> (Vec<u8>, Option<i64>) {
+        let addr = state["addr"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("unix://");
+        let mut stream = UnixStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let request = json!({
+            "type": "attach",
+            "token": state["token"],
+            "cols": 80,
+            "rows": 24,
+        });
+        stream.write_all(format!("{request}\n").as_bytes()).unwrap();
+        let mut output = Vec::new();
+        let mut exit_code = None;
+        for line in BufReader::new(stream).lines() {
+            let frame: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            match frame["type"].as_str() {
+                Some("output") => {
+                    output.extend(BASE64.decode(frame["output"].as_str().unwrap()).unwrap());
+                }
+                Some("exit") => exit_code = frame["exit_code"].as_i64(),
+                _ => {}
+            }
+        }
+        (output, exit_code)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_serves_late_attach_after_child_exit() {
+        let (root, owner, state) = start_test_owner("echo late-output; exit 3");
+        thread::sleep(Duration::from_millis(500));
+
+        let (output, exit_code) = attach_and_collect(&state);
+
+        assert!(String::from_utf8_lossy(&output).contains("late-output"));
+        assert_eq!(exit_code, Some(3));
+        owner.join().unwrap().unwrap();
+        assert!(!root.join("s1").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_delivers_exit_frame_to_client_attached_at_exit() {
+        let (root, owner, state) = start_test_owner("sleep 0.3; echo final-line; exit 4");
+
+        let (output, exit_code) = attach_and_collect(&state);
+
+        assert!(String::from_utf8_lossy(&output).contains("final-line"));
+        assert_eq!(exit_code, Some(4));
+        let started = Instant::now();
+        owner.join().unwrap().unwrap();
+        assert!(started.elapsed() < OWNER_POST_EXIT_LINGER);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owner_lingers_after_exit_until_bounded_timeout() {
+        let shared = Arc::new(Mutex::new(Shared {
+            exited: true,
+            reader_done: true,
+            ..Shared::default()
+        }));
+        let mut completed_at = None;
+        assert!(!owner_should_exit(&shared, &mut completed_at));
+
+        completed_at = Some(Instant::now() - OWNER_POST_EXIT_LINGER);
+        assert!(owner_should_exit(&shared, &mut completed_at));
+    }
+
+    #[test]
+    fn stop_after_child_exit_does_not_signal_reaped_pid() {
+        let kill_calls = Arc::new(AtomicUsize::new(0));
+        let mut killer: Box<dyn ChildKiller + Send + Sync> = Box::new(RecordingKiller {
+            calls: Arc::clone(&kill_calls),
+        });
+        let running = Arc::new(Mutex::new(Shared::default()));
+        let exited = Arc::new(Mutex::new(Shared {
+            exited: true,
+            ..Shared::default()
+        }));
+
+        stop_owner(&exited, &mut killer);
+        assert_eq!(kill_calls.load(Ordering::SeqCst), 0);
+        stop_owner(&running, &mut killer);
+        assert_eq!(kill_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
