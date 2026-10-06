@@ -26,7 +26,7 @@ use std::ptr;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree};
 #[cfg(windows)]
@@ -47,6 +47,7 @@ const MAX_OWNER_REQUEST_SIZE: usize = 96 * 1024;
 const MAX_OWNER_INPUT_SIZE: usize = 64 * 1024;
 const MAX_UNIX_SOCKET_PATH_LEN: usize = 100;
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 64;
+const OWNER_EXIT_CODE_GRACE_PERIOD: Duration = Duration::from_millis(200);
 const INITIAL_PTY_SIZE: PtySize = PtySize {
     rows: 24,
     cols: 80,
@@ -500,7 +501,7 @@ fn handle_attach(
                 return;
             }
         }
-        let code = shared_for_output.lock().expect("shared poisoned").exit_code;
+        let code = exit_code_after_output_close(&shared_for_output);
         let _ = write_response(&mut output_stream, exit(code));
     });
 
@@ -782,6 +783,23 @@ fn mark_reader_done(shared: &Arc<Mutex<Shared>>) {
         take_subscribers_if_complete(&mut shared)
     };
     drop(subscribers);
+}
+
+// A subscriber's channel also closes when broadcast drops it for falling
+// behind, while the child may still be running. Give the child a short grace
+// period to exit so the exit frame carries its real code instead of the -1
+// placeholder, matching the Go owner's exitCodeAfterOutputClose.
+fn exit_code_after_output_close(shared: &Arc<Mutex<Shared>>) -> i32 {
+    let deadline = Instant::now() + OWNER_EXIT_CODE_GRACE_PERIOD;
+    loop {
+        {
+            let shared = shared.lock().expect("shared poisoned");
+            if shared.exited || Instant::now() >= deadline {
+                return shared.exit_code;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn take_subscribers_if_complete(shared: &mut Shared) -> Vec<Subscriber> {
@@ -1705,6 +1723,35 @@ mod tests {
         mark_reader_done(&shared);
         assert!(rx.recv().is_err());
         assert_eq!(shared.lock().expect("shared poisoned").exit_code, 7);
+    }
+
+    #[test]
+    fn exit_code_after_output_close_waits_for_child_exit() {
+        let shared = Arc::new(Mutex::new(Shared {
+            exit_code: -1,
+            ..Shared::default()
+        }));
+        let waiter_shared = Arc::clone(&shared);
+        let waiter = thread::spawn(move || exit_code_after_output_close(&waiter_shared));
+
+        thread::sleep(Duration::from_millis(50));
+        mark_child_exited(&shared, 7);
+
+        assert_eq!(waiter.join().unwrap(), 7);
+    }
+
+    #[test]
+    fn exit_code_after_output_close_gives_up_after_grace_period() {
+        let shared = Arc::new(Mutex::new(Shared {
+            exit_code: -1,
+            ..Shared::default()
+        }));
+
+        let started = Instant::now();
+        let code = exit_code_after_output_close(&shared);
+
+        assert_eq!(code, -1);
+        assert!(started.elapsed() >= OWNER_EXIT_CODE_GRACE_PERIOD);
     }
 
     #[test]
