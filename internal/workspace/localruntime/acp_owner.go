@@ -154,7 +154,7 @@ func (m *Manager) restoreACP(ctx context.Context, info SessionInfo, cwd string) 
 		if !errors.Is(err, ErrSessionNotFound) {
 			return nil, err
 		}
-	} else if m.ptyOwnerRuntime != nil && m.ptyOwnerRuntime.HasState(info.Key) {
+	} else if m.ptyOwnerRuntime != nil {
 		backend, err := m.ptyOwnerRuntime.Attach(ctx, info.Key)
 		if err == nil {
 			defer backend.Close()
@@ -166,7 +166,7 @@ func (m *Manager) restoreACP(ctx context.Context, info SessionInfo, cwd string) 
 			default:
 				return nil, fmt.Errorf("%w: ACP owner unavailable", ErrSessionUnavailable)
 			}
-		} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ECONNREFUSED) {
+		} else if !errors.Is(err, ptyowner.ErrOwnerGone) {
 			return nil, err
 		}
 	}

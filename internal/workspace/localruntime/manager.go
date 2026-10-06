@@ -662,11 +662,6 @@ func (m *Manager) restoreRuntimeSession(
 			"%w: %q: pty owner runtime unavailable",
 			ErrSessionUnavailable, key,
 		)
-	} else if restored.Kind != LaunchTargetACP && tmuxSession == "" && !m.ptyOwnerRuntime.HasState(key) {
-		return fmt.Errorf(
-			"%w: %q: pty owner state missing",
-			ErrSessionUnavailable, key,
-		)
 	}
 
 	target, err := m.target(targetKey)

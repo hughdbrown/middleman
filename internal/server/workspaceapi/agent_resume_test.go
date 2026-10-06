@@ -2,9 +2,11 @@ package workspaceapi
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +26,89 @@ import (
 	"go.kenn.io/forge/internal/workspace"
 	"go.kenn.io/forge/internal/workspace/localruntime"
 )
+
+// TestResumeAgentHelper records the arguments a resume appended, in the agent's
+// working directory, then waits like a running agent.
+func TestResumeAgentHelper(t *testing.T) { //nolint:paralleltest // subprocess entry point
+	if os.Getenv("KENN_FORGE_RESUME_AGENT_HELPER") != "1" {
+		return
+	}
+	args := os.Args[slices.Index(os.Args, "--")+1:]
+	if os.WriteFile("args.tmp", []byte(strings.Join(args, "\n")), 0o600) != nil || os.Rename("args.tmp", "args") != nil {
+		os.Exit(2)
+	}
+	time.Sleep(time.Hour)
+}
+
+func TestRestoreRuntimeSessionsResumesSavedConversationAfterPtyOwnerLoss(t *testing.T) { //nolint:paralleltest // t.Setenv writes KENN_FORGE_RESUME_AGENT_HELPER
+	t.Setenv("KENN_FORGE_RESUME_AGENT_HELPER", "1")
+	for _, name := range []string{"no owner state", "stale owner state", "no saved conversation"} {
+		t.Run(name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			ctx := t.Context()
+			database := dbtest.Open(t)
+			cwd := t.TempDir()
+			require.NoError(database.InsertWorkspace(ctx, &db.Workspace{
+				ID: "workspace", Platform: "github", PlatformHost: "github.com",
+				RepoOwner: "acme", RepoName: "widget", ItemType: db.WorkspaceItemTypeAdHoc,
+				ItemKey: db.AdHocWorkspaceItemKey("work/resume"), GitHeadRef: "work/resume",
+				WorkspaceBranch: "work/resume", WorktreePath: cwd, Status: "ready",
+			}))
+			require.NoError(database.UpsertWorkspaceRuntimeSession(ctx, &db.WorkspaceRuntimeSession{
+				WorkspaceID: "workspace", SessionKey: "saved-runtime", TargetKey: "custom-worker",
+				Label: "Worker 2", Kind: "agent", Scope: "session",
+			}))
+			activity := agentactivity.NewStore(t.TempDir())
+			if name != "no saved conversation" {
+				require.NoError(activity.HandleEvent("claude", agentactivity.HookEvent{
+					SessionID: "saved-conversation", CWD: cwd, HookEventName: "Stop",
+				}, "saved-runtime"))
+			}
+			ownerRoot := t.TempDir()
+			if name == "stale owner state" {
+				// A killed owner leaves its state and a socket nobody listens on.
+				paths, err := ptyowner.NewSessionPaths(ownerRoot, "saved-runtime")
+				require.NoError(err)
+				require.NoError(os.MkdirAll(paths.Dir, 0o700))
+				state, err := json.Marshal(map[string]string{"session": "saved-runtime", "addr": "unix://" + filepath.Join(filepath.Dir(paths.Socket), "gone", "s"), "token": "token"})
+				require.NoError(err)
+				require.NoError(os.WriteFile(paths.StatePath, state, 0o600))
+			}
+			runtime := localruntime.NewManager(localruntime.Options{
+				PtyOwnerRuntime: ptyownerruntime.New(&ptyowner.Client{Root: ownerRoot, InProcess: true}, nil),
+				Targets: []localruntime.LaunchTarget{{Key: "custom-worker", Kind: localruntime.LaunchTargetAgent, Available: true, Command: []string{
+					os.Args[0], "-test.run=^TestResumeAgentHelper$", "--",
+				}}},
+			})
+			t.Cleanup(func() {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+				defer cancel()
+				runtime.StopWorkspace(cleanupCtx, "workspace")
+				runtime.Shutdown()
+			})
+			handler := New(Deps{DB: database, Workspaces: workspace.NewManager(database, t.TempDir()), Runtime: runtime, AgentActivity: activity})
+
+			require.NoError(handler.RestoreRuntimeSessions(ctx))
+
+			stored, err := database.ListAllWorkspaceRuntimeSessions(ctx)
+			require.NoError(err)
+			if name == "no saved conversation" {
+				assert.Len(stored, 1, "the row stays as an unavailable session until the user stops it")
+				assert.Empty(runtime.ListSessions("workspace"))
+				return
+			}
+			require.Eventually(func() bool { _, err := os.Stat(filepath.Join(cwd, "args")); return err == nil }, 10*time.Second, 10*time.Millisecond)
+			args, err := os.ReadFile(filepath.Join(cwd, "args"))
+			require.NoError(err)
+			assert.Equal("--resume\nsaved-conversation", string(args))
+			require.Len(stored, 1)
+			sessions := runtime.ListSessions("workspace")
+			require.Len(sessions, 1)
+			assert.Equal("saved-runtime", sessions[0].Key)
+		})
+	}
+}
 
 func TestRestoreRuntimeSessionsResumesSavedConversationAfterTmuxLoss(t *testing.T) {
 	t.Parallel()
