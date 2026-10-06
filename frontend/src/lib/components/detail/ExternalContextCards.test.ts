@@ -14,6 +14,7 @@ const props = {
   number: 42,
   headSha: "a".repeat(40),
 };
+const details = () => screen.getByText("Details:", { exact: false }).closest("details") as HTMLDetailsElement;
 const card = {
   status: "warning",
   summary: "A slower result",
@@ -39,7 +40,7 @@ describe("external PR context", () => {
     vi.useRealTimers();
   });
 
-  it("renders applicable results, their older-commit label and read-only Markdown", async () => {
+  it("renders compact cards, their older-commit label, read-only Markdown and a failed source", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (request: Request) => {
@@ -49,11 +50,28 @@ describe("external PR context", () => {
             sources: [
               { id: "checks", name: "Quality checks" },
               { id: "other", name: "Other context" },
+              { id: "plain", name: "Plain context" },
+              { id: "report", name: "Report" },
             ],
           });
         }
         if (url.includes("/external-context/checks")) return Response.json({ card });
         if (url.includes("/external-context/other")) return Response.json({ card: null });
+        if (url.includes("/external-context/plain"))
+          return Response.json({
+            card: { status: "neutral", summary: "No changes", actions: [{ id: "n", label: "Note", input: {} }] },
+          });
+        if (url.includes("/external-context/report"))
+          return Response.json(
+            {
+              type: "about:blank",
+              status: 504,
+              title: "Source timed out",
+              detail: "External context timed out.",
+              code: "upstreamError",
+            },
+            { status: 504 },
+          );
         throw new Error(`Unexpected request: ${url}`);
       }),
     );
@@ -62,43 +80,27 @@ describe("external PR context", () => {
     expect(await screen.findByText("A slower result")).toBeTruthy();
     expect(screen.getByText("Quality checks")).toBeTruthy();
     expect(screen.getByText("Results are for an older commit")).toBeTruthy();
-    await fireEvent.click(screen.getByText("Details"));
-    expect(screen.getByRole("table").textContent).toContain("Parse input");
-    expect((screen.getByRole("checkbox") as HTMLInputElement).disabled).toBe(true);
+    expect(screen.getByText("warning")).toBeTruthy();
+    expect(details().open).toBe(false);
+    expect(details().textContent).not.toContain("Run checks");
+    expect(details().textContent).not.toContain("Publish");
+    expect(
+      details().compareDocumentPosition(screen.getByText("Results are for an older commit")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     expect((screen.getByRole("button", { name: "Publish" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText("Run first")).toBeTruthy();
-    await waitFor(() => expect(screen.queryByText("Other context")).toBeNull());
-  });
-
-  it("keeps a failed source separate from a successful card", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (request: Request) => {
-        const url = request.url;
-        if (url.endsWith("/external-context/sources"))
-          return Response.json({
-            sources: [
-              { id: "checks", name: "Quality checks" },
-              { id: "report", name: "Report" },
-            ],
-          });
-        if (url.includes("/external-context/checks")) return Response.json({ card });
-        return Response.json(
-          {
-            type: "about:blank",
-            status: 504,
-            title: "Source timed out",
-            detail: "External context timed out.",
-            code: "upstreamError",
-          },
-          { status: 504 },
-        );
-      }),
-    );
-    render(ExternalContextCards, { props });
-    expect(await screen.findByText("A slower result")).toBeTruthy();
+    await fireEvent.click(screen.getByText("Details:", { exact: false }));
+    expect(details().open).toBe(true);
+    expect(screen.getByRole("table").textContent).toContain("Parse input");
+    expect((screen.getByRole("checkbox") as HTMLInputElement).disabled).toBe(true);
+    expect(await screen.findByText("No changes")).toBeTruthy();
+    expect(screen.getAllByText("Details:", { exact: false })).toHaveLength(1);
+    expect(screen.queryByText("neutral")).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Note text" })).toBeTruthy();
     expect(await screen.findByRole("alert")).toHaveProperty("textContent", "External context timed out.");
     expect(screen.getByRole("button", { name: "Refresh Report" })).toBeTruthy();
+    await waitFor(() => expect(screen.queryByText("Other context")).toBeNull());
   });
 
   it("pins one action to the displayed commit on a host route and keeps its outcome across navigation", async () => {
@@ -246,9 +248,12 @@ describe("external PR context", () => {
     const view = render(ExternalContextCards, { props });
     const textbox = () => screen.getByRole("textbox", { name: "Add note text" }) as HTMLTextAreaElement;
     const button = () => screen.getByRole("button", { name: "Add note" }) as HTMLButtonElement;
-    await screen.findByRole("textbox", { name: "Add note text" });
+    await screen.findByText("A slower result");
+    expect(details().open).toBe(false);
+    await fireEvent.click(screen.getByText("Details:", { exact: false }));
     expect(textbox().placeholder).toBe("Leave a note");
     expect(textbox().maxLength).toBe(2000);
+    expect(details().contains(textbox())).toBe(true);
     expect(button().disabled).toBe(true);
     await fireEvent.input(textbox(), { target: { value: "  " } });
     expect(button().disabled).toBe(true);
@@ -256,6 +261,7 @@ describe("external PR context", () => {
     const newHead = { ...props, headSha: "c".repeat(40) };
     await view.rerender(newHead);
     await waitFor(() => expect(textbox().value).toBe("Ship after review"));
+    expect(details().open).toBe(true);
     await fireEvent.click(button());
     expect((await screen.findByRole("alert")).textContent).toBe("Adapter rejected it.");
     expect(textbox().value).toBe("Ship after review");
