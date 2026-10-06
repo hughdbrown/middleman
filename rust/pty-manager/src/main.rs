@@ -168,6 +168,7 @@ struct Shared {
     next_subscriber_id: u64,
     attached: bool,
     attachment_ended_after_exit: bool,
+    child_reaped: bool,
     exited: bool,
     reader_done: bool,
     stopping: bool,
@@ -314,6 +315,14 @@ fn run_owner(args: Args) -> Result<()> {
     });
 
     let wait_shared = Arc::clone(&shared);
+    #[cfg(unix)]
+    {
+        let child_pid = child.process_id().context("spawned pty child has no pid")?;
+        thread::spawn(move || {
+            mark_child_exited(&wait_shared, wait_for_exit_without_reaping(child_pid));
+        });
+    }
+    #[cfg(windows)]
     thread::spawn(move || {
         let exit_code = match child.wait() {
             Ok(status) => status.exit_code() as i32,
@@ -352,8 +361,48 @@ fn run_owner(args: Args) -> Result<()> {
         });
     }
 
+    #[cfg(unix)]
+    reap_child(&shared, child.as_mut());
     cleanup.disarm_killer();
     Ok(())
+}
+
+// Observe the child's exit but leave it as a zombie. Until it is reaped the
+// kernel cannot hand its PID, and therefore its process group ID, to another
+// process, so stop can still kill descendants left in the group after the
+// shell exits without any risk of signalling an unrelated group.
+#[cfg(unix)]
+fn wait_for_exit_without_reaping(pid: u32) -> i32 {
+    // CLD_EXITED has the same value on Linux and macOS.
+    const CLD_EXITED: i32 = 1;
+    loop {
+        // SAFETY: siginfo_t is plain old data, so all-zero bytes are valid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid, writable siginfo_t for the whole call.
+        let rc =
+            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if rc == 0 {
+            if info.si_code == CLD_EXITED {
+                // SAFETY: waitid filled a SIGCHLD siginfo, so si_status is set.
+                return unsafe { info.si_status() };
+            }
+            // Killed by a signal; portable-pty reports this as exit code 1.
+            return 1;
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return -1;
+        }
+    }
+}
+
+// Reap under the shared lock so stop_owner never signals the group after its
+// ID has been released for reuse.
+#[cfg(unix)]
+fn reap_child(shared: &Arc<Mutex<Shared>>, child: &mut (dyn portable_pty::Child + Send + Sync)) {
+    let mut shared = shared.lock().expect("shared poisoned");
+    if let Ok(Some(_)) = child.try_wait() {
+        shared.child_reaped = true;
+    }
 }
 
 fn handle_conn(
@@ -844,17 +893,21 @@ fn owner_should_exit(shared: &Arc<Mutex<Shared>>, completed_at: &mut Option<Inst
 }
 
 fn stop_owner(shared: &Arc<Mutex<Shared>>, killer: &mut Box<dyn ChildKiller + Send + Sync>) {
-    let (subscribers, child_running) = {
+    let subscribers = {
         let mut shared = shared.lock().expect("shared poisoned");
+        // The shell can exit while descendants, such as a SIGHUP-ignoring
+        // background job, stay in its process group, so the group kill must
+        // run even after the child has exited. Until reap_child releases the
+        // zombie, its PID cannot be reused, so the group ID still names only
+        // this session's processes. Signal before setting `stopping`, and
+        // under the lock, so the owner cannot reap in between.
+        if !shared.child_reaped {
+            let _ = killer.kill();
+        }
         shared.stopping = true;
-        (std::mem::take(&mut shared.subscribers), !shared.exited)
+        std::mem::take(&mut shared.subscribers)
     };
     drop(subscribers);
-    // The owner now outlives its child, and a reaped child's PID may have
-    // been reused; only signal a child that has not been waited on yet.
-    if child_running {
-        let _ = killer.kill();
-    }
 }
 
 fn mark_child_exited(shared: &Arc<Mutex<Shared>>, exit_code: i32) {
@@ -1904,7 +1957,12 @@ mod tests {
     fn owner_killer_kills_hup_ignoring_child_and_background_jobs() {
         let pair = native_pty_system().openpty(INITIAL_PTY_SIZE).unwrap();
         let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.args(["-c", "trap '' HUP; sleep 30 & echo \"bg=$!\"; sleep 30"]);
+        // exec keeps the shell from forking while the group kill lands; a
+        // child mid-fork can miss a process-group signal on macOS.
+        cmd.args([
+            "-c",
+            "trap '' HUP; sleep 30 & echo \"bg=$!\"; exec sleep 30",
+        ]);
         let mut child = pair.slave.spawn_command(cmd).unwrap();
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
@@ -2052,21 +2110,92 @@ mod tests {
     }
 
     #[test]
-    fn stop_after_child_exit_does_not_signal_reaped_pid() {
+    fn stop_signals_group_until_child_is_reaped() {
         let kill_calls = Arc::new(AtomicUsize::new(0));
         let mut killer: Box<dyn ChildKiller + Send + Sync> = Box::new(RecordingKiller {
             calls: Arc::clone(&kill_calls),
         });
         let running = Arc::new(Mutex::new(Shared::default()));
-        let exited = Arc::new(Mutex::new(Shared {
+        let exited_unreaped = Arc::new(Mutex::new(Shared {
             exited: true,
+            reader_done: true,
+            ..Shared::default()
+        }));
+        let reaped = Arc::new(Mutex::new(Shared {
+            exited: true,
+            reader_done: true,
+            child_reaped: true,
             ..Shared::default()
         }));
 
-        stop_owner(&exited, &mut killer);
+        stop_owner(&reaped, &mut killer);
         assert_eq!(kill_calls.load(Ordering::SeqCst), 0);
         stop_owner(&running, &mut killer);
         assert_eq!(kill_calls.load(Ordering::SeqCst), 1);
+        stop_owner(&exited_unreaped, &mut killer);
+        assert_eq!(kill_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_after_shell_exit_kills_surviving_background_job() {
+        let (root, owner, state) =
+            start_test_owner("trap '' HUP; sleep 30 & echo \"bg=$!\"; exit 0");
+        let addr = state["addr"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("unix://");
+        let request = |kind: &str| {
+            let mut stream = UnixStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = json!({ "type": kind, "token": state["token"] });
+            stream.write_all(format!("{request}\n").as_bytes()).unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let background_pid = loop {
+            let status = request("status");
+            let output = BASE64
+                .decode(status["output"].as_str().unwrap_or_default())
+                .unwrap();
+            if let Some(pid) = String::from_utf8_lossy(&output)
+                .split("bg=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|pid| pid.parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "background pid never printed");
+            thread::sleep(Duration::from_millis(20));
+        };
+        // Let the shell exit and be reaped while the background job keeps
+        // the terminal open.
+        thread::sleep(Duration::from_millis(300));
+        assert!(process_exists(background_pid));
+
+        request("stop");
+        owner.join().unwrap().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_exists(background_pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let survived = process_exists(background_pid);
+        if survived {
+            // SAFETY: plain signal to the leaked test process.
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            unsafe { kill(background_pid, 9) };
+        }
+        let _ = fs::remove_dir_all(root);
+        assert!(!survived, "background job {background_pid} survived stop");
     }
 
     #[cfg(unix)]
