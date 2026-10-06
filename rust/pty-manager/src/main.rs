@@ -1475,7 +1475,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{Value, json};
+    #[cfg(unix)]
+    use serde_json::Value;
+    use serde_json::json;
     use std::io::Cursor;
     use std::sync::{
         Arc,
