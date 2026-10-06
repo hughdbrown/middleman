@@ -915,6 +915,9 @@ describe("ACPWorkspace rich content", () => {
     const audio = document.querySelector("audio")!;
     expect(audio.getAttribute("src")).toBe("data:audio/wav;base64,UklGRg==");
     expect(audio.hasAttribute("controls")).toBe(true);
+
+    await fireEvent.click(audio);
+    expect(document.activeElement).not.toBe(screen.getByRole("textbox", { name: "Message agent" }));
   });
 
   it("links resource cards only for web addresses", async () => {
@@ -1232,6 +1235,66 @@ describe("ACPWorkspace composer size", () => {
     expect(send.disabled).toBe(false);
     await fireEvent.click(send);
     expect(sentCommands()).toEqual([{ type: "prompt", mode: "send", id: expect.any(String), text }]);
+  });
+});
+
+// jsdom has no text layout, so these click empty containers. Text versus
+// empty space is covered in ACPWorkspace.browser.svelte.ts.
+describe("ACPWorkspace click to focus composer", () => {
+  const transcript = { messages: [{ role: "assistant", text: "The change is ready." }] };
+  const composer = () => screen.getByRole("textbox", { name: "Message agent" });
+  const emptySpace = () => screen.getByRole("log", { name: "Conversation" });
+
+  it("focuses the composer when empty space is clicked", async () => {
+    await openChat(transcript);
+
+    await fireEvent.click(emptySpace());
+    expect(document.activeElement).toBe(composer());
+  });
+
+  it("leaves focus with the control that was clicked", async () => {
+    await openChat({
+      elicitations: [
+        {
+          id: "elicit-1",
+          message: "Name it",
+          schema: { properties: { name: { type: "string", title: "Project name" } } },
+        },
+      ],
+    });
+    const field = screen.getByLabelText(/Project name/);
+    field.focus();
+
+    await fireEvent.click(field);
+    expect(document.activeElement).toBe(field);
+  });
+
+  it("keeps a text selection in the transcript intact", async () => {
+    await openChat(transcript);
+    window.getSelection()!.selectAllChildren(screen.getByText("The change is ready."));
+
+    // A drag that ends past the text fires its click on the shared container.
+    await fireEvent.click(emptySpace());
+    expect(document.activeElement).not.toBe(composer());
+    expect(window.getSelection()!.toString()).toBe("The change is ready.");
+  });
+
+  it("does not raise the touch keyboard for taps", async () => {
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({ matches: query === "(pointer: coarse)" })),
+    );
+    await openChat(transcript);
+
+    await fireEvent.click(emptySpace());
+    expect(document.activeElement).not.toBe(composer());
+  });
+
+  it("does nothing while the chat is disconnected", async () => {
+    await openChat({ ...transcript, connected: false });
+
+    await fireEvent.click(emptySpace());
+    expect(document.activeElement).not.toBe(composer());
   });
 });
 
