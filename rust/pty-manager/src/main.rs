@@ -24,6 +24,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -50,6 +51,8 @@ const MAX_UNIX_SOCKET_PATH_LEN: usize = 100;
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 64;
 const OWNER_EXIT_CODE_GRACE_PERIOD: Duration = Duration::from_millis(200);
 const OWNER_POST_EXIT_LINGER: Duration = Duration::from_secs(5);
+const OWNER_FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_OWNER_CONNECTIONS: usize = 32;
 const INITIAL_PTY_SIZE: PtySize = PtySize {
     rows: 24,
     cols: 80,
@@ -319,6 +322,7 @@ fn run_owner(args: Args) -> Result<()> {
         mark_child_exited(&wait_shared, exit_code);
     });
 
+    let connection_slots = ConnectionSlots::new(MAX_OWNER_CONNECTIONS);
     let mut completed_at = None;
     loop {
         if owner_should_exit(&shared, &mut completed_at) {
@@ -332,6 +336,10 @@ fn run_owner(args: Args) -> Result<()> {
             }
             Err(err) => return Err(err).context("accept connection"),
         };
+        let Some(slot) = connection_slots.try_acquire() else {
+            // At capacity: close the connection instead of spawning a thread.
+            continue;
+        };
         stream.set_nonblocking(false)?;
         let token = token.clone();
         let conn_shared = Arc::clone(&shared);
@@ -339,6 +347,7 @@ fn run_owner(args: Args) -> Result<()> {
         let master = Arc::clone(&master);
         let mut killer = killer.clone_killer();
         thread::spawn(move || {
+            let _slot = slot;
             let _ = handle_conn(stream, &token, conn_shared, writer, master, &mut killer);
         });
     }
@@ -357,7 +366,7 @@ fn handle_conn(
 ) -> Result<()> {
     let mut response_stream = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
-    let first = match read_request(&mut reader, MAX_OWNER_FIRST_REQUEST_SIZE)? {
+    let first = match read_first_request(&mut reader, OWNER_FIRST_REQUEST_TIMEOUT)? {
         Some(req) => req,
         None => return Ok(()),
     };
@@ -375,6 +384,8 @@ fn handle_conn(
         )?;
         return Ok(());
     }
+    // Authenticated: an attachment may legitimately sit idle between requests.
+    reader.get_ref().set_read_timeout(None)?;
 
     match first.kind.as_str() {
         "status" => {
@@ -550,6 +561,51 @@ fn scale_pixel_dimension(pixels: u16, current_cells: u16, new_cells: u16) -> u16
     let current_cells = u64::from(current_cells);
     ((u64::from(pixels) * u64::from(new_cells) + current_cells / 2) / current_cells)
         .min(u64::from(u16::MAX)) as u16
+}
+
+// Bound how long an unauthenticated connection can hold its thread before
+// sending anything; the Windows listener is reachable by any local user.
+fn read_first_request(
+    reader: &mut BufReader<OwnerStream>,
+    timeout: Duration,
+) -> Result<Option<Request>> {
+    reader.get_ref().set_read_timeout(Some(timeout))?;
+    read_request(reader, MAX_OWNER_FIRST_REQUEST_SIZE)
+}
+
+struct ConnectionSlots {
+    in_use: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+struct ConnectionSlot {
+    in_use: Arc<AtomicUsize>,
+}
+
+impl ConnectionSlots {
+    fn new(limit: usize) -> Self {
+        Self {
+            in_use: Arc::new(AtomicUsize::new(0)),
+            limit,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<ConnectionSlot> {
+        self.in_use
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |in_use| {
+                (in_use < self.limit).then_some(in_use + 1)
+            })
+            .ok()?;
+        Some(ConnectionSlot {
+            in_use: Arc::clone(&self.in_use),
+        })
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.in_use.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn read_request<R: BufRead>(reader: &mut R, max_bytes: usize) -> Result<Option<Request>> {
@@ -2009,6 +2065,37 @@ mod tests {
         assert_eq!(kill_calls.load(Ordering::SeqCst), 0);
         stop_owner(&running, &mut killer);
         assert_eq!(kill_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_request_times_out_when_client_sends_nothing() {
+        let (server, _client) = UnixStream::pair().unwrap();
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(server);
+            let _ = result_tx.send(
+                read_first_request(&mut reader, Duration::from_millis(50)).map(|req| req.is_some()),
+            );
+        });
+
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first request read never timed out");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn connection_slots_cap_concurrent_connections() {
+        let slots = ConnectionSlots::new(2);
+
+        let first = slots.try_acquire().expect("first slot");
+        let _second = slots.try_acquire().expect("second slot");
+        assert!(slots.try_acquire().is_none());
+
+        drop(first);
+        assert!(slots.try_acquire().is_some());
     }
 
     #[test]
