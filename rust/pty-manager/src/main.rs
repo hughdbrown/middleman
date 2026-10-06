@@ -612,14 +612,25 @@ fn scale_pixel_dimension(pixels: u16, current_cells: u16, new_cells: u16) -> u16
         .min(u64::from(u16::MAX)) as u16
 }
 
-// Bound how long an unauthenticated connection can hold its thread before
-// sending anything; the Windows listener is reachable by any local user.
+// Bound how long an unauthenticated connection can hold its thread and slot
+// before completing its first request; the Windows listener is reachable by
+// any local user. The deadline covers the whole request, so a client cannot
+// extend it by trickling bytes.
 fn read_first_request(
     reader: &mut BufReader<OwnerStream>,
     timeout: Duration,
 ) -> Result<Option<Request>> {
-    reader.get_ref().set_read_timeout(Some(timeout))?;
-    read_request(reader, MAX_OWNER_FIRST_REQUEST_SIZE)
+    let deadline = Instant::now() + timeout;
+    read_request_with(reader, MAX_OWNER_FIRST_REQUEST_SIZE, |reader| {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "pty owner first request timed out",
+            ));
+        }
+        reader.get_ref().set_read_timeout(Some(remaining))
+    })
 }
 
 struct ConnectionSlots {
@@ -658,8 +669,19 @@ impl Drop for ConnectionSlot {
 }
 
 fn read_request<R: BufRead>(reader: &mut R, max_bytes: usize) -> Result<Option<Request>> {
+    read_request_with(reader, max_bytes, |_| Ok(()))
+}
+
+// `before_fill` runs before every fill_buf so callers can adjust the
+// stream (for example its read timeout) ahead of each socket read.
+fn read_request_with<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+    mut before_fill: impl FnMut(&R) -> io::Result<()>,
+) -> Result<Option<Request>> {
     let mut line = Vec::new();
     loop {
+        before_fill(reader)?;
         let available = reader.fill_buf()?;
         if available.is_empty() {
             if line.is_empty() {
@@ -2213,6 +2235,36 @@ mod tests {
         let result = result_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("first request read never timed out");
+
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_request_deadline_covers_trickled_bytes() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        // Each byte arrives well inside the per-read timeout, but the request
+        // never completes; trickling would last about 6s.
+        thread::spawn(move || {
+            for _ in 0..200 {
+                if client.write_all(b"{").is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(server);
+            let _ = result_tx.send(
+                read_first_request(&mut reader, Duration::from_millis(200))
+                    .map(|req| req.is_some()),
+            );
+        });
+
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("trickled first request extended the deadline");
 
         assert!(result.is_err());
     }
