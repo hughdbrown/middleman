@@ -468,33 +468,22 @@ fn handle_attach(
     write_response(&mut stream, ok())?;
 
     let (tx, rx) = new_subscriber_channel();
-    let (replay, already_complete, exit_code) = {
+    let subscription = {
         let mut shared = runtime.shared.lock().expect("shared poisoned");
-        let replay = shared.output.clone();
-        let already_complete = shared.exited && shared.reader_done;
-        let exit_code = shared.exit_code;
-        let subscriber_id = if already_complete {
-            None
-        } else {
-            Some(add_subscriber(&mut shared, tx.clone()))
-        };
-        if let Some(subscriber_id) = subscriber_id {
+        subscribe(&mut shared, tx)
+    };
+    match subscription {
+        Subscription::Live { subscriber_id } => {
             active_attachment.subscriber_id = Some(subscriber_id);
         }
-        (replay, already_complete, exit_code)
-    };
-    if !replay.is_empty() {
-        if already_complete {
-            write_response(&mut stream, ok_with_output(replay))?;
-        } else {
-            let _ = tx.send(replay);
+        Subscription::Complete { replay, exit_code } => {
+            if !replay.is_empty() {
+                write_response(&mut stream, ok_with_output(replay))?;
+            }
+            write_response(&mut stream, exit(exit_code))?;
+            return Ok(());
         }
     }
-    if already_complete {
-        write_response(&mut stream, exit(exit_code))?;
-        return Ok(());
-    }
-    drop(tx);
 
     let mut output_stream = stream.try_clone()?;
     let shared_for_output = Arc::clone(&runtime.shared);
@@ -748,6 +737,30 @@ fn terminal_response_for_output(
 
 fn new_subscriber_channel() -> (mpsc::SyncSender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
     mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY)
+}
+
+enum Subscription {
+    Live { subscriber_id: u64 },
+    Complete { replay: Vec<u8>, exit_code: i32 },
+}
+
+// Runs under the shared lock, so the replay is queued before the subscriber
+// becomes visible to broadcast and no newer chunk can overtake it; the Go
+// owner's subscribe makes the same guarantee.
+fn subscribe(shared: &mut Shared, tx: mpsc::SyncSender<Vec<u8>>) -> Subscription {
+    if shared.exited && shared.reader_done {
+        return Subscription::Complete {
+            replay: shared.output.clone(),
+            exit_code: shared.exit_code,
+        };
+    }
+    if !shared.output.is_empty() {
+        // A fresh channel with a live receiver always has room for one chunk.
+        let _ = tx.try_send(shared.output.clone());
+    }
+    Subscription::Live {
+        subscriber_id: add_subscriber(shared, tx),
+    }
 }
 
 fn add_subscriber(shared: &mut Shared, tx: mpsc::SyncSender<Vec<u8>>) -> u64 {
@@ -1996,6 +2009,52 @@ mod tests {
         assert_eq!(kill_calls.load(Ordering::SeqCst), 0);
         stop_owner(&running, &mut killer);
         assert_eq!(kill_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn subscribe_queues_replay_ahead_of_later_broadcasts() {
+        let shared = Arc::new(Mutex::new(Shared {
+            output: b"earlier".to_vec(),
+            exit_code: -1,
+            ..Shared::default()
+        }));
+        let (tx, rx) = new_subscriber_channel();
+
+        let subscription = subscribe(&mut shared.lock().expect("shared poisoned"), tx);
+        broadcast(&shared, b"later");
+
+        assert!(matches!(subscription, Subscription::Live { .. }));
+        assert_eq!(rx.recv().unwrap(), b"earlier");
+        assert_eq!(rx.recv().unwrap(), b"later");
+    }
+
+    #[test]
+    fn subscribe_after_completion_returns_replay_and_exit_code() {
+        let shared = Arc::new(Mutex::new(Shared {
+            output: b"done".to_vec(),
+            exited: true,
+            reader_done: true,
+            exit_code: 9,
+            ..Shared::default()
+        }));
+        let (tx, _rx) = new_subscriber_channel();
+
+        let subscription = subscribe(&mut shared.lock().expect("shared poisoned"), tx);
+
+        match subscription {
+            Subscription::Complete { replay, exit_code } => {
+                assert_eq!(replay, b"done");
+                assert_eq!(exit_code, 9);
+            }
+            Subscription::Live { .. } => panic!("completed owner registered a live subscriber"),
+        }
+        assert!(
+            shared
+                .lock()
+                .expect("shared poisoned")
+                .subscribers
+                .is_empty()
+        );
     }
 
     #[test]
