@@ -1,5 +1,5 @@
 <script lang="ts">
-  import WorkspaceTargets from "./WorkspaceTargets.svelte";
+  import WorkspaceTargets, { type CurrentWorkspaceTarget } from "./WorkspaceTargets.svelte";
   import { repositoryKeyFromWire } from "../../api/repository-key.js";
   import type { WorkspaceTarget } from "../../api/generated/models/workspaceTarget.js";
   import { EmptyState } from "@kenn-io/kit-ui";
@@ -69,6 +69,7 @@
   }: Props = $props();
 
   let selectedKata = $state<{ daemonID: string; issueUID: string } | undefined>();
+  let kataPanelSelection = $state<{ daemonID: string; issueUID: string } | null>(null);
   function selectTarget(target: WorkspaceTarget): void {
     if (target.type === "kata" && target.kata) {
       selectedKata = { daemonID: target.kata.daemon_id, issueUID: target.kata.issue_uid };
@@ -102,13 +103,19 @@
       : hasPR
   );
   const defaultDiffBase = $derived(defaultWorkspaceDiffBase(gitState, hasMergeTarget));
+  const currentTarget = $derived.by((): CurrentWorkspaceTarget | null => {
+    if (activeTab === "pr" && displayedPR) return { type: "pr", ref: displayedPR };
+    if (activeTab === "issue" && displayedIssue) return { type: "issue", ref: displayedIssue };
+    if (activeTab === "kata" && kataPanelSelection) return { type: "kata", ...kataPanelSelection };
+    return null;
+  });
 
 </script>
 
 <div class="right-sidebar-content">
   {#if onselect}
     {#key `${workspaceHostKey ?? "self"}:${workspaceID}`}
-      <WorkspaceTargets {workspaceID} {workspaceHostKey} refreshToken={targetsRefreshToken + refreshToken} {disabled} onselect={selectTarget} />
+      <WorkspaceTargets {workspaceID} {workspaceHostKey} refreshToken={targetsRefreshToken + refreshToken} {disabled} current={currentTarget} onselect={selectTarget} />
     {/key}
   {/if}
   {#if activeTab === "diff"}
@@ -167,6 +174,7 @@
       <KataLinksPanel
         subject={{ kind: "workspace", workspaceID }}
         selection={selectedKata}
+        onselectionchange={(selection) => { kataPanelSelection = selection; }}
         active={activeTab === "kata"}
         {disabled}
       />
