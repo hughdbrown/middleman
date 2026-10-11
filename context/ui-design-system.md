@@ -99,13 +99,21 @@ otherwise fails only in the Vitest/Playwright transform tier, not in
 
 - Theme tokens come from kit `theme.css` plus the kit `quiet` identity from
   `themes.css`: system type, AA-contrast muted text, sentence-case labels,
-  and tinted label pills. `index.html` sets `data-kit-theme="quiet"` for
-  first paint and embeds; `initTheme` re-asserts it through `setThemeName`
-  because the kit store strips the attribute when no name is set
+  and tinted label pills. Quiet remains the default; preserve an explicit
+  e-reader choice through startup and first paint
   (`frontend/src/lib/stores/theme.svelte.ts`). Dark mode and high contrast
   remain `dark` / `high-contrast` classes on `<html>`. Frontend components additionally
   consume app tokens from `frontend/src/app.css` — style-asserting harnesses must load `app.css` like
   `browserAppHarness.ts`.
+- E-reader modes are always light: pure white reading surfaces, pure black text,
+  and strong edges. Plain e-reader forces black ink everywhere with pale
+  gray/blue fills; color e-reader keeps inline ink and uses saturated accents
+  (at least 4.5:1 on white). Diffs in both show +/- signs and take row tints
+  from `--diff-add-mark`/`--diff-del-mark`, which Pierre blends at only 12%
+  (`frontend/src/e-reader.css`, `frontend/src/lib/components/diff/PierreFileDiff.svelte`).
+- `kit-ui-check` honors an ignore comment only directly above the flagged
+  line. When `vp fmt` wraps a long selector, move the comment onto the wrapped
+  line it flags, and run `vp run -w check` (CI lint) rather than `vp lint`.
 - Disabled styling: native controls that dim when disabled use
   `var(--opacity-disabled)` (kit's `hand-rolled-disabled-state` rule rejects a
   literal); a deliberate no-dim rule uses `opacity: unset`, and hover rules

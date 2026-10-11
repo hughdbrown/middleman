@@ -8,6 +8,7 @@
 @import "@kenn-io/kit-ui/mermaid.css";
 /* Expand buttons on markdown images; the expanded view is kit MediaViewer. */
 @import "@kenn-io/kit-ui/markdown-images.css";
+@import "./e-reader.css";
 
 /* kit's themes.css tints scrollbars under every named theme; Forge's scroll
    panes keep browser-native scrollbars (tests/e2e/viewport-fit.spec.ts). */
@@ -186,7 +187,7 @@ body {
     --font-size-2xl: 1.375rem;
   }
   #app :is(input:not([type="checkbox"], [type="radio"], [type="range"]), textarea, select) {
-    font-size: var(--font-size-touch-field);
+    font-size: max(var(--font-size-touch-field), var(--font-size-acp, var(--font-size-touch-field)));
   }
 }
 
@@ -200,7 +201,7 @@ body {
   --font-size-2xl: 1.375rem;
 }
 .kit-type-touch #app :is(input:not([type="checkbox"], [type="radio"], [type="range"]), textarea, select) {
-  font-size: var(--font-size-touch-field);
+  font-size: max(var(--font-size-touch-field), var(--font-size-acp, var(--font-size-touch-field)));
 }
 
 #app {

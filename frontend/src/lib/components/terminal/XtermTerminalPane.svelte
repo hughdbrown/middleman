@@ -5,6 +5,8 @@
   import { observeResize } from "../../browser/observers.js";
   import { getStores } from "../../context.js";
   import { showFlash } from "../../stores/flash.svelte.js";
+  import { isColorEReader, isEReader } from "../../stores/theme.svelte.js";
+  import { terminalAppearance } from "./terminal-appearance.js";
   import { Terminal } from "@xterm/xterm";
   import type { ILinkHandler } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
@@ -100,6 +102,9 @@
 
   let containerEl: HTMLElement;
   let terminal: Terminal | null = $state(null);
+  const appearance = $derived(
+    terminalAppearance(isColorEReader() ? "e-reader-color" : isEReader() ? "e-reader" : "default"),
+  );
   let hoveredTerminalLink: string | null = $state(null);
   let fitAddon: FitAddon | null = null;
   let imageAddon: ImageAddon | null = null;
@@ -155,6 +160,15 @@
       return;
     }
     explicitFocusRequested = true;
+  }
+
+  /** The live xterm appearance; contrast is not observable through WebGL output. */
+  export function appearanceOptions(): { background: string | undefined; minimumContrastRatio: number } | null {
+    if (!terminal) return null;
+    return {
+      background: terminal.options.theme?.background,
+      minimumContrastRatio: terminal.options.minimumContrastRatio ?? 1,
+    };
   }
 
   export function sendInput(data: string): boolean {
@@ -219,7 +233,6 @@
   }
 
   const TERMINAL_SMOOTH_SCROLL_DURATION = 0;
-  const TERMINAL_MINIMUM_CONTRAST_RATIO = 4.5;
   const TERMINAL_FONT_WAIT_MS = 300;
   const TERMINAL_FONT_LOAD_GLYPHS = "0MWim@#";
   const TERMINAL_SEQUENCE_CANCEL = new Uint8Array([0x18]);
@@ -1203,6 +1216,12 @@
   $effect(syncRendererState);
 
   $effect(() => {
+    if (!terminal) return;
+    terminal.options.theme = appearance.theme;
+    terminal.options.minimumContrastRatio = appearance.minimumContrastRatio;
+  });
+
+  $effect(() => {
     syncImageAddon(terminalGraphics);
   });
 
@@ -1278,11 +1297,7 @@
 
       function startTerminal(): void {
       const term = new Terminal({
-        theme: {
-          background: "#0d1117",
-          foreground: "#c9d1d9",
-          cursor: "#58a6ff",
-        },
+        theme: appearance.theme,
         // The ligatures addon registers a character joiner, which xterm
         // exposes as proposed API. This is constructor-only and must be on
         // before a user enables ligatures at runtime.
@@ -1296,7 +1311,7 @@
         letterSpacing: terminalLetterSpacing,
         lineHeight: terminalLineHeight,
         linkHandler: terminalLinkHandler,
-        minimumContrastRatio: TERMINAL_MINIMUM_CONTRAST_RATIO,
+        minimumContrastRatio: appearance.minimumContrastRatio,
         rescaleOverlappingGlyphs: true,
         scrollOnEraseInDisplay: true,
         smoothScrollDuration: TERMINAL_SMOOTH_SCROLL_DURATION,
