@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
     getWorkspace: vi.fn(),
     getWorkspaceRuntime: vi.fn(),
     launchWorkspaceRuntimeSession: vi.fn(),
+    launchWorkspaceAgentHandoff: vi.fn(),
     getFleetWorkspace: vi.fn(),
     getFleetWorkspaceRuntime: vi.fn(),
     launchFleetWorkspaceRuntimeSession: vi.fn(),
@@ -43,10 +44,17 @@ vi.mock("../../context.js", async (importOriginal) => {
   };
 });
 
+import {
+  runWorkspaceQuickAction,
+  quickActionWorkspaces,
+  quickActionLaunches,
+} from "../../stores/workspace-quick-actions.js";
+import type { RuntimeSession } from "../../api/types.js";
 import MobileWorkspaceTerminal from "./MobileWorkspaceTerminal.svelte";
 import type { WorkspaceEventsNotification } from "../../stores/events.svelte.js";
 import {
   markWorkspaceIdDeleted,
+  pendingWorkspaceLaunch,
   queueWorkspaceLaunch,
   resetWorkspaceCreatePendingForTest,
 } from "../../stores/workspace-create-pending.svelte.js";
@@ -99,6 +107,8 @@ describe("MobileWorkspaceTerminal", () => {
       }),
     );
     localStorage.clear();
+    quickActionWorkspaces.clear();
+    quickActionLaunches.clear();
     resetWorkspaceHostForTest();
     resetWorkspaceCreatePendingForTest();
     resetSessionHostForTest();
@@ -112,6 +122,112 @@ describe("MobileWorkspaceTerminal", () => {
     resetWorkspaceCreatePendingForTest();
     resetSessionHostForTest();
   });
+
+  it("waits for a directly launched ACP session without showing the base terminal", async () => {
+    const session: RuntimeSession = {
+      key: "chat-a",
+      workspace_id: "ws-a",
+      target_key: "chat",
+      label: "Chat agent",
+      kind: "acp",
+      display_region: "workflow",
+      status: "running",
+      created_at: workspace.created_at,
+    };
+    const launch = Promise.withResolvers<RuntimeSession>();
+    let notify: ((event: WorkspaceEventsNotification) => void) | undefined;
+    events.subscribeWorkspaceEvents.mockImplementation((subscriber: (event: WorkspaceEventsNotification) => void) => {
+      notify = subscriber;
+      return () => {};
+    });
+    mocks.runtimeClient.getWorkspace
+      .mockResolvedValueOnce({ ...workspace, status: "creating" })
+      .mockResolvedValue(workspace);
+    mocks.runtimeClient.getWorkspaceRuntime.mockResolvedValue({
+      launch_targets: [{ key: "chat", label: "Chat agent", kind: "acp", available: true }],
+      sessions: [],
+    });
+    mocks.runtimeClient.launchWorkspaceRuntimeSession.mockReturnValue(launch.promise);
+    queueWorkspaceLaunch("ws-a", "chat", undefined);
+    render(MobileWorkspaceTerminal, { props });
+    await screen.findByText("Preparing worktree…");
+    expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).not.toHaveBeenCalled();
+    await waitFor(() => expect(notify).toBeTypeOf("function"));
+    notify?.({ type: "workspace_status", payload: { id: "ws-a", status: "ready" } });
+    await waitFor(() => expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).toHaveBeenCalledOnce());
+    expect(screen.getByText("Starting Chat agent…")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open terminal composer" })).toBeNull();
+    mocks.runtimeClient.getWorkspaceRuntime.mockResolvedValue({ launch_targets: [], sessions: [session] });
+    launch.resolve(session);
+    expect(await screen.findByRole("button", { name: "Chat options" })).toBeTruthy();
+    expect(screen.queryByText("Starting Chat agent…")).toBeNull();
+  });
+
+  it("selects the quick action's ACP session after an empty runtime selected the base terminal", async () => {
+    const session: RuntimeSession = {
+      key: "chat-a",
+      workspace_id: "ws-a",
+      target_key: "chat",
+      label: "Chat agent",
+      kind: "acp",
+      display_region: "workflow",
+      status: "running",
+      created_at: workspace.created_at,
+    };
+    const handoff = Promise.withResolvers<{ session: RuntimeSession; initial_message: { state: string } }>();
+    mocks.runtimeClient.launchWorkspaceAgentHandoff.mockReturnValue(handoff.promise);
+    const appRuntime = runtimeState.appRuntime;
+    if (!appRuntime) throw new Error("Missing test runtime");
+    runWorkspaceQuickAction(appRuntime, "ws-a", { label: "Review", agent: "chat", prompt: "Review this change" });
+    render(MobileWorkspaceTerminal, { props });
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
+    expect(screen.getByText("Starting chat…")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open terminal composer" })).toBeNull();
+    mocks.runtimeClient.getWorkspaceRuntime.mockResolvedValue({ ...runtime, sessions: [session] });
+    handoff.resolve({ session, initial_message: { state: "delivered" } });
+    expect(await screen.findByRole("button", { name: "Chat options" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open terminal composer" })).toBeNull();
+  });
+
+  it.each(["pending", "rejected"])(
+    "opens an acknowledged quick-action chat when the initial runtime read is %s",
+    async (state) => {
+      const session: RuntimeSession = {
+        key: "chat-a",
+        workspace_id: "ws-a",
+        target_key: "chat",
+        label: "Chat agent",
+        kind: "acp",
+        display_region: "workflow",
+        status: "running",
+        created_at: workspace.created_at,
+      };
+      const initialRead = Promise.withResolvers<typeof runtime>();
+      const handoff = Promise.withResolvers<{ session: RuntimeSession; initial_message: { state: string } }>();
+      mocks.runtimeClient.getWorkspaceRuntime.mockReturnValueOnce(initialRead.promise);
+      mocks.runtimeClient.launchWorkspaceAgentHandoff.mockReturnValue(handoff.promise);
+      const appRuntime = runtimeState.appRuntime;
+      if (!appRuntime) throw new Error("Missing test runtime");
+      runWorkspaceQuickAction(appRuntime, "ws-a", { label: "Review", agent: "chat", prompt: "Review this change" });
+      render(MobileWorkspaceTerminal, { props });
+      await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
+      if (state === "rejected") {
+        initialRead.reject(
+          new GeneratedProblemResponse(
+            { type: "about:blank", title: "Runtime unavailable", status: 500 },
+            new Response(null, { status: 500 }),
+          ),
+        );
+        await screen.findByRole("button", { name: "Retry runtime sessions" });
+      }
+      const refresh = Promise.withResolvers<typeof runtime>();
+      mocks.runtimeClient.getWorkspaceRuntime.mockReturnValue(refresh.promise);
+      handoff.resolve({ session, initial_message: { state: "delivered" } });
+      expect(await screen.findByRole("button", { name: "Chat options" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Open terminal composer" })).toBeNull();
+      await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledTimes(2));
+    },
+  );
 
   it.each([true, false])("shows only available launch choices (available: %s)", async (available) => {
     mocks.runtimeClient.getWorkspaceRuntime.mockResolvedValue({
@@ -361,6 +477,59 @@ describe("MobileWorkspaceTerminal", () => {
     await waitFor(() => expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledTimes(2));
     expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Terminal options" }).hasAttribute("disabled")).toBe(true);
+  });
+
+  it("opens an acknowledged chat after switching workspaces while the runtime read is held", async () => {
+    const view = render(MobileWorkspaceTerminal, { props });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Terminal options" }).hasAttribute("disabled")).toBe(false),
+    );
+    const held = Promise.withResolvers<typeof runtime>();
+    mocks.runtimeClient.getWorkspace.mockResolvedValue({ ...workspace, id: "ws-b" });
+    mocks.runtimeClient.getWorkspaceRuntime.mockReturnValue(held.promise);
+    const session: RuntimeSession = {
+      key: "chat-b",
+      workspace_id: "ws-b",
+      target_key: "chat",
+      label: "Chat agent",
+      kind: "acp",
+      display_region: "workflow",
+      status: "running",
+      created_at: workspace.created_at,
+    };
+    quickActionLaunches.set("ws-b", { targetKey: "chat", session });
+    await view.rerender({ ...props, workspaceId: "ws-b" });
+    expect(await screen.findByRole("button", { name: "Chat options" })).toBeTruthy();
+  });
+
+  it("keeps the next workspace terminal accessible while the previous workspace launch settles", async () => {
+    const session: RuntimeSession = {
+      key: "helper-a",
+      workspace_id: "ws-a",
+      target_key: "helper",
+      label: "Helper",
+      kind: "agent",
+      display_region: "workflow",
+      status: "running",
+      created_at: workspace.created_at,
+    };
+    const launch = Promise.withResolvers<RuntimeSession>();
+    mocks.runtimeClient.launchWorkspaceRuntimeSession.mockReturnValue(launch.promise);
+    queueWorkspaceLaunch("ws-a", "helper", undefined);
+    const view = render(MobileWorkspaceTerminal, { props });
+    await screen.findByText("Starting Helper…");
+    await waitFor(() => expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).toHaveBeenCalledOnce());
+
+    mocks.runtimeClient.getWorkspace.mockResolvedValue({ ...workspace, id: "ws-b" });
+    await view.rerender({ ...props, workspaceId: "ws-b" });
+    expect(await screen.findByRole("button", { name: "Open terminal composer" })).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Terminal options" }));
+    expect(screen.getByRole("button", { name: /^New terminal/ }).hasAttribute("disabled")).toBe(false);
+
+    launch.resolve(session);
+    await waitFor(() => expect(pendingWorkspaceLaunch("ws-a", undefined)?.phase).toBe("awaiting_session"));
+    expect(screen.getByRole("button", { name: "Open terminal composer" })).toBeTruthy();
+    expect(screen.queryByText("Starting Helper…")).toBeNull();
   });
 
   it("rechecks runtime for queued intent after returning to the same workspace", async () => {

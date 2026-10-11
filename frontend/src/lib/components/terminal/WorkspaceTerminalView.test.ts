@@ -25,7 +25,11 @@ import {
   resetWorkspaceCreatePendingForTest,
 } from "../../stores/workspace-create-pending.svelte.js";
 import type { WorkspaceItemIdentity } from "../../workspace-inline.js";
-import { runWorkspaceQuickAction, quickActionWorkspaces } from "../../stores/workspace-quick-actions.js";
+import {
+  runWorkspaceQuickAction,
+  quickActionWorkspaces,
+  quickActionLaunches,
+} from "../../stores/workspace-quick-actions.js";
 import { STORES_KEY } from "../../context.js";
 
 const mocks = vi.hoisted(() => ({
@@ -166,6 +170,7 @@ vi.mock("../../context.js", async (importOriginal) => {
         }),
         setTerminalSettings: mocks.mockSetTerminalSettings,
         getQuickActions: () => mocks.quickActions,
+        getACPSettings: () => ({ font_family: "", font_size: 13 }),
         getConfiguredRepos: () => [],
         getModeVisibility: () => ({
           activity: true,
@@ -719,6 +724,7 @@ describe("WorkspaceTerminalView", () => {
       container.appendChild(screen);
     });
     quickActionWorkspaces.clear();
+    quickActionLaunches.clear();
     mocks.quickActions = [];
     mocks.runtime = makeAppRuntime();
     delete window.__BASE_PATH__;
@@ -4301,12 +4307,14 @@ describe("WorkspaceTerminalView", () => {
     ).toBeNull();
   });
 
-  it("uses local ready events to launch before a held detail refresh, with one fresh admission read", async () => {
+  it("shows ACP launch progress and opens chat before a held detail or runtime refresh", async () => {
     const events = installEventSourceRecorder();
     const setupPolling: Array<{ callback: () => void; delay: number | undefined }> = [];
     capturePollingIntervals(setupPolling);
     const detailRefresh = deferred<Response>();
     const admission = deferred<ReturnType<typeof runtimeWithCodexTarget>>();
+    const acpSession = { ...runningSession, kind: "acp", target_key: "codex", label: "Codex" } satisfies RuntimeSession;
+    const launchRequest = deferred<typeof acpSession>();
     let details = 0;
     vi.stubGlobal(
       "fetch",
@@ -4321,18 +4329,27 @@ describe("WorkspaceTerminalView", () => {
     );
     queueWorkspaceLaunch("ws-1", "codex", undefined);
     mocks.getWorkspaceRuntime.mockReturnValueOnce(admission.promise).mockReturnValue(new Promise(() => {}));
-    mocks.launchWorkspaceSession.mockReturnValue(new Promise(() => {}));
+    mocks.launchWorkspaceSession.mockReturnValue(launchRequest.promise);
     render(WorkspaceTerminalView, { props: { workspaceId: "ws-1" } });
     await waitFor(() => expect(setupPolling.some((timer) => timer.delay === 3000)).toBe(true));
     await waitFor(() => expect(latestWorkspaceEventListeners(events).workspace_status).toBeTypeOf("function"));
     expect(mocks.launchWorkspaceSession).not.toHaveBeenCalled();
+    expect(screen.getByText("Preparing worktree...")).toBeTruthy();
     latestWorkspaceEventListeners(events).workspace_status?.(
       new MessageEvent("workspace_status", { data: JSON.stringify({ id: "ws-1", status: "ready" }) }),
     );
     await waitFor(() => expect(mocks.getWorkspaceRuntime).toHaveBeenCalledTimes(1));
-    admission.resolve(runtimeWithCodexTarget());
+    const acpRuntime = runtimeWithCodexTarget();
+    admission.resolve({
+      ...acpRuntime,
+      launch_targets: acpRuntime.launch_targets.map((target) => ({ ...target, kind: "acp" })),
+    });
     await waitFor(() => expect(mocks.launchWorkspaceSession).toHaveBeenCalledTimes(1));
     expect(mocks.getWorkspaceRuntime).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status", { name: "Launching Codex..." })).toBeTruthy();
+    launchRequest.resolve(acpSession);
+    expect(await screen.findByRole("textbox", { name: "Message agent" })).toBeTruthy();
+    expect(screen.queryByText("Launching Codex...")).toBeNull();
   });
 
   it.each(["creating", "deleting"])("handles delayed %s details after retry reaches ready", async (status) => {
@@ -5773,6 +5790,467 @@ describe("WorkspaceTerminalView", () => {
       await waitFor(() => expect(screen.queryByRole("dialog", { name: "Launch a session" })).toBeNull());
     });
 
+    it("preserves an acknowledged handoff after the launching view unmounts", async () => {
+      const handoff = deferred<Response>();
+      const runCommand = vi.spyOn(mocks.runtime, "runCommand");
+      const originalFetch = globalThis.fetch;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((input: Request | URL | string, init?: RequestInit) => {
+          if (String(input instanceof Request ? input.url : input).includes("agent-handoff")) return handoff.promise;
+          return originalFetch(input, init);
+        }),
+      );
+      mocks.quickActions = [{ label: "Review", agent: "helper", prompt: "Review this change" }];
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      claimForPrs();
+      const view = render(WorkspaceTerminalView, { props: { workspaceId: "ws-1", paneSurface: "prs" as const } });
+      const dialog = await screen.findByRole("dialog", { name: "Launch a session" });
+      await fireEvent.click(within(dialog).getByRole("button", { name: "Review" }));
+      const execution = runCommand.mock.results.at(-1)!.value;
+      view.unmount();
+      mocks.getWorkspaceRuntime.mockReturnValue(new Promise(() => {}));
+      const session = { ...runningSession, kind: "acp" } satisfies RuntimeSession;
+      handoff.resolve(
+        Response.json({ session, initial_message: { state: "delivered", target_key: "helper", message_bytes: 18 } }),
+      );
+      await execution.exit;
+      flushSync();
+      render(WorkspaceTerminalView, { props: { workspaceId: "ws-1", paneSurface: "prs" as const } });
+      expect(await screen.findByRole("textbox", { name: "Message agent" })).toBeTruthy();
+    });
+
+    it("activates a quick-action session discovered before its acknowledgement without moving it", async () => {
+      localStorage.setItem(
+        "kenn-forge-workspace-terminal-layout:ws-1",
+        persistedTwoSessionWorkflowLayout(runningSession.key, reviewerSession.key),
+      );
+      const polls: Array<{ callback: () => void; delay: number | undefined }> = [];
+      capturePollingIntervals(polls);
+      const handoff = deferred<Response>();
+      const runCommand = vi.spyOn(mocks.runtime, "runCommand");
+      const originalFetch = globalThis.fetch;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((input: Request | URL | string, init?: RequestInit) => {
+          if (String(input instanceof Request ? input.url : input).includes("agent-handoff")) return handoff.promise;
+          return originalFetch(input, init);
+        }),
+      );
+      mocks.quickActions = [{ label: "Review", agent: "helper", prompt: "Review this change" }];
+      mocks.getWorkspaceRuntime.mockResolvedValue({
+        ...runtimeWithStaleSession(),
+        sessions: [runningSession, reviewerSession],
+      });
+      render(WorkspaceTerminalView, { props: { workspaceId: "ws-1" } });
+      const helper = await screen.findByRole("tab", { name: /Helper/ });
+      const strip = helper.closest<HTMLElement>('[role="tablist"]')!;
+      await fireEvent.click(within(strip).getByRole("button", { name: "Quick actions" }));
+      const review = within(screen.getByRole("dialog", { name: "Quick actions" })).getByRole("button", {
+        name: "Review",
+      });
+      expect(review.hasAttribute("disabled")).toBe(false);
+      await fireEvent.click(review);
+      const execution = runCommand.mock.results.at(-1)!.value;
+      mocks.getWorkspaceRuntime.mockResolvedValue({
+        ...runtimeWithStaleSession(),
+        sessions: [runningSession, reviewerSession, duplicateAgentSession],
+      });
+      await waitFor(() => expect(polls.some((poll) => poll.delay === 3000)).toBe(true));
+      polls.find((poll) => poll.delay === 3000)!.callback();
+      const discovered = await within(strip).findByRole("tab", { name: /Helper 2/ });
+      expect(helper.getAttribute("aria-selected")).toBe("true");
+      expect(discovered.getAttribute("aria-selected")).toBe("false");
+
+      handoff.resolve(
+        Response.json({
+          session: duplicateAgentSession,
+          initial_message: { state: "delivered", target_key: "helper", message_bytes: 18 },
+        }),
+      );
+      await execution.exit;
+      await waitFor(() => expect(discovered.getAttribute("aria-selected")).toBe("true"));
+      expect(within(strip).getByRole("tab", { name: /Helper 2/ })).toBe(discovered);
+      await waitFor(() => expect(sockets.some((socket) => socket.url.includes(duplicateAgentSession.key))).toBe(true));
+    });
+
+    it.each(["mounted", "remounted"])(
+      "keeps a session promoted before acknowledgement with a %s view",
+      async (mountState) => {
+        localStorage.setItem(
+          "kenn-forge-workspace-terminal-layout:ws-1",
+          persistedTwoSessionWorkflowLayout(runningSession.key, reviewerSession.key),
+        );
+        const polls: Array<{ callback: () => void; delay: number | undefined }> = [];
+        capturePollingIntervals(polls);
+        const handoff = deferred<Response>();
+        const runCommand = vi.spyOn(mocks.runtime, "runCommand");
+        const originalFetch = globalThis.fetch;
+        vi.stubGlobal(
+          "fetch",
+          vi.fn((input: Request | URL | string, init?: RequestInit) => {
+            if (String(input instanceof Request ? input.url : input).includes("agent-handoff")) return handoff.promise;
+            return originalFetch(input, init);
+          }),
+        );
+        mocks.quickActions = [{ label: "Review", agent: "helper", prompt: "Review this change" }];
+        const initial = { ...runtimeWithStaleSession(), sessions: [runningSession, reviewerSession] };
+        mocks.getWorkspaceRuntime.mockResolvedValue(initial);
+        claimForPrs();
+        const view = render(WorkspaceTerminalView, { props: { workspaceId: "ws-1", paneSurface: "prs" as const } });
+        const reviewer = await screen.findByRole("tab", { name: /Reviewer/ });
+        await fireEvent.click(
+          within(reviewer.closest<HTMLElement>('[role="tablist"]')!).getByRole("button", { name: "Quick actions" }),
+        );
+        const dialog = screen.getByRole("dialog", { name: "Quick actions" });
+        await fireEvent.click(within(dialog).getByRole("button", { name: "Review" }));
+        const execution = runCommand.mock.results.at(-1)!.value;
+        const discovered = { ...initial, sessions: [runningSession, reviewerSession, duplicateAgentSession] };
+        mocks.getWorkspaceRuntime.mockResolvedValue(discovered);
+        await waitFor(() => expect(polls.some((poll) => poll.delay === 3000)).toBe(true));
+        polls.find((poll) => poll.delay === 3000)!.callback();
+        await screen.findByRole("tab", { name: /Helper 2/ });
+        const paneKey = promoteSession("prs", duplicateAgentSession.key);
+        flushSync();
+        expect(getPaneLayoutStore("prs").storedTabKeys()).toContain(paneKey);
+        const promotedLeaf = getPaneLayoutStore("prs").leafIDForTab(paneKey);
+        getPaneLayoutStore("prs").activateTab("conversation");
+        expect(getPaneLayoutStore("prs").isTabActive(paneKey)).toBe(false);
+        if (mountState === "remounted") {
+          view.unmount();
+          mocks.getWorkspaceRuntime.mockReturnValue(new Promise(() => {}));
+        }
+        handoff.resolve(
+          Response.json({
+            session: duplicateAgentSession,
+            initial_message: { state: "delivered", target_key: "helper", message_bytes: 18 },
+          }),
+        );
+        await execution.exit;
+        if (mountState === "remounted") {
+          render(WorkspaceTerminalView, { props: { workspaceId: "ws-1", paneSurface: "prs" as const } });
+        }
+        await waitFor(() => expect(quickActionLaunches.has("ws-1")).toBe(false));
+        flushSync();
+        expect(getPaneLayoutStore("prs").storedTabKeys()).toContain(paneKey);
+        expect(getPaneLayoutStore("prs").leafIDForTab(paneKey)).toBe(promotedLeaf);
+        expect(getPaneLayoutStore("prs").isTabActive(paneKey)).toBe(true);
+      },
+    );
+
+    it("retains a requested split leaf after switching during a quick action", async () => {
+      const storageKey = "kenn-forge-workspace-terminal-layout:ws-1";
+      localStorage.setItem(storageKey, persistedTwoSessionWorkflowLayout(runningSession.key, reviewerSession.key));
+      const handoff = deferred<Response>();
+      const runCommand = vi.spyOn(mocks.runtime, "runCommand");
+      const originalFetch = globalThis.fetch;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((input: Request | URL | string, init?: RequestInit) => {
+          const url = String(input instanceof Request ? input.url : input);
+          if (url.includes("agent-handoff")) return handoff.promise;
+          if (url.endsWith("/workspaces/ws-2"))
+            return Promise.resolve(Response.json({ ...workspaceResponse, id: "ws-2", git_head_ref: "feature/switch" }));
+          return originalFetch(input, init);
+        }),
+      );
+      mocks.quickActions = [{ label: "Review", agent: "helper", prompt: "Review this change" }];
+      mocks.getWorkspaceRuntime.mockResolvedValue({
+        ...runtimeWithStaleSession(),
+        sessions: [runningSession, reviewerSession],
+      });
+      const view = render(WorkspaceTerminalView, { props: { workspaceId: "ws-1" } });
+      await screen.findByRole("tab", { name: /Helper/ });
+      const strips = screen.getAllByRole("tablist", { name: "Workflow group tabs" });
+      await fireEvent.click(within(strips[1]!).getByRole("button", { name: "Quick actions" }));
+      const review = within(screen.getByRole("dialog", { name: "Quick actions" })).getByRole("button", {
+        name: "Review",
+      });
+      expect(review.hasAttribute("disabled")).toBe(false);
+      await fireEvent.click(review);
+      const execution = runCommand.mock.results.at(-1)!.value;
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      await view.rerender({ workspaceId: "ws-2" });
+      await screen.findAllByText("feature/switch");
+      handoff.resolve(
+        Response.json({
+          session: duplicateAgentSession,
+          initial_message: { state: "delivered", target_key: "helper", message_bytes: 18 },
+        }),
+      );
+      await execution.exit;
+      mocks.getWorkspaceRuntime.mockResolvedValue({
+        ...runtimeWithStaleSession(),
+        sessions: [runningSession, reviewerSession, duplicateAgentSession],
+      });
+      await view.rerender({ workspaceId: "ws-1" });
+      await screen.findByRole("tab", { name: /Helper 2/ });
+      const reviewer = screen.getByRole("tab", { name: /Reviewer/ });
+      const targetStrip = reviewer.closest<HTMLElement>('[role="tablist"]')!;
+      expect(
+        within(targetStrip)
+          .getByRole("tab", { name: /Helper 2/ })
+          .getAttribute("aria-selected"),
+      ).toBe("true");
+    });
+
+    it.each(["workflow", "detail"] as const)(
+      "honors a requested %s pane after runtime discovers a quick-action session",
+      async (surface) => {
+        localStorage.setItem(
+          "kenn-forge-workspace-terminal-layout:ws-1",
+          persistedTwoSessionWorkflowLayout(runningSession.key, reviewerSession.key),
+        );
+        const polls: Array<{ callback: () => void; delay: number | undefined }> = [];
+        capturePollingIntervals(polls);
+        const handoff = deferred<Response>();
+        const runCommand = vi.spyOn(mocks.runtime, "runCommand");
+        const originalFetch = globalThis.fetch;
+        vi.stubGlobal(
+          "fetch",
+          vi.fn((input: Request | URL | string, init?: RequestInit) => {
+            if (String(input instanceof Request ? input.url : input).includes("agent-handoff")) return handoff.promise;
+            return originalFetch(input, init);
+          }),
+        );
+        mocks.quickActions = [{ label: "Review", agent: "helper", prompt: "Review this change" }];
+        const initial = { ...runtimeWithStaleSession(), sessions: [runningSession, reviewerSession] };
+        mocks.getWorkspaceRuntime.mockResolvedValue(initial);
+        claimForPrs();
+        noteWorkspacePaneRendered("prs");
+        const layout = getPaneLayoutStore("prs");
+        const detailLeaf = layout.leafIDForTab("conversation")!;
+        render(WorkspaceTerminalView, { props: { workspaceId: "ws-1", paneSurface: "prs" } });
+        const reviewer = await screen.findByRole("tab", { name: /Reviewer/ });
+        if (surface === "workflow") {
+          await fireEvent.click(
+            within(reviewer.closest<HTMLElement>('[role="tablist"]')!).getByRole("button", { name: "Quick actions" }),
+          );
+        } else {
+          const controls = render(WorkspacePaneControls, {
+            props: {
+              showStripActions: false,
+              leaf: { type: "leaf", id: detailLeaf, tabs: ["conversation"], activeTabKey: "conversation" },
+            },
+          });
+          await fireEvent.click(await within(controls.container).findByRole("button", { name: "Launch session" }));
+        }
+        const dialog = screen.getByRole("dialog", {
+          name: surface === "workflow" ? "Quick actions" : "Launch a session",
+        });
+        const review = within(dialog).getByRole("button", { name: "Review" });
+        expect(review.hasAttribute("disabled")).toBe(false);
+        await fireEvent.click(review);
+        const handoffCommandIndex = runCommand.mock.calls.findIndex(
+          ([, options]) => options.operation === "run workspace quick action",
+        );
+        const execution = runCommand.mock.results[handoffCommandIndex]!.value;
+        mocks.getWorkspaceRuntime.mockResolvedValue({
+          ...initial,
+          sessions: [runningSession, reviewerSession, duplicateAgentSession],
+        });
+        await waitFor(() => expect(polls.some((poll) => poll.delay === 3000)).toBe(true));
+        polls.find((poll) => poll.delay === 3000)!.callback();
+        await screen.findByRole("tab", { name: /Helper 2/ });
+        handoff.resolve(
+          Response.json({
+            session: duplicateAgentSession,
+            initial_message: { state: "delivered", target_key: "helper", message_bytes: 18 },
+          }),
+        );
+        await execution.exit;
+        if (surface === "workflow") {
+          const targetStrip = reviewer.closest<HTMLElement>('[role="tablist"]')!;
+          await waitFor(() =>
+            expect(
+              within(targetStrip)
+                .getByRole("tab", { name: /Helper 2/ })
+                .getAttribute("aria-selected"),
+            ).toBe("true"),
+          );
+        } else {
+          const paneKey = sessionPaneKey("ws-1", undefined, duplicateAgentSession.key);
+          await waitFor(() => expect(layout.leafIDForTab(paneKey)).toBe(detailLeaf));
+          expect(layout.isTabActive(paneKey)).toBe(true);
+        }
+      },
+    );
+
+    it.each(["switch", "unmount"] as const)(
+      "keeps a user's dock move across a %s before quick-action acknowledgement",
+      async (navigation) => {
+        const storageKey = "kenn-forge-workspace-terminal-layout:ws-1";
+        localStorage.setItem(storageKey, persistedTwoSessionWorkflowLayout(runningSession.key, reviewerSession.key));
+        const polls: Array<{ callback: () => void; delay: number | undefined }> = [];
+        capturePollingIntervals(polls);
+        const handoff = deferred<Response>();
+        const runCommand = vi.spyOn(mocks.runtime, "runCommand");
+        const originalFetch = globalThis.fetch;
+        vi.stubGlobal(
+          "fetch",
+          vi.fn((input: Request | URL | string, init?: RequestInit) => {
+            const url = String(input instanceof Request ? input.url : input);
+            if (url.includes("agent-handoff")) return handoff.promise;
+            if (url.endsWith("/workspaces/ws-2"))
+              return Promise.resolve(
+                Response.json({ ...workspaceResponse, id: "ws-2", git_head_ref: "feature/switch" }),
+              );
+            return originalFetch(input, init);
+          }),
+        );
+        mocks.quickActions = [{ label: "Review", agent: "helper", prompt: "Review this change" }];
+        const initial = { ...runtimeWithStaleSession(), sessions: [runningSession, reviewerSession] };
+        const discovered = { ...initial, sessions: [runningSession, reviewerSession, duplicateAgentSession] };
+        mocks.getWorkspaceRuntime.mockResolvedValue(initial);
+        const view = render(WorkspaceTerminalView, { props: { workspaceId: "ws-1" } });
+        const reviewer = await screen.findByRole("tab", { name: /Reviewer/ });
+        await fireEvent.click(
+          within(reviewer.closest<HTMLElement>('[role="tablist"]')!).getByRole("button", { name: "Quick actions" }),
+        );
+        const review = within(screen.getByRole("dialog", { name: "Quick actions" })).getByRole("button", {
+          name: "Review",
+        });
+        expect(review.hasAttribute("disabled")).toBe(false);
+        await fireEvent.click(review);
+        const execution = runCommand.mock.results.at(-1)!.value;
+        mocks.getWorkspaceRuntime.mockResolvedValue(discovered);
+        await waitFor(() => expect(polls.some((poll) => poll.delay === 3000)).toBe(true));
+        polls.find((poll) => poll.delay === 3000)!.callback();
+        await fireEvent.click(await screen.findByRole("tab", { name: /Helper 2/ }));
+        await fireEvent.click(screen.getByRole("button", { name: "Move Helper 2 to terminal" }));
+        await waitFor(() => expect(screen.queryByRole("tab", { name: /Helper 2/ })).toBeNull());
+        const moved = JSON.parse(localStorage.getItem(storageKey)!);
+        if (navigation === "switch") {
+          mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+          await view.rerender({ workspaceId: "ws-2" });
+          await screen.findAllByText("feature/switch");
+        } else {
+          view.unmount();
+        }
+        const runtimeRefresh = deferred<typeof discovered>();
+        mocks.getWorkspaceRuntime.mockReturnValue(runtimeRefresh.promise);
+        handoff.resolve(
+          Response.json({
+            session: duplicateAgentSession,
+            initial_message: { state: "delivered", target_key: "helper", message_bytes: 18 },
+          }),
+        );
+        await execution.exit;
+        if (navigation === "switch") await view.rerender({ workspaceId: "ws-1" });
+        else render(WorkspaceTerminalView, { props: { workspaceId: "ws-1" } });
+        await waitFor(() => expect(quickActionLaunches.has("ws-1")).toBe(false));
+        const presented = JSON.parse(localStorage.getItem(storageKey)!);
+        expect(presented.sessionRegions[duplicateAgentSession.key]).toBe("terminal");
+        expect(presented.terminalGroups).toEqual(moved.terminalGroups);
+        runtimeRefresh.resolve(discovered);
+        await screen.findByRole("tab", { name: /Reviewer/ });
+        expect(JSON.parse(localStorage.getItem(storageKey)!).sessionRegions[duplicateAgentSession.key]).toBe(
+          "terminal",
+        );
+      },
+    );
+
+    it("preserves saved dock grouping across an unmount while a quick action waits", async () => {
+      const storageKey = "kenn-forge-workspace-terminal-layout:ws-1";
+      const saved = JSON.parse(persistedSplitWorkflowLayout(runningSession.key, "terminal"));
+      saved.workflowMode = "grid";
+      saved.tree = {
+        type: "split",
+        id: "saved-dock-split",
+        direction: "horizontal",
+        ratio: 0.5,
+        first: { type: "leaf", id: "saved-helper", sessionKey: runningSession.key },
+        second: { type: "leaf", id: "saved-shell", sessionKey: runningShellSession.key },
+      };
+      saved.terminalGroups = [
+        {
+          id: "saved-dock-group",
+          activeSessionKey: runningSession.key,
+          tree: saved.tree,
+        },
+      ];
+      saved.activeTerminalGroupID = "saved-dock-group";
+      saved.activeSessionKey = runningSession.key;
+      saved.sessionRegions[runningShellSession.key] = "terminal";
+      saved.sessionRegions[reviewerSession.key] = "workflow";
+      saved.customSessionLabels[reviewerSession.key] = "My reviewer";
+      localStorage.setItem(storageKey, JSON.stringify(saved));
+      localStorage.setItem("kenn-forge-workspace-active-tab:ws-1", "home");
+      const handoff = deferred<Response>();
+      const runCommand = vi.spyOn(mocks.runtime, "runCommand");
+      const originalFetch = globalThis.fetch;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((input: Request | URL | string, init?: RequestInit) => {
+          if (String(input instanceof Request ? input.url : input).includes("agent-handoff")) return handoff.promise;
+          return originalFetch(input, init);
+        }),
+      );
+      const authoritativeRuntime = {
+        ...runtimeWithStaleSession(),
+        sessions: [runningSession, runningShellSession, reviewerSession],
+      };
+      mocks.getWorkspaceRuntime.mockReturnValue(new Promise(() => {}));
+      runWorkspaceQuickAction(mocks.runtime, "ws-1", {
+        label: "Review",
+        agent: "helper",
+        prompt: "Review this change",
+      });
+      const execution = runCommand.mock.results.at(-1)!.value;
+      const firstView = render(WorkspaceTerminalView, { props: { workspaceId: "ws-1" } });
+      await screen.findByText("Loading workspace runtime...");
+      const placed = JSON.parse(localStorage.getItem(storageKey)!);
+      expect(placed.workflowMode).toBe("grid");
+      firstView.unmount();
+
+      const runtimeRefresh = deferred<typeof authoritativeRuntime>();
+      mocks.getWorkspaceRuntime.mockReturnValue(runtimeRefresh.promise);
+      handoff.resolve(
+        Response.json({
+          session: runningSession,
+          initial_message: { state: "delivered", target_key: "helper", message_bytes: 18 },
+        }),
+      );
+      await execution.exit;
+      render(WorkspaceTerminalView, { props: { workspaceId: "ws-1" } });
+      await waitFor(() => expect(quickActionLaunches.has("ws-1")).toBe(false));
+      const presented = JSON.parse(localStorage.getItem(storageKey)!);
+      expect(presented.sessionRegions).toEqual(placed.sessionRegions);
+      expect(presented.terminalGroups).toEqual(placed.terminalGroups);
+      expect(presented.workflowMode).toBe("grid");
+      expect(presented.customSessionLabels).toEqual(placed.customSessionLabels);
+
+      runtimeRefresh.resolve(authoritativeRuntime);
+      await screen.findByRole("tab", { name: /Reviewer/ });
+      expect(JSON.parse(localStorage.getItem(storageKey)!).terminalGroups).toEqual(placed.terminalGroups);
+    });
+
+    it("retains saved session layout before handoff runtime hydration", async () => {
+      const storageKey = "kenn-forge-workspace-terminal-layout:ws-1";
+      const saved = JSON.parse(persistedSplitWorkflowLayout(runningSession.key));
+      saved.customSessionLabels = { [runningSession.key]: "My agent" };
+      localStorage.setItem(storageKey, JSON.stringify(saved));
+      const runtimeRefresh = deferred<ReturnType<typeof runtimeWithLaunchTargetsOnly>>();
+      mocks.getWorkspaceRuntime.mockReturnValue(runtimeRefresh.promise);
+      const session = { ...duplicateAgentSession, kind: "acp" } satisfies RuntimeSession;
+      claimForPrs();
+      render(WorkspaceTerminalView, { props: { workspaceId: "ws-1", paneSurface: "prs" as const } });
+      await screen.findByText("Loading workspace runtime...");
+      expect(JSON.parse(localStorage.getItem(storageKey)!).customSessionLabels[runningSession.key]).toBe("My agent");
+      quickActionLaunches.set("ws-1", { targetKey: "helper", session });
+      await screen.findByRole("textbox", { name: "Message agent" });
+      const layout = JSON.parse(localStorage.getItem(storageKey)!);
+      expect(layout.customSessionLabels[runningSession.key]).toBe("My agent");
+      expect(layout.sessionRegions[runningSession.key]).toBe("workflow");
+
+      runtimeRefresh.resolve({ ...runtimeWithLaunchTargetsOnly(), sessions: [session] });
+      await waitFor(() => {
+        const authoritativeLayout = JSON.parse(localStorage.getItem(storageKey)!);
+        expect(authoritativeLayout.customSessionLabels[runningSession.key]).toBeUndefined();
+        expect(authoritativeLayout.sessionRegions[runningSession.key]).toBeUndefined();
+      });
+    });
+
     it("runs a configured quick action from the launcher and closes it", async () => {
       const handoffBodies: unknown[] = [];
       const originalFetch = globalThis.fetch;
@@ -5837,9 +6315,47 @@ describe("WorkspaceTerminalView", () => {
       await screen.findByRole("dialog", { name: "Launch a session" });
     });
 
+    it("consumes a completed quick-action handoff when reopened after its session exits", async () => {
+      const runCommand = vi.spyOn(mocks.runtime, "runCommand");
+      const originalFetch = globalThis.fetch;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((input: Request | URL | string, init?: RequestInit) => {
+          if (String(input instanceof Request ? input.url : input).includes("agent-handoff")) {
+            return Promise.resolve(
+              Response.json({
+                session: runningSession,
+                initial_message: { state: "delivered", target_key: "helper", message_bytes: 18 },
+              }),
+            );
+          }
+          return originalFetch(input, init);
+        }),
+      );
+      runWorkspaceQuickAction(mocks.runtime, "ws-1", {
+        label: "Review",
+        agent: "helper",
+        prompt: "Review this change",
+      });
+      await runCommand.mock.results.at(-1)!.value.exit;
+      expect(quickActionLaunches.get("ws-1")?.session).toEqual(runningSession);
+
+      // The session has exited while the workspace was not mounted.
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      claimForPrs();
+      render(WorkspaceTerminalView, { props: { workspaceId: "ws-1", paneSurface: "prs" as const } });
+
+      await waitFor(() => expect(mocks.getWorkspaceRuntime).toHaveBeenCalled());
+      await waitFor(() => expect(quickActionLaunches.has("ws-1")).toBe(false));
+      await waitFor(() => expect(screen.queryByText(/Launching Helper/)).toBeNull());
+      expect(screen.queryByRole("dialog", { name: "Launch a session" })).toBeNull();
+      expect(mocks.launchWorkspaceSession).not.toHaveBeenCalled();
+    });
+
     it("keeps the launcher closed after a quick action succeeds and its session exits", async () => {
       const eventSources = installEventSourceRecorder();
       const handoff = deferred<Response>();
+      const acpSession = { ...runningSession, kind: "acp", target_key: "helper" } satisfies RuntimeSession;
       const runCommand = vi.spyOn(mocks.runtime, "runCommand");
       const originalFetch = globalThis.fetch;
       vi.stubGlobal(
@@ -5851,8 +6367,13 @@ describe("WorkspaceTerminalView", () => {
           return originalFetch(input, init);
         }),
       );
+      mocks.quickActions = [{ label: "Review", agent: "helper", prompt: "Review this change" }];
       mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
-      runWorkspaceQuickAction(mocks.runtime, "ws-1", { label: "Review", agent: "codex", prompt: "Review this change" });
+      runWorkspaceQuickAction(mocks.runtime, "ws-1", {
+        label: "Review",
+        agent: "helper",
+        prompt: "Review this change",
+      });
       const execution = runCommand.mock.results.at(-1)!.value;
       claimForPrs();
       render(WorkspaceTerminalView, { props: { workspaceId: "ws-1", paneSurface: "prs" as const } });
@@ -5864,18 +6385,34 @@ describe("WorkspaceTerminalView", () => {
       expect(screen.queryByRole("dialog", { name: "Launch a session" })).toBeNull();
       expect(mocks.launchWorkspaceSession).not.toHaveBeenCalled();
 
+      expect(screen.getByRole("status", { name: "Launching Helper..." })).toBeTruthy();
+      hostedWorkspaceLauncher("prs")!();
+      const pendingLauncher = await screen.findByRole("dialog", { name: "Launch a session" });
+      expect(within(pendingLauncher).getByRole("button", { name: "Review" }).hasAttribute("disabled")).toBe(true);
+      expect(within(pendingLauncher).getByRole("button", { name: "Helper" }).hasAttribute("disabled")).toBe(false);
+      await fireEvent.click(within(pendingLauncher).getByRole("button", { name: "Close", exact: true }));
+      const runtimeRefresh = deferred<ReturnType<typeof runtimeWithLaunchTargetsOnly>>();
+      mocks.getWorkspaceRuntime.mockReturnValue(runtimeRefresh.promise);
       handoff.resolve(
         Response.json({
-          session: runningSession,
-          initial_message: { state: "delivered", target_key: "codex", message_bytes: 18 },
+          session: acpSession,
+          initial_message: { state: "delivered", target_key: "helper", message_bytes: 18 },
         }),
       );
       // The handoff response can precede the next three-second runtime poll.
       await execution.exit;
       flushSync();
+      expect(await screen.findByRole("textbox", { name: "Message agent" })).toBeTruthy();
+      expect(screen.queryByText("Launching Helper...")).toBeNull();
       expect(screen.queryByRole("dialog", { name: "Launch a session" })).toBeNull();
 
-      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithStaleSession());
+      hostedWorkspaceLauncher("prs")!();
+      const readyLauncher = await screen.findByRole("dialog", { name: "Launch a session" });
+      expect(within(readyLauncher).getByRole("button", { name: "Review" }).hasAttribute("disabled")).toBe(false);
+      await fireEvent.click(within(readyLauncher).getByRole("button", { name: "Close", exact: true }));
+
+      runtimeRefresh.resolve({ ...runtimeWithLaunchTargetsOnly(), sessions: [acpSession] });
+      mocks.getWorkspaceRuntime.mockResolvedValue({ ...runtimeWithStaleSession(), sessions: [acpSession] });
       await waitFor(() =>
         expect(latestWorkspaceEventListeners(eventSources)["reconnect.stale"]).toBeTypeOf("function"),
       );

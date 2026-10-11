@@ -2,6 +2,7 @@
   import { updateWorkspaceTarget, visitWorkspaceTargetReference } from "../../api/workspace-targets.js";
   import type { TabbedPanelLeaf } from "../shared/tabbed-panel-layout.js";
   import {
+    quickActionLaunches,
     quickActionWorkspaceKey,
     quickActionWorkspaces,
     runWorkspaceQuickAction,
@@ -74,6 +75,7 @@
     clampTerminalHeight,
     closeSessionInTerminalGroups,
     collectSessionKeys,
+    collectWorkflowTabKeys,
     createTerminalGroup,
     defaultTerminalLayout,
     findLeafBySession,
@@ -982,7 +984,8 @@
     const identity = workspaceIdentitySnapshot(workspaceId);
     return (
       (identity !== undefined ? pendingWorkspaceCreateLaunch(identity) : null) ??
-      pendingWorkspaceLaunch(workspaceId, workspaceHostKey)?.targetKey ?? null
+      pendingWorkspaceLaunch(workspaceId, workspaceHostKey)?.targetKey ??
+      quickActionLaunches.get(quickActionWorkspaceKey(workspaceId, workspaceHostKey))?.targetKey ?? null
     );
   }
 
@@ -1234,17 +1237,25 @@
       : (sessionKey: string) => {
           const session = runtimeSessions.find((candidate) => candidate.key === sessionKey);
           if (!session) return;
-          promoteSessionBesideWorkspace(surfaceLayout, sessionPaneKeyFor(session));
+          if (promoteSessionBesideWorkspace(surfaceLayout, sessionPaneKeyFor(session))) {
+            rememberQuickActionSessionPlacement(sessionKey);
+          }
         },
   );
+
+  function rememberQuickActionSessionPlacement(sessionKey: string): void {
+    const launch = quickActionLaunches.get(quickActionWorkspaceKey(workspaceId, workspaceHostKey));
+    if (launch) (launch.explicitlyMovedSessionKeys ??= new Set()).add(sessionKey);
+  }
 
   /** Bring a promoted session home before a container edit places it. */
   function demoteWorkflowTab(tabKey: WorkflowTabKey): void {
     const sessionKey = sessionKeyFromWorkflowTab(tabKey);
     if (sessionKey === null) return;
     const session = runtimeSessions.find((candidate) => candidate.key === sessionKey);
-    if (!session || !isPromoted(session)) return;
-    surfaceLayout?.demoteTab(sessionPaneKeyFor(session));
+    if (!session) return;
+    rememberQuickActionSessionPlacement(sessionKey);
+    if (isPromoted(session)) surfaceLayout?.demoteTab(sessionPaneKeyFor(session));
   }
 
   const terminalSessions = $derived(
@@ -2983,23 +2994,13 @@
       : [],
   );
 
+  const quickActionBusy = $derived(
+    quickActionLaunches.has(quickActionWorkspaceKey(workspaceId, workspaceHostKey)),
+  );
+
   function handleQuickAction(action: QuickAction, leaf?: WorkspaceRuntimeLaunchLeaf): void {
     if (!workspaceId || actionsBlocked) return;
-    const id = workspaceId;
-    const hostKey = workspaceHostKey;
-    runWorkspaceQuickAction(appRuntime, id, action, hostKey, (session) => {
-      if (!isCurrentWorkspace(id, hostKey)) return;
-      clearClosedSession(session);
-      const sessions = upsertRuntimeSession(session);
-      applySessionToWorkflow(session.key, sessions);
-      if (leaf?.surface === "workflow") {
-        appendWorkflowTabToGroup(workflowTabKeyForSession(session.key), leaf.id, sessions);
-      } else if (leaf?.surface === "detail") {
-        surfaceLayout?.promoteTab(sessionPaneKeyFor(session), { kind: "tab", leafID: leaf.id });
-      }
-      requestSessionFocus(sessionHostKeyFor(session));
-      requestRuntime({ force: true });
-    });
+    runWorkspaceQuickAction(appRuntime, workspaceId, action, workspaceHostKey, undefined, leaf);
   }
 
   function startAcceptedWorkspaceLaunchReconciliation(
@@ -3151,17 +3152,17 @@
         ? { ...candidate, activeSessionKey: sessionKey }
         : candidate,
     );
-    terminalLayout = normalizeLayoutForSessions(
-      sessions,
-      layoutWithTerminalGroups(
-        {
-          ...terminalLayout,
-          open: remember || terminalLayout.open,
-        },
-        groups,
-        group?.id ?? terminalLayout.activeTerminalGroupID,
-      ),
+    const selected = layoutWithTerminalGroups(
+      {
+        ...terminalLayout,
+        open: remember || terminalLayout.open,
+      },
+      groups,
+      group?.id ?? terminalLayout.activeTerminalGroupID,
     );
+    terminalLayout = runtimeSnapshotAuthoritative
+      ? normalizeLayoutForSessions(sessions, selected)
+      : selected;
     if (terminalLayout.dock === "top") {
       selectWorkspaceTab("terminal", remember);
     }
@@ -3186,6 +3187,7 @@
     if (actionsBlocked) return;
     const session = runtimeSessions.find((s) => s.key === sessionKey);
     if (!session) return;
+    rememberQuickActionSessionPlacement(sessionKey);
     if (isPromoted(session)) surfaceLayout?.demoteTab(sessionPaneKeyFor(session));
     const groups = addTerminalGroup(terminalLayout.terminalGroups, sessionKey);
     terminalLayout = normalizeLayoutForSessions(runtimeSessions, {
@@ -3214,6 +3216,7 @@
     sessions: RuntimeSession[] = runtimeSessions,
   ): void {
     if (actionsBlocked) return;
+    if (sessions.some((session) => session.key === sessionKey)) rememberQuickActionSessionPlacement(sessionKey);
     applySessionToWorkflow(sessionKey, sessions);
   }
 
@@ -3617,6 +3620,7 @@
       selectTerminalSession(sessionKey);
       return;
     }
+    rememberQuickActionSessionPlacement(sessionKey);
     const groupsWithoutSource = closeSessionInTerminalGroups(
       terminalLayout.terminalGroups,
       sessionKey,
@@ -4387,6 +4391,73 @@
     void loadEmptyLaunchTargets();
   });
 
+  $effect(() => {
+    const workspaceKey = quickActionWorkspaceKey(workspaceId, workspaceHostKey);
+    const launch = quickActionLaunches.get(workspaceKey);
+    const session = launch?.session;
+    if (!session || !workspaceLive || workspace?.status !== "ready") return;
+    untrack(() => {
+      quickActionLaunches.delete(workspaceKey);
+      const tabKey = workflowTabKeyForSession(session.key);
+      const savedGroup = terminalGroupForSession(terminalLayout.terminalGroups, session.key);
+      const hasPlacement = runtimeSessions.some((candidate) => candidate.key === session.key) ||
+        terminalLayout.sessionRegions[session.key] !== undefined ||
+        findWorkflowLeafByTab(terminalLayout.workflowTree, tabKey) !== null || savedGroup !== null;
+      const userPlaced = launch.explicitlyMovedSessionKeys?.has(session.key) ||
+        surfaceLayout?.hasTab(sessionPaneKeyFor(session));
+      clearClosedSession(session);
+      upsertRuntimeSession(session);
+      if (!userPlaced && (launch.leaf !== undefined || !hasPlacement)) {
+        // A handoff confirms this session, not the absence of the other saved sessions.
+        let tree = normalizeWorkflowTree(terminalLayout.workflowTree, [
+          ...collectWorkflowTabKeys(terminalLayout.workflowTree), tabKey,
+        ]);
+        if (launch.leaf?.surface === "workflow") {
+          const placed = appendWorkflowTabToLeaf(tree, tabKey, launch.leaf.id);
+          if (placed && findWorkflowLeafByTab(placed, tabKey)?.id === launch.leaf.id) tree = placed;
+        }
+        terminalLayout = {
+          ...layoutWithTerminalGroups(
+            terminalLayout,
+            closeSessionInTerminalGroups(terminalLayout.terminalGroups, session.key),
+            terminalLayout.activeTerminalGroupID,
+          ),
+          sessionRegions: { ...terminalLayout.sessionRegions, [session.key]: "workflow" },
+          workflowTree: tree,
+        };
+        if (launch.leaf?.surface === "detail") {
+          surfaceLayout?.promoteTab(sessionPaneKeyFor(session), { kind: "tab", leafID: launch.leaf.id });
+        }
+      }
+      mountSessionTerminal(session.key);
+      if (isPromoted(session)) {
+        surfaceLayout?.activateTab(sessionPaneKeyFor(session));
+      } else {
+        let activeKey = tabKey;
+        if (sessionRegion(session) === "terminal") {
+          const group = terminalGroupForSession(terminalLayout.terminalGroups, session.key);
+          terminalLayout = layoutWithTerminalGroups(
+            { ...terminalLayout, open: true },
+            terminalLayout.terminalGroups.map((candidate) => candidate.id === group?.id
+              ? { ...candidate, activeSessionKey: session.key } : candidate),
+            group?.id ?? terminalLayout.activeTerminalGroupID,
+          );
+          if (terminalLayout.dock === "top") activeKey = "terminal";
+        }
+        if (sessionRegion(session) === "workflow" || terminalLayout.dock === "top") {
+          terminalLayout = {
+            ...terminalLayout,
+            workflowTree: activateWorkflowTab(terminalLayout.workflowTree, activeKey),
+          };
+          activeTabKey = activeKey;
+          rememberActiveTab(activeKey);
+        }
+      }
+      requestSessionFocus(sessionHostKeyFor(session));
+      requestRuntime({ force: true });
+    });
+  });
+
   function reconcileQueuedWorkspaceLaunch(admissionRuntime: WorkspaceRuntimeState): void {
     if (!workspaceLive || workspace?.status !== "ready" || actionsBlocked ||
       (workspaceHostKey === undefined && isWorkspaceIdDeleted(workspaceId))) return;
@@ -4549,6 +4620,7 @@
         <div class="state-message">
           <Spinner size={18} />
           <span>Setting up workspace...</span>
+          {#if explicitLaunchTargetKey()}<span>Preparing worktree...</span>{/if}
           {@render inlineCollapseControl()}
         </div>
       {:else if workspace.status === "error"}
@@ -4790,6 +4862,7 @@
                     disabled={actionsBlocked}
                     hostVisible={interactionVisible}
                     quickActions={workspaceQuickActions}
+                    {quickActionBusy}
                     onQuickAction={handleQuickAction}
                     onLaunch={(key) => handleLaunch(key)}
                   />
@@ -4890,6 +4963,7 @@
                             disabled={actionsBlocked}
                             {hostVisible}
                             quickActions={workspaceQuickActions}
+                            {quickActionBusy}
                             onQuickAction={(action) => handleQuickAction(action, { surface: "workflow", id: leaf.id })}
                             onLaunch={(key) => handleLaunch(key, undefined, { surface: "workflow", id: leaf.id })}
                           />
@@ -5273,6 +5347,7 @@
       {launchingKey}
       readonly={actionsBlocked}
       quickActions={workspaceQuickActions}
+      {quickActionBusy}
       onClose={closeLauncher}
       onLaunch={(key) => handleLaunch(key, undefined, launcherState?.leaf)}
       onQuickAction={(action) => {
@@ -5428,6 +5503,7 @@
       disabled={actionsBlocked}
       hostVisible={interactionVisible}
       quickActions={workspaceQuickActions}
+      {quickActionBusy}
       onQuickAction={handleQuickAction}
       onLaunch={(key) => void handleLaunch(key)}
     />
