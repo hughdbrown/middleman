@@ -29,6 +29,11 @@ const (
 
 const RuntimeSessionKeyEnv = "KENN_FORGE_RUNTIME_SESSION_KEY"
 
+var (
+	errInvalidReport = errors.New("invalid report")
+	errEmptyReport   = errors.New("empty report")
+)
+
 type Report struct {
 	Agent             string    `json:"agent"`
 	SessionID         string    `json:"session_id"`
@@ -186,16 +191,35 @@ func (s *Store) Remove(agent, sessionID, runtimeSessionKey string) error {
 	}
 	legacy := s.legacyReportPath(agent, sessionID)
 	paths := []string{s.reportPath(agent, sessionID, runtimeSessionKey)}
-	if report, ok := s.readReport(legacy); ok && report.RuntimeSessionKey == runtimeSessionKey {
-		paths = append(paths, legacy)
-	}
 	var errs []error
+	legacyReport, legacyErr := s.readReport(legacy)
+	ownsLegacy := legacyErr == nil && legacyReport.RuntimeSessionKey == runtimeSessionKey
+	// An empty legacy report holds no activity, so any session may finish deleting it.
+	if ownsLegacy || errors.Is(legacyErr, errEmptyReport) {
+		paths = append(paths, legacy)
+	} else if legacyErr != nil && !errors.Is(legacyErr, os.ErrNotExist) &&
+		!errors.Is(legacyErr, errInvalidReport) {
+		errs = append(errs, legacyErr)
+	}
 	removed := false
 	for _, path := range paths {
 		err := os.Remove(path)
 		switch {
 		case err == nil:
 			removed = true
+		case isReportLockError(err):
+			// Zero-length reports stay hidden until a scan can delete them.
+			writeErr := os.Truncate(path, 0)
+			if writeErr != nil {
+				if info, statErr := os.Stat(path); statErr == nil && info.Size() == 0 {
+					writeErr = nil
+				}
+			}
+			if writeErr != nil {
+				errs = append(errs, errors.Join(err, writeErr))
+			} else {
+				removed = true
+			}
 		case !errors.Is(err, os.ErrNotExist):
 			errs = append(errs, err)
 		}
@@ -360,6 +384,7 @@ func (s *Store) reports() []storedReport {
 		return nil
 	}
 	files := make(map[string]os.FileInfo)
+	emptyFiles := make(map[string]bool)
 	metadataComplete := true
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
@@ -368,6 +393,12 @@ func (s *Store) reports() []storedReport {
 		info, infoErr := entry.Info()
 		if infoErr != nil {
 			metadataComplete = false
+			continue
+		}
+		if info.Size() == 0 {
+			emptyFiles[entry.Name()] = true
+			// Empty reports have no activity; retry cleanup before reusing the remaining reports' cache.
+			_ = os.Remove(filepath.Join(s.root, entry.Name()))
 			continue
 		}
 		files[entry.Name()] = info
@@ -379,12 +410,12 @@ func (s *Store) reports() []storedReport {
 	reports := make([]storedReport, 0, len(entries))
 	cleanupPending := false
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" || emptyFiles[entry.Name()] {
 			continue
 		}
 		path := filepath.Join(s.root, entry.Name())
-		report, ok := s.readReport(path)
-		if !ok {
+		report, err := s.readReport(path)
+		if err != nil {
 			continue
 		}
 		report.Agent = strings.ToLower(strings.TrimSpace(report.Agent))
@@ -515,37 +546,45 @@ func (s *Store) writeReport(report Report) error {
 	return nil
 }
 
-func (s *Store) readReport(path string) (Report, bool) {
-	file, err := os.Open(path)
+func (s *Store) readReport(path string) (Report, error) {
+	// Windows opens through os.Root with delete sharing, so this read does not block report cleanup.
+	file, err := os.OpenInRoot(s.root, filepath.Base(path))
 	if err != nil {
-		return Report{}, false
+		return Report{}, fmt.Errorf("read report %s: %w", path, err)
 	}
 	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 64<<10))
+	if err != nil {
+		return Report{}, fmt.Errorf("read report %s: %w", path, err)
+	}
+	if len(data) == 0 {
+		return Report{}, fmt.Errorf("%w %s", errEmptyReport, path)
+	}
 	var report Report
-	if err := json.UnmarshalRead(io.LimitReader(file, 64<<10), &report); err != nil {
-		return Report{}, false
+	if err := json.Unmarshal(data, &report); err != nil {
+		return Report{}, fmt.Errorf("%w %s: %w", errInvalidReport, path, err)
 	}
 	if statePriority(report.State) == 0 || report.RuntimeSessionKey == "" ||
 		report.CWD == "" || report.UpdatedAt.IsZero() {
-		return Report{}, false
+		return Report{}, fmt.Errorf("%w %s", errInvalidReport, path)
 	}
 	cwd, err := canonicalWorkspacePath(report.CWD)
 	if err != nil {
-		return Report{}, false
+		return Report{}, fmt.Errorf("%w %s workspace: %w", errInvalidReport, path, err)
 	}
 	report.CWD = cwd
-	return report, true
+	return report, nil
 }
 
 // previousReport returns the newest report for one terminal, including one saved under its name from before terminals had their own.
 func (s *Store) previousReport(agent, sessionID, runtimeSessionKey string) (Report, bool) {
-	report, ok := s.readReport(s.reportPath(agent, sessionID, runtimeSessionKey))
-	legacy, legacyOK := s.readReport(s.legacyReportPath(agent, sessionID))
-	if legacyOK && legacy.RuntimeSessionKey == runtimeSessionKey &&
-		(!ok || legacy.UpdatedAt.After(report.UpdatedAt)) {
+	report, err := s.readReport(s.reportPath(agent, sessionID, runtimeSessionKey))
+	legacy, legacyErr := s.readReport(s.legacyReportPath(agent, sessionID))
+	if legacyErr == nil && legacy.RuntimeSessionKey == runtimeSessionKey &&
+		(err != nil || legacy.UpdatedAt.After(report.UpdatedAt)) {
 		return legacy, true
 	}
-	return report, ok
+	return report, err == nil
 }
 
 func (s *Store) legacyReportPath(agent, sessionID string) string {

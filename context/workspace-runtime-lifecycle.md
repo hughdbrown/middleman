@@ -130,6 +130,22 @@ Rules:
   (`internal/agentactivity/store.go::Store.reportPath`).
 - SessionEnd and Remove clear only the calling terminal's report
   (`internal/agentactivity/store.go::Store.Remove`).
+- When Windows refuses to delete a report, cleanup empties it instead
+  (`internal/agentactivity/store.go::Store.Remove`):
+  - Only sharing-violation and access-denied delete errors permit emptying
+    (`internal/agentactivity/report_lock_windows.go::isReportLockError`).
+  - Empty reports count as no activity. Every scan skips them and retries
+    their deletion, including after a daemon restart. They stay out of the
+    cache comparison, so they do not invalidate the cached remaining reports
+    (`internal/agentactivity/store.go::Store.reports`).
+  - SessionEnd deletes an empty legacy report whichever runtime ends, and
+    leaves a corrupt or invalid legacy report in place.
+  - SessionEnd fails with HTTP 500, and the hook CLI exits with the file and
+    cause, when a legacy report cannot be opened or read for a reason other
+    than absence, a nonempty report cannot be emptied, or deletion fails for
+    any other reason
+    (`internal/server/workspaceapi/agent_hook.go::Handler.receiveAgentHook`,
+    `cmd/kenn-forge/agent_hook.go::agentHookRelay.relay`).
 - Agents started before an upgrade can keep writing the old report filename;
   retain read and cleanup support until those sessions end
   (`internal/agentactivity/store.go::Store.legacyReportPath`).

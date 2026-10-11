@@ -95,6 +95,10 @@ Use `--agent NAME` to install one agent's hook. The sidebar can then show when
 an agent is working, waiting for approval, waiting for input, or done. Without
 fresh hook reports, Forge falls back to tmux activity.
 
+On Windows, ending a conversation with `/clear` or exit clears its badge even
+if another program, such as a virus scanner, has the activity file open. If
+Forge can't clear it, the SessionEnd hook fails and names the file.
+
 ## Attach outside the browser
 
 Workspace and session controls expose tmux attach commands. This is useful for
