@@ -50,6 +50,22 @@
       .map((choice) => choice.value)
       .filter((choice) => (choice === value ? checked : current.includes(choice)));
   }
+  // Activating the picked option of an optional question clears it in place,
+  // so the form never grows a separate clear control. A click on an already
+  // checked radio fires no change event, so this listens to clicks (arrow keys
+  // also click the radio they move to). Space on a checked radio fires nothing,
+  // so its keydown clears instead.
+  function clears(field: ElicitationField, value: string): boolean {
+    return !field.required && textOf(field.key) === value;
+  }
+  function pick(field: ElicitationField, value: string) {
+    values[field.key] = clears(field, value) ? "" : value;
+  }
+  function clearOnSpace(event: KeyboardEvent, field: ElicitationField, value: string) {
+    if (event.key !== " " || !clears(field, value)) return;
+    event.preventDefault();
+    values[field.key] = "";
+  }
   function respond(response: ElicitationResponse) {
     if (disabled || sent) return;
     sent = true;
@@ -99,7 +115,7 @@
         >{@render labelText(field)}</Checkbox>
       {:else if field.kind === "multi" || field.kind === "select"}
         {@const picked = field.kind === "multi" ? picksOf(field.key) : [textOf(field.key)]}
-        {@const preview = field.kind === "select" ? field.choices.find((choice) => choice.value === picked[0])?.preview : ""}
+        {@const previews = field.kind === "select" ? field.choices.filter((choice) => choice.preview) : []}
         <fieldset
           aria-describedby={describedBy || undefined}
           role={field.kind === "select" ? "radiogroup" : undefined}
@@ -123,17 +139,27 @@
                     value={choice.value}
                     {checked}
                     {disabled}
-                    onchange={() => { values[field.key] = choice.value; }}
+                    onclick={() => pick(field, choice.value)}
+                    onkeydown={(event) => clearOnSpace(event, field, choice.value)}
                   />
                   {@render choiceText(choice)}
                 </label>
               {/if}
             {/each}
           </div>
-          {#if preview}<pre class="preview" aria-label={`${field.label} preview`}>{preview}</pre>{/if}
-          {#if field.kind === "select" && !field.required && picked[0]}
-            <div class="clear">
-              <Button size="sm" {disabled} onclick={() => { values[field.key] = ""; }}>Clear selection</Button>
+          <!-- Every preview sits in one grid cell from the first render, so the
+               slot is as tall as the tallest one and picking an option only
+               changes which preview is visible; the form below never moves. -->
+          {#if previews.length}
+            <div class="preview">
+              {#each previews as choice (choice.value)}
+                {@const shown = picked[0] === choice.value}
+                <pre
+                  class={["preview-text", !shown && "preview-text--hidden"]}
+                  aria-hidden={shown ? undefined : "true"}
+                  aria-label={shown ? `${field.label} preview` : undefined}
+                >{choice.preview}</pre>
+              {/each}
             </div>
           {/if}
         </fieldset>
@@ -184,8 +210,9 @@
   .choice-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .choice-title { font-size: var(--font-size-sm); font-weight: var(--font-weight-medium); color: var(--text-primary); overflow-wrap: anywhere; }
   .choice-description { font-size: var(--font-size-xs); color: var(--text-secondary); overflow-wrap: anywhere; white-space: pre-wrap; }
-  .preview { margin: var(--space-2) 0 0; padding: var(--space-2) var(--space-3); max-height: 16rem; overflow: auto; border: 1px solid var(--border-muted); border-radius: var(--radius-md); background: var(--bg-inset); font-family: var(--font-mono); font-size: var(--font-size-xs); color: var(--text-primary); white-space: pre; }
-  .clear { margin-top: var(--space-2); }
+  .preview { display: grid; margin: var(--space-2) 0 0; padding: var(--space-2) var(--space-3); max-height: 16rem; overflow: auto; border: 1px solid var(--border-muted); border-radius: var(--radius-md); background: var(--bg-inset); }
+  .preview-text { grid-area: 1 / 1; margin: 0; font-family: var(--font-mono); font-size: var(--font-size-xs); color: var(--text-primary); white-space: pre; }
+  .preview-text--hidden { visibility: hidden; }
   .required { color: var(--accent-red); }
   small { font-size: var(--font-size-xs); color: var(--text-secondary); overflow-wrap: anywhere; }
   .problem { color: var(--accent-red); }
