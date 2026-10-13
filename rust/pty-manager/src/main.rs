@@ -350,6 +350,13 @@ fn run_owner(args: Args) -> Result<()> {
         if owner_should_exit(&shared, &mut completed_at) {
             break;
         }
+        // At capacity, leave new connections queued in the listen backlog
+        // until a slot frees. Clients treat a connection closed without a
+        // response as a dead owner and delete its state.
+        let Some(slot) = connection_slots.try_acquire() else {
+            thread::sleep(Duration::from_millis(25));
+            continue;
+        };
         let stream = match listener.accept() {
             Ok((stream, _addr)) => stream,
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -357,10 +364,6 @@ fn run_owner(args: Args) -> Result<()> {
                 continue;
             }
             Err(err) => return Err(err).context("accept connection"),
-        };
-        let Some(slot) = connection_slots.try_acquire() else {
-            // At capacity: close the connection instead of spawning a thread.
-            continue;
         };
         stream.set_nonblocking(false)?;
         let token = token.clone();
@@ -2413,6 +2416,45 @@ mod tests {
 
         drop(first);
         assert!(slots.try_acquire().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_at_capacity_queues_connections_instead_of_closing_them() {
+        let (root, owner, state) = start_test_owner("exec sleep 30");
+        let addr = state["addr"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("unix://");
+        let mut idle: Vec<UnixStream> = (0..MAX_OWNER_CONNECTIONS)
+            .map(|_| UnixStream::connect(addr).unwrap())
+            .collect();
+        thread::sleep(Duration::from_millis(200));
+
+        let request = |kind: &str| {
+            let mut stream = UnixStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = json!({ "type": kind, "token": state["token"] });
+            stream.write_all(format!("{request}\n").as_bytes()).unwrap();
+            stream
+        };
+        let queued = request("status");
+        thread::sleep(Duration::from_millis(200));
+        drop(idle.pop());
+        let mut line = String::new();
+        BufReader::new(queued).read_line(&mut line).unwrap();
+
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["type"], "output");
+        drop(idle);
+        let mut stop = String::new();
+        BufReader::new(request("stop"))
+            .read_line(&mut stop)
+            .unwrap();
+        owner.join().unwrap().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
