@@ -51,6 +51,8 @@ const MAX_UNIX_SOCKET_PATH_LEN: usize = 100;
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 64;
 const OWNER_EXIT_CODE_GRACE_PERIOD: Duration = Duration::from_millis(200);
 const OWNER_POST_EXIT_LINGER: Duration = Duration::from_secs(5);
+const OWNER_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+const OWNER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const OWNER_FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_OWNER_CONNECTIONS: usize = 32;
 const INITIAL_PTY_SIZE: PtySize = PtySize {
@@ -171,7 +173,10 @@ struct Shared {
     child_reaped: bool,
     exited: bool,
     reader_done: bool,
-    stopping: bool,
+    // Set once the child has exited and its output has drained, or stopped
+    // draining; subscribers are closed and new attachments get the exit code.
+    output_closed: bool,
+    stop_requested_at: Option<Instant>,
     exit_code: i32,
 }
 
@@ -319,7 +324,13 @@ fn run_owner(args: Args) -> Result<()> {
     {
         let child_pid = child.process_id().context("spawned pty child has no pid")?;
         thread::spawn(move || {
-            mark_child_exited(&wait_shared, wait_for_exit_without_reaping(child_pid));
+            let exit_code = wait_for_exit_without_reaping(child_pid).unwrap_or_else(|err| {
+                eprintln!("wait for pty child {child_pid}: {err}");
+                -1
+            });
+            mark_child_exited(&wait_shared, exit_code);
+            thread::sleep(OWNER_OUTPUT_DRAIN_TIMEOUT);
+            mark_output_drain_expired(&wait_shared);
         });
     }
     #[cfg(windows)]
@@ -329,6 +340,8 @@ fn run_owner(args: Args) -> Result<()> {
             Err(_) => -1,
         };
         mark_child_exited(&wait_shared, exit_code);
+        thread::sleep(OWNER_OUTPUT_DRAIN_TIMEOUT);
+        mark_output_drain_expired(&wait_shared);
     });
 
     let connection_slots = ConnectionSlots::new(MAX_OWNER_CONNECTIONS);
@@ -372,9 +385,7 @@ fn run_owner(args: Args) -> Result<()> {
 // process, so stop can still kill descendants left in the group after the
 // shell exits without any risk of signalling an unrelated group.
 #[cfg(unix)]
-fn wait_for_exit_without_reaping(pid: u32) -> i32 {
-    // CLD_EXITED has the same value on Linux and macOS.
-    const CLD_EXITED: i32 = 1;
+fn wait_for_exit_without_reaping(pid: u32) -> io::Result<i32> {
     loop {
         // SAFETY: siginfo_t is plain old data, so all-zero bytes are valid.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -382,15 +393,16 @@ fn wait_for_exit_without_reaping(pid: u32) -> i32 {
         let rc =
             unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
         if rc == 0 {
-            if info.si_code == CLD_EXITED {
+            if info.si_code == libc::CLD_EXITED {
                 // SAFETY: waitid filled a SIGCHLD siginfo, so si_status is set.
-                return unsafe { info.si_status() };
+                return Ok(unsafe { info.si_status() });
             }
-            // Killed by a signal; portable-pty reports this as exit code 1.
-            return 1;
+            // Killed by a signal; the Go owner reports this as -1.
+            return Ok(-1);
         }
-        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            return -1;
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
         }
     }
 }
@@ -547,7 +559,7 @@ fn handle_attach(
 
     let mut output_stream = stream.try_clone()?;
     let shared_for_output = Arc::clone(&runtime.shared);
-    thread::spawn(move || {
+    let output = thread::spawn(move || {
         for chunk in rx {
             if write_response(&mut output_stream, ok_with_output(chunk)).is_err() {
                 return;
@@ -560,7 +572,23 @@ fn handle_attach(
         let _ = output_stream.shutdown(Shutdown::Both);
     });
 
-    while let Some(req) = read_request(&mut reader, MAX_OWNER_REQUEST_SIZE)? {
+    let result = serve_attach_requests(&mut reader, token, &runtime, killer);
+    // Fail any write still blocked on this client and close the output
+    // channel, then wait for the output thread so the connection slot stays
+    // held until the thread is gone.
+    let _ = stream.shutdown(Shutdown::Both);
+    drop(active_attachment);
+    let _ = output.join();
+    result
+}
+
+fn serve_attach_requests(
+    reader: &mut BufReader<OwnerStream>,
+    token: &str,
+    runtime: &AttachRuntime,
+    killer: &mut Box<dyn ChildKiller + Send + Sync>,
+) -> Result<()> {
+    while let Some(req) = read_request(reader, MAX_OWNER_REQUEST_SIZE)? {
         if req.token != token {
             return Ok(());
         }
@@ -875,7 +903,7 @@ enum Subscription {
 // becomes visible to broadcast and no newer chunk can overtake it; the Go
 // owner's subscribe makes the same guarantee.
 fn subscribe(shared: &mut Shared, tx: mpsc::SyncSender<Vec<u8>>) -> Subscription {
-    if shared.exited && shared.reader_done {
+    if shared.output_closed {
         return Subscription::Complete {
             replay: shared.output.clone(),
             exit_code: shared.exit_code,
@@ -900,13 +928,15 @@ fn add_subscriber(shared: &mut Shared, tx: mpsc::SyncSender<Vec<u8>>) -> u64 {
 // After the child exits, keep serving so the attached client can drain its
 // output and exit frame, or a client that reconnects can still collect them.
 // Leave once such an attachment ends, or after a bounded linger, matching the
-// Go owner's waitAfterNaturalExit.
+// Go owner's waitAfterNaturalExit. After a stop, wait (bounded) for the killed
+// child's exit to close the output so the attached client gets its exit frame.
 fn owner_should_exit(shared: &Arc<Mutex<Shared>>, completed_at: &mut Option<Instant>) -> bool {
     let shared = shared.lock().expect("shared poisoned");
-    if shared.stopping {
-        return true;
+    if let Some(stop_requested_at) = shared.stop_requested_at {
+        return (shared.output_closed && !shared.attached)
+            || stop_requested_at.elapsed() >= OWNER_STOP_TIMEOUT;
     }
-    if !(shared.exited && shared.reader_done) {
+    if !shared.output_closed {
         return false;
     }
     let completed_at = *completed_at.get_or_insert_with(Instant::now);
@@ -915,21 +945,17 @@ fn owner_should_exit(shared: &Arc<Mutex<Shared>>, completed_at: &mut Option<Inst
 }
 
 fn stop_owner(shared: &Arc<Mutex<Shared>>, killer: &mut Box<dyn ChildKiller + Send + Sync>) {
-    let subscribers = {
-        let mut shared = shared.lock().expect("shared poisoned");
-        // The shell can exit while descendants, such as a SIGHUP-ignoring
-        // background job, stay in its process group, so the group kill must
-        // run even after the child has exited. Until reap_child releases the
-        // zombie, its PID cannot be reused, so the group ID still names only
-        // this session's processes. Signal before setting `stopping`, and
-        // under the lock, so the owner cannot reap in between.
-        if !shared.child_reaped {
-            let _ = killer.kill();
-        }
-        shared.stopping = true;
-        std::mem::take(&mut shared.subscribers)
-    };
-    drop(subscribers);
+    let mut shared = shared.lock().expect("shared poisoned");
+    // The shell can exit while descendants, such as a SIGHUP-ignoring
+    // background job, stay in its process group, so the group kill must run
+    // even after the child has exited. Until reap_child releases the zombie,
+    // its PID cannot be reused, so the group ID still names only this
+    // session's processes. Signal before recording the stop, and under the
+    // lock, so the owner cannot reap in between.
+    if !shared.child_reaped {
+        let _ = killer.kill();
+    }
+    shared.stop_requested_at.get_or_insert_with(Instant::now);
 }
 
 fn mark_child_exited(shared: &Arc<Mutex<Shared>>, exit_code: i32) {
@@ -968,12 +994,25 @@ fn exit_code_after_output_close(shared: &Arc<Mutex<Shared>>) -> i32 {
     }
 }
 
+// A descendant can hold the terminal open after the child exits, so stop
+// waiting for the output to drain once the child has been gone for
+// OWNER_OUTPUT_DRAIN_TIMEOUT, matching the Go owner's wait.
+fn mark_output_drain_expired(shared: &Arc<Mutex<Shared>>) {
+    let subscribers = close_output(&mut shared.lock().expect("shared poisoned"));
+    drop(subscribers);
+}
+
 fn take_subscribers_if_complete(shared: &mut Shared) -> Vec<Subscriber> {
     if shared.exited && shared.reader_done {
-        std::mem::take(&mut shared.subscribers)
+        close_output(shared)
     } else {
         Vec::new()
     }
+}
+
+fn close_output(shared: &mut Shared) -> Vec<Subscriber> {
+    shared.output_closed = true;
+    std::mem::take(&mut shared.subscribers)
 }
 
 // portable-pty's cloned killer only sends SIGHUP to the child PID, which a
@@ -1016,12 +1055,6 @@ impl ChildKiller for ProcessGroupKiller {
 
 #[cfg(unix)]
 fn kill_process_group(pid: u32) -> io::Result<()> {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    const SIGKILL: i32 = 9;
-    const ESRCH: i32 = 3;
-
     // Process group 0 or 1 would signal this process's own group or every
     // process the user owns, never a child session.
     let pgid = i32::try_from(pid)
@@ -1034,11 +1067,11 @@ fn kill_process_group(pid: u32) -> io::Result<()> {
             )
         })?;
     // SAFETY: kill takes plain integers and does not dereference pointers.
-    if unsafe { kill(-pgid, SIGKILL) } == 0 {
+    if unsafe { libc::kill(-pgid, libc::SIGKILL) } == 0 {
         return Ok(());
     }
     let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(ESRCH) {
+    if err.raw_os_error() == Some(libc::ESRCH) {
         // The group is already gone.
         return Ok(());
     }
@@ -1401,7 +1434,7 @@ impl Drop for ActiveAttachment {
                 .retain(|subscriber| subscriber.id != subscriber_id);
         }
         shared.attached = false;
-        if shared.exited && shared.reader_done {
+        if shared.output_closed {
             shared.attachment_ended_after_exit = true;
         }
     }
@@ -1967,11 +2000,8 @@ mod tests {
 
     #[cfg(unix)]
     fn process_exists(pid: i32) -> bool {
-        unsafe extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-        }
         // SAFETY: signal 0 only checks that the process exists.
-        unsafe { kill(pid, 0) == 0 }
+        unsafe { libc::kill(pid, 0) == 0 }
     }
 
     #[cfg(unix)]
@@ -1997,13 +2027,7 @@ mod tests {
                     break;
                 }
                 output.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&output);
-                if let Some(pid) = text
-                    .split("bg=")
-                    .nth(1)
-                    .and_then(|rest| rest.split_whitespace().next())
-                    .and_then(|pid| pid.parse::<i32>().ok())
-                {
+                if let Some(pid) = background_pid(&output) {
                     let _ = line_tx.send(pid);
                     break;
                 }
@@ -2120,8 +2144,7 @@ mod tests {
     #[test]
     fn owner_lingers_after_exit_until_bounded_timeout() {
         let shared = Arc::new(Mutex::new(Shared {
-            exited: true,
-            reader_done: true,
+            output_closed: true,
             ..Shared::default()
         }));
         let mut completed_at = None;
@@ -2185,12 +2208,7 @@ mod tests {
             let output = BASE64
                 .decode(status["output"].as_str().unwrap_or_default())
                 .unwrap();
-            if let Some(pid) = String::from_utf8_lossy(&output)
-                .split("bg=")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-                .and_then(|pid| pid.parse::<i32>().ok())
-            {
+            if let Some(pid) = background_pid(&output) {
                 break pid;
             }
             assert!(Instant::now() < deadline, "background pid never printed");
@@ -2211,13 +2229,129 @@ mod tests {
         let survived = process_exists(background_pid);
         if survived {
             // SAFETY: plain signal to the leaked test process.
-            unsafe extern "C" {
-                fn kill(pid: i32, sig: i32) -> i32;
-            }
-            unsafe { kill(background_pid, 9) };
+            unsafe { libc::kill(background_pid, libc::SIGKILL) };
         }
         let _ = fs::remove_dir_all(root);
         assert!(!survived, "background job {background_pid} survived stop");
+    }
+
+    #[cfg(unix)]
+    fn background_pid(output: &[u8]) -> Option<i32> {
+        String::from_utf8_lossy(output)
+            .split("bg=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|pid| pid.parse::<i32>().ok())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_reports_exit_while_background_job_holds_terminal() {
+        let (root, owner, state) =
+            start_test_owner("trap '' HUP; sleep 30 & echo \"bg=$!\"; exit 5");
+
+        let (output, exit_code) = attach_and_collect(&state);
+        let background_pid = background_pid(&output);
+        if let Some(pid) = background_pid {
+            // SAFETY: plain signal to the test's own background job.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+
+        assert!(background_pid.is_some(), "background pid never printed");
+        assert_eq!(exit_code, Some(5));
+        owner.join().unwrap().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_delivers_exit_frame_to_attached_client() {
+        let (root, owner, state) = start_test_owner("echo ready; exec sleep 30");
+        let addr = state["addr"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("unix://");
+        let mut stream = UnixStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let attach = json!({ "type": "attach", "token": state["token"], "cols": 80, "rows": 24 });
+        stream.write_all(format!("{attach}\n").as_bytes()).unwrap();
+        let mut frames = BufReader::new(stream.try_clone().unwrap()).lines();
+        let mut output = Vec::new();
+        while !String::from_utf8_lossy(&output).contains("ready") {
+            let frame: Value = serde_json::from_str(&frames.next().unwrap().unwrap()).unwrap();
+            if frame["type"] == "output" {
+                output.extend(BASE64.decode(frame["output"].as_str().unwrap()).unwrap());
+            }
+        }
+
+        let stop = json!({ "type": "stop", "token": state["token"] });
+        stream.write_all(format!("{stop}\n").as_bytes()).unwrap();
+        let mut exit_code = None;
+        for line in frames {
+            let frame: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            if frame["type"] == "exit" {
+                exit_code = frame["exit_code"].as_i64();
+            }
+        }
+
+        assert_eq!(exit_code, Some(-1));
+        owner.join().unwrap().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_exit_without_reaping_reports_wait_errors() {
+        // This process is not its own child, so waitid fails with ECHILD.
+        let err = wait_for_exit_without_reaping(std::process::id()).unwrap_err();
+
+        assert_eq!(err.raw_os_error(), Some(libc::ECHILD));
+    }
+
+    #[test]
+    fn output_drain_expiry_closes_output_while_reader_runs() {
+        let (tx, rx) = new_subscriber_channel();
+        let shared = Arc::new(Mutex::new(Shared {
+            subscribers: vec![Subscriber { id: 1, tx }],
+            next_subscriber_id: 2,
+            exit_code: -1,
+            ..Shared::default()
+        }));
+        mark_child_exited(&shared, 5);
+
+        mark_output_drain_expired(&shared);
+
+        assert!(rx.recv().is_err());
+        let (late_tx, _late_rx) = new_subscriber_channel();
+        let subscription = subscribe(&mut shared.lock().expect("shared poisoned"), late_tx);
+        assert!(matches!(
+            subscription,
+            Subscription::Complete { exit_code: 5, .. }
+        ));
+    }
+
+    #[test]
+    fn owner_waits_after_stop_for_attachment_until_bounded_timeout() {
+        let shared = Arc::new(Mutex::new(Shared {
+            attached: true,
+            output_closed: true,
+            stop_requested_at: Some(Instant::now()),
+            ..Shared::default()
+        }));
+        let mut completed_at = None;
+        assert!(!owner_should_exit(&shared, &mut completed_at));
+
+        shared.lock().expect("shared poisoned").attached = false;
+        assert!(owner_should_exit(&shared, &mut completed_at));
+
+        let unfinished = Arc::new(Mutex::new(Shared {
+            attached: true,
+            stop_requested_at: Some(Instant::now() - OWNER_STOP_TIMEOUT),
+            ..Shared::default()
+        }));
+        assert!(owner_should_exit(&unfinished, &mut completed_at));
     }
 
     #[cfg(unix)]
@@ -2302,8 +2436,7 @@ mod tests {
     fn subscribe_after_completion_returns_replay_and_exit_code() {
         let shared = Arc::new(Mutex::new(Shared {
             output: b"done".to_vec(),
-            exited: true,
-            reader_done: true,
+            output_closed: true,
             exit_code: 9,
             ..Shared::default()
         }));

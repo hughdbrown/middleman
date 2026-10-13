@@ -442,6 +442,22 @@ jobs:
       - name: Run Rust PTY manager tests
         run: cargo test -p kenn-forge-pty-manager
 
+  pty-rust-linux:
+    name: Rust PTY manager tests (linux)
+    runs-on: ${{ github.repository == 'kenn-io/forge' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'namespace-profile-linux-4cpu' || 'ubuntu-latest' }}
+    needs: detect_changes
+    if: needs.detect_changes.outputs.rust == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Run Rust PTY manager tests
+        run: cargo test -p kenn-forge-pty-manager
+
   daemon-path-macos:
     name: Daemon path identity (macOS)
     runs-on: ${{ github.repository == 'kenn-io/forge' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'namespace-profile-mac-6cpu' || 'macos-15' }}
