@@ -2420,6 +2420,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn attachment_teardown_waits_for_stalled_output_worker() {
+        let pair = native_pty_system().openpty(INITIAL_PTY_SIZE).unwrap();
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(io::sink())));
+        let master = Arc::new(Mutex::new(pair.master));
+        let shared = Arc::new(Mutex::new(Shared {
+            exit_code: -1,
+            ..Shared::default()
+        }));
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let attach = json!({ "type": "attach", "token": "t", "cols": 80, "rows": 24 });
+        client.write_all(format!("{attach}\n").as_bytes()).unwrap();
+        let conn_shared = Arc::clone(&shared);
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut killer: Box<dyn ChildKiller + Send + Sync> = Box::new(RecordingKiller {
+                calls: Arc::new(AtomicUsize::new(0)),
+            });
+            let _ = handle_conn(server, "t", conn_shared, writer, master, &mut killer);
+            let _ = done_tx.send(());
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared
+            .lock()
+            .expect("shared poisoned")
+            .subscribers
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline, "attachment never subscribed");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The client never reads, so the output worker blocks writing once
+        // the socket buffer fills.
+        for _ in 0..64 {
+            broadcast(&shared, &[b'x'; 32 * 1024]);
+        }
+        thread::sleep(Duration::from_millis(100));
+
+        client.shutdown(Shutdown::Write).unwrap();
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("attachment teardown hung on a stalled output worker");
+        // The worker holds its own handle to the shared state, so a sole
+        // remaining handle proves it exited before the connection ended.
+        assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn owner_at_capacity_queues_connections_instead_of_closing_them() {
         let (root, owner, state) = start_test_owner("exec sleep 30");
         let addr = state["addr"]
