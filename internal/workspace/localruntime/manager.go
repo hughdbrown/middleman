@@ -1354,7 +1354,7 @@ func (m *Manager) killTmuxSession(
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	err = procutil.Run(ctx, cmd, "tmux subprocess capacity")
-	if err == nil || isTmuxSessionAbsent(stderr.Bytes(), err) {
+	if IsTmuxKillSessionGone(stderr.Bytes(), err) {
 		return nil
 	}
 	msg := strings.TrimSpace(stderr.String())
@@ -1433,6 +1433,15 @@ func (m *Manager) refreshTmuxSessionClients(
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// IsTmuxKillSessionGone reports whether kill-session succeeded or the session is already gone.
+func IsTmuxKillSessionGone(stderr []byte, err error) bool {
+	if err == nil || isTmuxSessionAbsent(stderr, err) {
+		return true
+	}
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	return ok && exitErr.ExitCode() == 1 && strings.Contains(string(stderr), "server exited unexpectedly")
 }
 
 func isTmuxSessionAbsent(stderr []byte, err error) bool {

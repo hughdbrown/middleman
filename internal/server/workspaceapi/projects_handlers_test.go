@@ -35,6 +35,12 @@ import (
 	"go.kenn.io/forge/platform"
 )
 
+func TestKillProjectRuntimeTmuxSessionTreatsServerExitAsGone(t *testing.T) {
+	command := []string{"sh", "-c", "echo 'server exited unexpectedly' >&2; exit 1"}
+	err := killProjectRuntimeTmuxSession(t.Context(), command, "session")
+	require.NoError(t, err)
+}
+
 func TestRegisterProjectUsesHubRepositoryIdentity(t *testing.T) {
 	t.Parallel()
 	require := require.New(t)
