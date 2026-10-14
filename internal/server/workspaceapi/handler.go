@@ -191,11 +191,38 @@ type Handler struct {
 	runtimeRestoreMu           sync.Mutex
 	runtimeRecoveryMu          sync.Mutex
 	runtimeRecoveryPending     map[string]bool
+	// tmuxServerAtLaunch names the tmux server each agent runtime ran on, so
+	// its exit can tell a replaced server from its own session ending.
+	// runtimeRecoveryMu guards it.
+	tmuxServerAtLaunch map[string]string
+	// exitDecisionMu serializes tmux exit classification; exitDecisions caches
+	// each generation's answer so every caller sees the same one.
+	exitDecisionMu sync.Mutex
+	exitDecisions  map[string]exitDecision
+	// baseRestoreRemaining lists workspaces whose base terminal, lost with its
+	// tmux server or not restored at startup, is not restored yet; the
+	// missing-tmux prune waits until it is empty. A true value marks a
+	// workspace startup restored for its retained agents, which later passes
+	// restore whatever its status, as startup would. runtimeRecoveryMu guards
+	// it.
+	baseRestoreRemaining map[string]bool
+	// baseRestoreListPending asks the next pass to restore every workspace's
+	// base terminal, after a loss or a list that could not be read; it holds
+	// the prune like outstanding workspaces.
+	baseRestoreListPending bool
+	// baseRestoreCursor is the last workspace a restore pass reached.
+	baseRestoreCursor string
+	// baseRestoreBudget bounds base-terminal restoration within a recovery
+	// pass, leaving the rest of the pass for pending agents.
+	baseRestoreBudget time.Duration
 	// cannotReloadChats holds chats whose agent refused to reload them; see
 	// setChatCannotReload. runtimeRecoveryMu guards it.
 	cannotReloadChats map[string]bool
 	lifecycleMu       sync.Mutex
 	lifecycleCtx      context.Context
+	// startedAt is when this daemon's handler was built. A hook report older
+	// than it may predate hooks lost while no daemon was listening.
+	startedAt         time.Time
 	lifecycleCancel   context.CancelFunc
 	lifecycleWG       sync.WaitGroup
 	lifecycleStarted  bool
@@ -217,6 +244,7 @@ func New(deps Deps) *Handler {
 	}
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	h := &Handler{
+		startedAt:                      time.Now().UTC(),
 		repositoryWorktrees:            deps.RepositoryWorktrees,
 		executionWorker:                deps.ExecutionWorker,
 		db:                             deps.DB,
@@ -256,6 +284,7 @@ func New(deps Deps) *Handler {
 		workspaceEnrichmentDisabled:    deps.EnrichmentDisabled,
 		workspaceSetupDone:             make(map[string]chan struct{}),
 		workspaceWarmWake:              make(chan struct{}, 1),
+		baseRestoreBudget:              10 * time.Second,
 		workspaceDeleting:              make(map[string]*workspaceDeletion),
 		initialMessages:                make(map[initialMessageKey]initialMessageAttempt),
 		tmuxActivity:                   newTmuxActivityTracker(now),

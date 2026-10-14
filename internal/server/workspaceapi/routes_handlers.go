@@ -2609,10 +2609,14 @@ func (s *Handler) workspaceRuntimeSessions(
 	if err != nil {
 		return nil, err
 	}
-	// A session that exited is gone even before its record is forgotten.
+	// A session that exited is gone even before its record is forgotten,
+	// unless it was kept for recovery: it then shows as unavailable, and Stop
+	// forgets it.
+	s.runtimeRecoveryMu.Lock()
 	stored = slices.DeleteFunc(stored, func(session db.WorkspaceRuntimeSession) bool {
-		return s.runtime.Exited(session.SessionKey)
+		return s.runtime.Exited(session.SessionKey) && !s.runtimeRecoveryPending[session.SessionKey]
 	})
+	s.runtimeRecoveryMu.Unlock()
 	merged := mergeStoredRuntimeSessions(sessions, stored)
 	idle := s.idle.Load()
 	for i := range merged {
@@ -2839,17 +2843,30 @@ func (s *Handler) forgetRecordedRuntimeSessionIfExited(
 			return
 		}
 	}
+	// The exit can land before this record does. Keep a lost agent as the exit
+	// handler would, whether or not that handler has run yet.
+	s.runtimeRecoveryMu.Lock()
+	pending := s.runtimeRecoveryPending[session.Key]
+	s.runtimeRecoveryMu.Unlock()
+	if pending {
+		return
+	}
+	if exited, ok := s.runtime.ExitedSession(session.Key); ok && s.keepAgentAfterTmuxServerLoss(exited) {
+		s.invalidateWorkspaceEnrichment(session.WorkspaceID)
+		return
+	}
 	cleanupCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx), runtimeSessionCleanupTimeout,
 	)
 	defer cancel()
-	if _, err := s.workspaces.ForgetRuntimeSessionAfterExit(
+	forgotten, err := s.workspaces.ForgetRuntimeSessionAfterExit(
 		cleanupCtx,
 		session.WorkspaceID,
 		session.Key,
 		session.CreatedAt,
 		session.TmuxSession,
-	); err != nil {
+	)
+	if err != nil {
 		slog.Warn(
 			"forget runtime session that exited before record completed",
 			"workspace_id", session.WorkspaceID,
@@ -2857,6 +2874,9 @@ func (s *Handler) forgetRecordedRuntimeSessionIfExited(
 			"err", err,
 		)
 		return
+	}
+	if forgotten {
+		s.runtime.ForgetAgentExit(session.TmuxSession)
 	}
 	s.invalidateWorkspaceEnrichment(session.WorkspaceID)
 }
@@ -2886,7 +2906,46 @@ func (s *Handler) recordRuntimeSession(
 	); err != nil {
 		return httpapi.Internal("record runtime session: " + err.Error())
 	}
+	if session.Kind == localruntime.LaunchTargetAgent {
+		s.noteTmuxServer(ctx, session.Key, session.TmuxSession)
+		s.importEarlyConversation(ctx, workspaceID, session.Key)
+	}
 	return nil
+}
+
+// importEarlyConversation saves a conversation the agent reported before its
+// row existed: its first hook can beat the record, and SessionEnd may delete
+// the report before another hook arrives.
+func (s *Handler) importEarlyConversation(ctx context.Context, workspaceID, sessionKey string) {
+	if s.db == nil || s.agentActivity == nil {
+		return
+	}
+	ws, err := s.db.GetWorkspace(ctx, workspaceID)
+	if err != nil || ws == nil {
+		return
+	}
+	reports := s.agentActivity.LiveReportsForWorkspace(ws.WorktreePath, []string{sessionKey})
+	// Several conversations mean a nested agent reported too, and nothing
+	// tells which is the terminal's own; the next hook decides instead.
+	if len(reports) == 0 || !singleConversation(reports) {
+		return
+	}
+	// A row that already saves a conversation, as a resumed agent's does,
+	// keeps it: the newest report may be a nested agent's.
+	if _, err := s.db.ImportWorkspaceRuntimeConversation(
+		ctx, sessionKey, reports[0].Agent, reports[0].SessionID,
+	); err != nil {
+		slog.Warn("import early agent conversation", "session_key", sessionKey, "err", err)
+	}
+}
+
+func singleConversation(reports []agentactivity.Report) bool {
+	for _, report := range reports[1:] {
+		if report.Agent != reports[0].Agent || report.SessionID != reports[0].SessionID {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeRuntimeDisplayRegion(

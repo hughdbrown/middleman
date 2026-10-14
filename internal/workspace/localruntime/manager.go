@@ -120,6 +120,10 @@ type Options struct {
 	ACPSessionsDir     string
 	// ParkedDir holds a marker per runtime session idle stop parked.
 	ParkedDir string
+	// AgentExitDir holds how each tmux-backed agent exited, so a clean tmux
+	// exit caused by a killed agent can be told apart from the agent
+	// finishing. Empty disables the record.
+	AgentExitDir string
 	// AgentActivityDir is where ACP owners report turn state for the
 	// workspace activity views, alongside hook-reported agents.
 	AgentActivityDir string
@@ -170,8 +174,14 @@ type Manager struct {
 	parkedDir          string
 	inputObserver      atomic.Pointer[func(workspaceID string)]
 	agentActivityDir   string
+	agentExitDir       string
 	acpOwnerCommand    []string
 	acpPreferences     map[string]map[string]string
+
+	// exitCallbacks counts running OnSessionExit calls. A session gains one
+	// when it leaves sessions, under mu, so every call Shutdown must wait for
+	// is counted before Shutdown clears sessions.
+	exitCallbacks sync.WaitGroup
 
 	mu          sync.Mutex
 	targets     map[string]LaunchTarget
@@ -180,7 +190,7 @@ type Manager struct {
 	// exited holds the keys of sessions this manager saw exit on their own.
 	// Their stored records are forgotten in the background, and a restore in
 	// the meantime must not relaunch an agent that already finished.
-	exited            map[string]struct{}
+	exited            map[string]SessionInfo
 	labelReservations map[string]map[string]int
 	shellCommand      []string
 	tmuxCommand       []string
@@ -328,13 +338,14 @@ func NewManager(options Options) *Manager {
 		acpSessionsDir:     options.ACPSessionsDir,
 		parkedDir:          options.ParkedDir,
 		agentActivityDir:   options.AgentActivityDir,
+		agentExitDir:       options.AgentExitDir,
 		acpOwnerCommand:    slices.Clone(options.ACPOwnerCommand),
 		acpPreferences:     make(map[string]map[string]string),
 
 		targets:           targets,
 		targetsList:       targetsList,
 		sessions:          make(map[string]*session),
-		exited:            make(map[string]struct{}),
+		exited:            make(map[string]SessionInfo),
 		labelReservations: make(map[string]map[string]int),
 		shellCommand:      slices.Clone(options.ShellCommand),
 		tmuxCommand:       slices.Clone(options.TmuxCommand),
@@ -500,6 +511,9 @@ func (m *Manager) launch(ctx context.Context, workspaceID, cwd, targetKey string
 		}
 	}
 
+	// The runtime starts before its pane does, so even the agent's first hook
+	// is never older than the runtime it reports for.
+	createdAt := time.Now().UTC()
 	launch, err := m.launchCommand(ctx, target, workspaceID, key, cwd)
 	if err != nil {
 		slog.Debug(
@@ -528,7 +542,7 @@ func (m *Manager) launch(ctx context.Context, workspaceID, cwd, targetKey string
 		Label:                  label,
 		Kind:                   target.Kind,
 		Status:                 SessionStatusStarting,
-		CreatedAt:              time.Now().UTC(),
+		CreatedAt:              createdAt,
 		TmuxSession:            launch.TmuxSession,
 		tmuxLaunchID:           launch.TmuxLaunchID,
 		Reused:                 launch.TmuxSession != "" && !launch.TmuxCreated,
@@ -1860,6 +1874,9 @@ func (m *Manager) shellLaunchCommand(
 	return result, nil
 }
 
+// exitCallbackShutdownWait bounds how long Shutdown waits for exit handling.
+const exitCallbackShutdownWait = 5 * time.Second
+
 func (m *Manager) Shutdown() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1884,12 +1901,36 @@ func (m *Manager) Shutdown() {
 		}
 		s.detach()
 	}
+	m.waitSessionsDone(ctx, sessions)
+	m.waitExitCallbacks()
+}
+
+func (m *Manager) waitSessionsDone(ctx context.Context, sessions []*session) {
 	for _, s := range sessions {
 		select {
 		case <-s.done:
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// waitExitCallbacks lets exit handling that began before shutdown finish, such
+// as forgetting a finished agent's record, so the process does not exit or
+// close its database first. The wait is bounded so a stuck callback cannot
+// hold shutdown forever.
+func (m *Manager) waitExitCallbacks() {
+	done := make(chan struct{})
+	go func() {
+		m.exitCallbacks.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(exitCallbackShutdownWait)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		slog.Warn("shutdown stopped waiting for runtime exit handling")
 	}
 }
 
@@ -2023,6 +2064,12 @@ func (m *Manager) launchCommand(
 			agentactivity.RuntimeSessionKeyEnv: sessionKey,
 		},
 	)
+	if m.agentExitDir != "" {
+		if err := os.MkdirAll(m.agentExitDir, 0o700); err != nil {
+			return launchCommand{}, fmt.Errorf("create agent exit directory: %w", err)
+		}
+		paneEnv.paneCommand = recordAgentExitPaneCommand(paneEnv.paneCommand, m.agentExitPaths(tmuxSession))
+	}
 	prepared, err := tmuxLauncher{
 		TmuxCommand:     tmuxCommand,
 		Session:         tmuxSession,
@@ -2160,6 +2207,7 @@ func (m *Manager) watchSession(
 		return
 	}
 	if m.removeExitedSession(info, s) && m.onSessionExit != nil {
+		defer m.exitCallbacks.Done()
 		m.onSessionExit(info)
 	}
 }
@@ -2167,10 +2215,17 @@ func (m *Manager) watchSession(
 // Exited reports whether this manager saw the session exit on its own. Such a
 // session is finished even while its stored record is still being forgotten.
 func (m *Manager) Exited(key string) bool {
+	_, exited := m.ExitedSession(key)
+	return exited
+}
+
+// ExitedSession returns how a session this manager saw exit on its own ended,
+// including its exit code.
+func (m *Manager) ExitedSession(key string) (SessionInfo, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, exited := m.exited[key]
-	return exited
+	info, exited := m.exited[key]
+	return info, exited
 }
 
 func (m *Manager) removeExitedSession(
@@ -2185,7 +2240,10 @@ func (m *Manager) removeExitedSession(
 		return false
 	}
 	delete(m.sessions, info.Key)
-	m.exited[info.Key] = struct{}{}
+	m.exited[info.Key] = info
+	if m.onSessionExit != nil {
+		m.exitCallbacks.Add(1)
+	}
 	return true
 }
 

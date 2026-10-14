@@ -5232,7 +5232,8 @@ func (d *DB) ListWorkspaceRuntimeSessions(
 ) ([]WorkspaceRuntimeSession, error) {
 	rows, err := d.roQueryContext(ctx, `
 		SELECT workspace_id, session_key, target_key, label, kind, display_region, scope,
-		       tmux_session, created_at
+		       tmux_session, created_at, conversation_agent, conversation_id,
+		       conversation_end_reason
 		FROM forge_workspace_runtime_sessions
 		WHERE workspace_id = ?
 		ORDER BY created_at, session_key`, workspaceID,
@@ -5252,7 +5253,8 @@ func (d *DB) ListAllWorkspaceRuntimeSessions(
 ) ([]WorkspaceRuntimeSession, error) {
 	rows, err := d.roQueryContext(ctx, `
 		SELECT workspace_id, session_key, target_key, label, kind, display_region, scope,
-		       tmux_session, created_at
+		       tmux_session, created_at, conversation_agent, conversation_id,
+		       conversation_end_reason
 		FROM forge_workspace_runtime_sessions
 		ORDER BY workspace_id, created_at, session_key`,
 	)
@@ -5272,7 +5274,8 @@ func (d *DB) ListWorkspaceRuntimeTmuxSessions(
 ) ([]WorkspaceRuntimeSession, error) {
 	rows, err := d.roQueryContext(ctx, `
 		SELECT workspace_id, session_key, target_key, label, kind, display_region, scope,
-		       tmux_session, created_at
+		       tmux_session, created_at, conversation_agent, conversation_id,
+		       conversation_end_reason
 		FROM forge_workspace_runtime_sessions
 		WHERE workspace_id = ? AND tmux_session != ''
 		ORDER BY created_at, session_key`, workspaceID,
@@ -5292,7 +5295,8 @@ func (d *DB) ListAllWorkspaceRuntimeTmuxSessions(
 ) ([]WorkspaceRuntimeSession, error) {
 	rows, err := d.roQueryContext(ctx, `
 		SELECT workspace_id, session_key, target_key, label, kind, display_region, scope,
-		       tmux_session, created_at
+		       tmux_session, created_at, conversation_agent, conversation_id,
+		       conversation_end_reason
 		FROM forge_workspace_runtime_sessions
 		WHERE tmux_session != ''
 		ORDER BY workspace_id, created_at, session_key`,
@@ -5329,6 +5333,111 @@ func (d *DB) UpdateWorkspaceRuntimeSessionLabel(
 	return rows > 0, nil
 }
 
+// RuntimeSessionConversation returns the conversation saved on a runtime
+// session, with its workspace's worktree, and whether that session is
+// recorded.
+func (d *DB) RuntimeSessionConversation(ctx context.Context, sessionKey string) (RuntimeConversation, bool, error) {
+	var conversation RuntimeConversation
+	err := d.roQueryRowContext(ctx, `
+		SELECT w.worktree_path, r.created_at, r.conversation_agent, r.conversation_id,
+		       r.conversation_end_reason
+		FROM forge_workspace_runtime_sessions r
+		JOIN forge_workspaces w ON w.id = r.workspace_id
+		WHERE r.session_key = ?`, sessionKey,
+	).Scan(
+		&conversation.WorktreePath, &conversation.CreatedAt,
+		&conversation.Agent, &conversation.ID, &conversation.EndReason,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RuntimeConversation{}, false, nil
+	}
+	if err != nil {
+		return RuntimeConversation{}, false, fmt.Errorf("read runtime session conversation: %w", err)
+	}
+	conversation.CreatedAt = conversation.CreatedAt.UTC()
+	return conversation, true, nil
+}
+
+// RecordWorkspaceRuntimeConversation saves the conversation an agent runtime
+// last reported, so recovery can resume it after its activity report is
+// gone. A report means the conversation runs, so any end reason is cleared.
+// It writes only when something changed and reports whether a row was
+// updated.
+func (d *DB) RecordWorkspaceRuntimeConversation(
+	ctx context.Context,
+	sessionKey string,
+	agent string,
+	conversationID string,
+) (bool, error) {
+	res, err := d.execContext(ctx, `
+		UPDATE forge_workspace_runtime_sessions
+		SET conversation_agent = ?, conversation_id = ?, conversation_end_reason = ''
+		WHERE session_key = ? AND (conversation_agent != ? OR conversation_id != ? OR
+		      conversation_end_reason != '')`,
+		agent, conversationID, sessionKey, agent, conversationID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("record workspace runtime conversation: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("record workspace runtime conversation rows: %w", err)
+	}
+	return rows > 0, nil
+}
+
+// ImportWorkspaceRuntimeConversation saves a conversation on a runtime row
+// that has none yet, and reports whether it did. A row that already saves one
+// keeps it.
+func (d *DB) ImportWorkspaceRuntimeConversation(
+	ctx context.Context,
+	sessionKey string,
+	agent string,
+	conversationID string,
+) (bool, error) {
+	res, err := d.execContext(ctx, `
+		UPDATE forge_workspace_runtime_sessions
+		SET conversation_agent = ?, conversation_id = ?, conversation_end_reason = ''
+		WHERE session_key = ? AND conversation_id = ''`,
+		agent, conversationID, sessionKey,
+	)
+	if err != nil {
+		return false, fmt.Errorf("import workspace runtime conversation: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("import workspace runtime conversation rows: %w", err)
+	}
+	return rows > 0, nil
+}
+
+// RecordWorkspaceRuntimeConversationEnd saves why the conversation saved on a
+// runtime ended, as its SessionEnd hook reported. A hook from any other
+// conversation changes nothing. It reports whether a row was updated.
+func (d *DB) RecordWorkspaceRuntimeConversationEnd(
+	ctx context.Context,
+	sessionKey string,
+	agent string,
+	conversationID string,
+	reason string,
+) (bool, error) {
+	res, err := d.execContext(ctx, `
+		UPDATE forge_workspace_runtime_sessions
+		SET conversation_end_reason = ?
+		WHERE session_key = ? AND conversation_agent = ? AND conversation_id = ? AND
+		      conversation_end_reason != ?`,
+		reason, sessionKey, agent, conversationID, reason,
+	)
+	if err != nil {
+		return false, fmt.Errorf("record workspace runtime conversation end: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("record workspace runtime conversation end rows: %w", err)
+	}
+	return rows > 0, nil
+}
+
 func scanWorkspaceRuntimeSessions(
 	rows *sql.Rows,
 ) ([]WorkspaceRuntimeSession, error) {
@@ -5339,7 +5448,8 @@ func scanWorkspaceRuntimeSessions(
 			&session.WorkspaceID, &session.SessionKey,
 			&session.TargetKey, &session.Label, &session.Kind,
 			&session.DisplayRegion, &session.Scope, &session.TmuxSession,
-			&session.CreatedAt,
+			&session.CreatedAt, &session.ConversationAgent, &session.ConversationID,
+			&session.ConversationEndReason,
 		); err != nil {
 			return nil, fmt.Errorf("scan workspace runtime session: %w", err)
 		}

@@ -4177,13 +4177,26 @@ func (m *Manager) ReapOrphanTmuxSessions(ctx context.Context) error {
 // the host tmux server. Runtime-session rows whose tmux session was killed
 // outside kenn-forge are removed. Ready workspaces whose primary tmux session is
 // missing are marked errored so list responses stop probing dead session names
-// and the UI can offer retry/delete. It reports whether anything was pruned so
-// callers only notify clients about passes that changed state.
-func (m *Manager) PruneMissingTmuxSessions(ctx context.Context, pendingRecovery map[string]bool) (bool, error) {
+// and the UI can offer retry/delete. The hooks are asked after tmux was
+// listed, so a loss during the pass can still keep a row or a workspace
+// status. It reports whether anything was pruned so callers only notify
+// clients about passes that changed state.
+func (m *Manager) PruneMissingTmuxSessions(ctx context.Context, hooks TmuxPruneHooks) (bool, error) {
 	changed := false
 	sessions, err := m.listTmuxSessions(ctx)
 	if err != nil {
 		return false, err
+	}
+	// A server with zero live sessions is the bulk-gone case: machine
+	// reboot, a killed tmux server, or first boot after the
+	// dedicated-socket upgrade while old sessions remain on the previous
+	// server. Runtime rows hold the agents that recovery resumes, and
+	// base sessions are recreated lazily on terminal attach, so ready
+	// workspaces stay ready and self-heal; marking them all errored would
+	// invite retry, whose cleanup force-removes worktrees. Individual
+	// missing sessions on a live server remain real anomalies.
+	if len(sessions) == 0 {
+		return false, nil
 	}
 	live := make(map[string]bool, len(sessions))
 	for _, session := range sessions {
@@ -4195,10 +4208,10 @@ func (m *Manager) PruneMissingTmuxSessions(ctx context.Context, pendingRecovery 
 		return false, err
 	}
 	for _, stored := range storedSessions {
-		if stored.TmuxSession == "" || pendingRecovery[stored.SessionKey] {
+		if stored.TmuxSession == "" || live[stored.TmuxSession] {
 			continue
 		}
-		if live[stored.TmuxSession] {
+		if hooks.RetainRuntime != nil && hooks.RetainRuntime(stored) {
 			continue
 		}
 		slog.Debug(
@@ -4216,15 +4229,9 @@ func (m *Manager) PruneMissingTmuxSessions(ctx context.Context, pendingRecovery 
 		changed = changed || deleted
 	}
 
-	// A server with zero live sessions is the bulk-gone case: machine
-	// reboot, or first boot after the dedicated-socket upgrade while
-	// old sessions remain on the previous server. Base sessions are
-	// recreated lazily on terminal attach, so ready workspaces stay
-	// ready and self-heal; marking them all errored would invite retry,
-	// whose cleanup force-removes worktrees. Individual missing
-	// sessions on a live server remain real anomalies and are errored
-	// below.
-	if len(live) == 0 {
+	// Judging the rows can reveal a lost server, whose bases are restored
+	// rather than errored.
+	if hooks.HoldWorkspaceStatus != nil && hooks.HoldWorkspaceStatus() {
 		return changed, nil
 	}
 	workspaces, err := m.db.ListWorkspaces(ctx)
@@ -4253,6 +4260,16 @@ func (m *Manager) PruneMissingTmuxSessions(ctx context.Context, pendingRecovery 
 		changed = changed || updated
 	}
 	return changed, nil
+}
+
+// TmuxPruneHooks carry evidence a missing-tmux prune reads after listing tmux.
+type TmuxPruneHooks struct {
+	// RetainRuntime reports whether to keep a runtime row whose tmux session
+	// is missing.
+	RetainRuntime func(db.WorkspaceRuntimeSession) bool
+	// HoldWorkspaceStatus reports, once the runtime rows are judged, whether
+	// base terminals are being restored, which leaves ready workspaces ready.
+	HoldWorkspaceStatus func() bool
 }
 
 func isWorkspaceTmuxSessionName(session string) bool {
@@ -4405,6 +4422,70 @@ func (m *Manager) listTmuxSessionInfos(
 		})
 	}
 	return sessions, nil
+}
+
+// tmuxServerIDFormat names one tmux server process: a replacement server has
+// a new pid and start time even on the same socket.
+const tmuxServerIDFormat = "#{pid}:#{start_time}"
+
+// TmuxServerID identifies the running tmux server, or returns "" when none
+// runs. tmux exits once its last session ends, so an empty server is gone.
+func (m *Manager) TmuxServerID(ctx context.Context) (string, error) {
+	cmd := m.tmuxExec(ctx, "list-sessions", "-F", tmuxServerIDFormat)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := procutil.Run(ctx, cmd, "tmux subprocess capacity"); err != nil {
+		if isTmuxSessionAbsent(stderr.Bytes(), err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("tmux list-sessions: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	first, _, _ := strings.Cut(strings.TrimSpace(stdout.String()), "\n")
+	return strings.TrimSpace(first), nil
+}
+
+// TmuxServerIDWithSession identifies the running tmux server only if it holds
+// session, reading both in one tmux call so a replacement server cannot be
+// mistaken for the one the session runs on. It returns "" otherwise. Fields
+// are separated by a colon, which session names cannot contain, because some
+// tmux builds replace tabs in format output.
+func (m *Manager) TmuxServerIDWithSession(ctx context.Context, session string) (string, error) {
+	cmd := m.tmuxExec(ctx, "list-sessions", "-F", "#{session_name}:"+tmuxServerIDFormat)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := procutil.Run(ctx, cmd, "tmux subprocess capacity"); err != nil {
+		if isTmuxSessionAbsent(stderr.Bytes(), err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("tmux list-sessions: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	for line := range strings.SplitSeq(stdout.String(), "\n") {
+		name, server, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if ok && name == session {
+			return strings.TrimSpace(server), nil
+		}
+	}
+	return "", nil
+}
+
+// TmuxSessionEnded reports whether session ended on its own: it is gone while
+// the tmux server it ran on still runs. A session that still exists, or whose
+// server is gone, replaced, or unknown (empty launchServer), did not.
+func (m *Manager) TmuxSessionEnded(ctx context.Context, session, launchServer string) (bool, error) {
+	if launchServer == "" {
+		return false, nil
+	}
+	exists, err := m.tmuxSessionExists(ctx, session)
+	if err != nil || exists {
+		return false, err
+	}
+	current, err := m.TmuxServerID(ctx)
+	if err != nil || current == "" {
+		return false, err
+	}
+	return current == launchServer, nil
 }
 
 func (m *Manager) listTmuxSessions(
@@ -5051,7 +5132,10 @@ func (m *Manager) setTmuxStatus(
 func (m *Manager) tmuxSessionExists(
 	ctx context.Context, session string,
 ) (bool, error) {
-	cmd := m.tmuxExec(ctx, "has-session", "-t", session)
+	// "=" asks for this exact name: tmux otherwise also accepts a session
+	// whose name merely starts with it, such as a workspace agent's session
+	// for a missing base terminal.
+	cmd := m.tmuxExec(ctx, "has-session", "-t", "="+session)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

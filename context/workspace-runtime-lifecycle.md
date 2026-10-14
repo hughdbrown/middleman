@@ -397,13 +397,37 @@ create a local process, PTY, or durable transport session
 
 ## Tmux Persistence Rules
 
-- Startup must attempt agent recovery before pruning missing runtime rows or
-  their hook reports; those two records jointly identify the saved conversation
+- Startup must attempt agent recovery before pruning missing runtime rows
   (`internal/server/workspaceapi/lifecycle.go::Handler.RestoreRuntimeSessions`).
+- The runtime row, not the activity report, holds the conversation to resume:
+  every non-SessionEnd hook whose canonical CWD is the row's workspace saves its
+  agent and conversation ID on the row, so a nested agent in another worktree cannot
+  replace it, and re-recording the row keeps them. A nested agent in the same worktree
+  inherits the runtime key, so another conversation replaces the saved one only once
+  the saved one has no report (SessionEnd, which /clear and /resume send first,
+  removes it), or, with a report older than the row's runtime or this daemon, through a
+  SessionStart: hooks are lost while no daemon listens, and a nested agent that outlived
+  a restart reports before its waiting parent. A conversation that ended with reason
+  "other" keeps the row until it reports again. Agents without SessionEnd hooks (Droid)
+  save their newest conversation. A runtime's start is taken before its pane starts.
+  Recording an agent's row also saves a conversation its hooks reported before the row
+  existed, only into a row that saves none and only when one conversation reported.
+  Hooks do not say which agent sent them, so a hooked nested agent in the same worktree
+  can still become the saved conversation when its SessionStart beats its waiting
+  parent's first hook after a restart, or when it reports first after an ambiguous
+  early import (accepted limit; process lineage is the robust signal). SessionEnd may delete the report, including when a
+  host shutdown kills the agent, and saves its reason on the row while that conversation
+  is the saved one
+  (`internal/server/workspaceapi/agent_hook.go::Handler.recordAgentConversation`,
+  `internal/db/queries.go::DB.RecordWorkspaceRuntimeConversation`).
+  Recovery and idle resume first copy the newest activity report into an agent row
+  that has no saved conversation, for agents running before migration 000066; a failed
+  write still resumes that attempt from the report. Remove that import
+  once no running agent can predate it
+  (`internal/server/workspaceapi/lifecycle.go::Handler.importReportedConversation`).
 - Missing tmux agents, and ptyowner agents whose owner is gone (no state, or a
-  socket that refuses or no longer exists, as after a reboot), resume the newest
-  matching Codex, Claude, Pi, Copilot, Cursor, Droid, or Gemini hook session by
-  exact ID, preserving configured flags and runtime identity without replaying
+  socket that refuses or no longer exists, as after a reboot), resume the row's
+  saved Codex, Claude, Pi, Copilot, Cursor, Droid, or Gemini conversation by exact ID, preserving configured flags and runtime identity without replaying
   the initial prompt. A gone
   ptyowner session with nothing to resume stays unavailable until the user stops it
   (`internal/server/workspaceapi/agent_resume.go::Handler.resumeWorkspaceAgent`,
@@ -415,7 +439,7 @@ create a local process, PTY, or durable transport session
   unchanged, with their meaning and validity owned by the caller
   (`internal/workspace/localruntime/agent_resume.go::agentResumeCommand`).
 - Recovery never resets worktrees or resends the initial message; failed
-  recovery retains the saved runtime and report for another attempt
+  recovery retains the saved runtime row for another attempt
   (`internal/server/workspaceapi/lifecycle.go::Handler.RestoreRuntimeSessions`).
 - Restore tmux base terminals before agents, including retained creating/error
   retries; startup recovery shares a 30-second budget and preserves uncompleted
@@ -423,6 +447,56 @@ create a local process, PTY, or durable transport session
   Pty-owner base terminals are never started by recovery; attach reuses a live
   owner or starts one (`internal/terminal/handler.go::Handler.ServeHTTP`).
   Activity enrichment reads an absent owner as idle without starting it; real owner errors still fail enrichment (`internal/server/workspaceapi/routes_handlers.go::Handler.probeOneTmuxSession`).
+- A tmux client exits 0 whenever its session ends, even the server's last. Whatever
+  the client's exit code, the pane wrapper's exit record decides: keep the agent when
+  it shows a kill (the wrapper died with it, or it died from HUP, KILL, or TERM, as when
+  a shutdown signals agents before tmux and Forge), and forget it after a recorded
+  normal exit, which can follow a killed client, unless the saved conversation's
+  SessionEnd gave reason "other": an agent can catch a termination signal and exit 0. Read the record once per decision.
+  Each new wrapper clears the record a previous run under the same tmux name left;
+  only deleting the agent's row spends a record, so an interrupted cleanup still
+  shows the next start that the agent finished, and a detached client, which also
+  exits 0 while the agent runs on, spends nothing. Startup recovery forgets, not resumes, a kept agent whose
+  session is gone with a recorded normal exit, then prunes records of gone sessions
+  that no stored row names, so an exit still being handled keeps its record. A runtime
+  without tmux has no record, so its exit handler deletes the row at once rather than
+  in background cleanup a shutdown can skip, and runtime shutdown waits (bounded) for
+  exit handling already under way
+  (`internal/workspace/localruntime/manager.go::Manager.Shutdown`); such an agent that finishes while Forge is
+  down is still resumed, since its gone owner looks like a killed one. Sessions
+  launched without a record keep the old meaning
+  (`internal/workspace/localruntime/agent_exit.go`). An agent whose client exits
+  non-zero lost its client or server unless tmux reports its session gone while the
+  server it ran on still runs (a failed launch). Identify servers by pid and start time,
+  read in the same tmux call that finds the session, so a replacement never counts as
+  the session ending, and keep an agent whose server was never identified: keep its
+  row and conversation pending for the next start, since a runtime never restores a key
+  it saw exit. Post-launch cleanup and a finished reattachment apply the same rule to
+  an exit that landed first (the exit handler skips a runtime while its recovery is
+  pending), and all callers share one cached decision per runtime generation. Kept agents
+  list as unavailable until Stop forgets them or the next start resumes them. Pruning
+  deletes nothing while the server has no sessions, and judges each missing row only
+  after listing tmux, never from an earlier snapshot: it keeps a pending runtime,
+  leaves one whose exit this process has not seen to its exit handler (and, since that
+  can mean a lost server, queues every base terminal for restore), and gives a seen
+  exit the exit handler's decision, including a supervised chat's. It errors no
+  workspace while base terminals are outstanding, rechecked after the rows are judged
+  (`internal/server/workspaceapi/workspace_enrichment.go::Handler.retainMissingRuntime`).
+  A periodic recovery pass that
+  follows keeping such an agent restores every base terminal first, as startup does,
+  even if the agent was stopped meanwhile, taking
+  setup admission per workspace so a deletion is never undone. Workspaces a pass could
+  not finish (busy, failed, or out of budget; terminals get only a share of each pass
+  so a hung one cannot starve pending agents), including those startup recovery could
+  not restore, or all of them while their list cannot be read, stay outstanding across
+  passes, even after the kept agents are stopped; one startup restored only for its
+  retained agents stays eligible after they resume, and a deleted one leaves the set.
+  Later passes work only on those, each starting after the workspace the last pass
+  reached, and the missing-tmux prune waits until none remain. Recovery changes must
+  pass every shutdown order of `make test-reboot-sim`
+  (`internal/server/workspaceapi/lifecycle.go::Handler.keepAgentAfterTmuxServerLoss`,
+  `internal/server/workspaceapi/routes_handlers.go::Handler.forgetRecordedRuntimeSessionIfExited`,
+  `internal/workspace/manager.go::Manager.PruneMissingTmuxSessions`).
 - Pending startup recovery retries during periodic missing-tmux pruning under
   workspace setup admission; successful recovery restores ordinary exit cleanup
   (`internal/server/workspaceapi/lifecycle.go::Handler.RestoreRuntimeSessions`).
@@ -515,6 +589,9 @@ create a local process, PTY, or durable transport session
   (`internal/fleetsetup/service.go::renderSystemdUserService`).
 - New tmux sessions use the `forge-` prefix; persisted `middleman-` session
   names remain valid and must not be rewritten (`internal/workspace/`).
+- Check a tmux session's existence with an exact `=name` target: a runtime session's
+  name extends its workspace's base name, and tmux otherwise accepts that prefix match
+  for a missing base (`internal/workspace/manager.go::Manager.tmuxSessionExists`).
 - Only `DefaultTmuxCommand` selects Forge's dedicated tmux server. Custom tmux
   commands may address a shared user server, so Forge never changes their global
   options or applies graphics-off mutations (`internal/config/config.go::IsDefaultTmuxCommand`).
