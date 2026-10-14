@@ -323,6 +323,12 @@ Natural process exit should collapse stale runtime state quickly.
 - PTY output EOF may precede process wait; give wait a bounded chance to publish
   the real exit code without marking the owner fully exited before replay drains
   (`internal/ptyowner/owner.go::exitCodeAfterOutputClose`).
+- The opt-in Rust PTY manager must keep the Go owner's exit-code, output-drain,
+  post-exit linger, and stop semantics; change both owners together
+  (`rust/pty-manager/src/main.rs::owner_should_exit`).
+- Never close an owner connection without a response: `Client.Stop` and
+  `Client.Ensure` read EOF as a dead owner and delete its state. The Rust
+  manager leaves connections queued while at capacity (`rust/pty-manager/src/main.rs::run_owner`).
 
 The base workspace `tmux` tab is the exception:
 
