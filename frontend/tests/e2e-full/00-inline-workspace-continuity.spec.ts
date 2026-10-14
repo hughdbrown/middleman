@@ -32,6 +32,7 @@ import {
 import { startIsolatedWorkspaceE2EServer, type IsolatedE2EServer } from "./support/e2eServer";
 import { runPaletteCommand } from "./support/paletteCommands";
 import { openSettingsPanel } from "./support/settingsPanel";
+import { trackTerminalReadiness, waitForTerminalInputReady } from "./support/terminalReadiness";
 
 type WorkspaceStatusResponse = {
   id: string;
@@ -312,6 +313,7 @@ async function collapseTerminal(page: Page): Promise<void> {
 }
 
 async function typeIntoTerminal(page: Page, container: Locator, command: string): Promise<void> {
+  await waitForTerminalInputReady(container);
   await container.click({ position: { x: 10, y: 10 } });
   await page.keyboard.type(command);
   await page.keyboard.press("Enter");
@@ -416,6 +418,7 @@ function exitTmuxCopyMode(server: IsolatedE2EServer, tmuxSession: string): void 
 }
 
 async function dispatchTerminalPaste(container: Locator, text: string): Promise<void> {
+  await waitForTerminalInputReady(container);
   await container.locator(".xterm-helper-textarea").evaluate((textarea, pastedText) => {
     const paste = new Event("paste", { bubbles: true, cancelable: true });
     Object.defineProperty(paste, "clipboardData", {
@@ -587,6 +590,7 @@ test.describe("inline workspace pane continuity", () => {
   // test that closes or maximizes the workspace pane would hand that arrangement
   // to the next one. Reset it on every document load.
   test.beforeEach(async ({ page }) => {
+    trackTerminalReadiness(page);
     await page.addInitScript(() => {
       for (const surface of ["prs", "issues", "activity"]) {
         localStorage.removeItem(`kenn-forge-pane-layout-v1:${surface}`);
@@ -2378,7 +2382,6 @@ test.describe("inline workspace pane continuity", () => {
         const log: Array<{
           url: string;
           closed: boolean;
-          replayReady: boolean;
           socket: WebSocket;
           sent: string[];
         }> = [];
@@ -2387,20 +2390,10 @@ test.describe("inline workspace pane continuity", () => {
         class TrackedWebSocket extends Native {
           constructor(url: string | URL, protocols?: string | string[]) {
             super(url, protocols);
-            const entry = { url: String(url), closed: false, replayReady: false, socket: this, sent: [] };
+            const entry = { url: String(url), closed: false, socket: this, sent: [] };
             log.push(entry);
             this.addEventListener("close", () => {
               entry.closed = true;
-            });
-            this.addEventListener("message", (event) => {
-              if (typeof event.data !== "string") return;
-              try {
-                if ((JSON.parse(event.data) as { type?: string }).type === "replay_ready") {
-                  entry.replayReady = true;
-                }
-              } catch {
-                // Non-JSON text frame; the renderer ignores it too.
-              }
             });
           }
 
@@ -2437,14 +2430,13 @@ test.describe("inline workspace pane continuity", () => {
                 __reconnectWsLog?: Array<{
                   url: string;
                   closed: boolean;
-                  replayReady: boolean;
                   sent: string[];
                 }>;
               }
             ).__reconnectWsLog ?? [];
           return log
             .filter((entry) => entry.url.includes(`/workspaces/${workspaceId}/runtime/sessions/`))
-            .map(({ url, closed, replayReady, sent }) => ({ url, closed, replayReady, sent }));
+            .map(({ url, closed, sent }) => ({ url, closed, sent }));
         }, workspace.id);
 
       await page.goto(`${isolatedServer.info.base_url}/terminal/${workspace.id}`);
@@ -2516,7 +2508,6 @@ test.describe("inline workspace pane continuity", () => {
       expect(new URL(reconnectSocket!.url).searchParams.get("replay_boundary")).toBe("1");
       expect(new URL(reconnectSocket!.url).searchParams.has("cols")).toBe(false);
       expect(new URL(reconnectSocket!.url).searchParams.has("rows")).toBe(false);
-      await expect.poll(async () => (await runtimeSockets()).at(-1)?.replayReady).toBe(true);
       await expect
         .poll(
           async () =>

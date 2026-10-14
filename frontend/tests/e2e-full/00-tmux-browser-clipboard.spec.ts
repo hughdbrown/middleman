@@ -13,6 +13,7 @@ import {
   type Page,
 } from "@playwright/test";
 import { startIsolatedWorkspaceE2EServer, type IsolatedE2EServer } from "./support/e2eServer";
+import { trackTerminalReadiness, waitForTerminalInputReady } from "./support/terminalReadiness";
 
 type WorkspaceStatusResponse = {
   id: string;
@@ -257,6 +258,7 @@ async function openTerminalPanel(page: Page): Promise<Locator> {
   const container = page.locator(".terminal-panel.open .terminal-container");
   await expect(container).toBeVisible();
   await expect(container.locator("canvas, .xterm-screen").first()).toBeVisible();
+  await waitForTerminalInputReady(container);
   return container;
 }
 
@@ -804,6 +806,10 @@ async function dragTerminalPastTop(page: Page, container: Locator, dimensions: T
 }
 
 test.describe.configure({ mode: "serial", timeout: 120_000 });
+
+test.beforeEach(({ page }) => {
+  trackTerminalReadiness(page);
+});
 
 test("detected terminal URLs disclose destinations and require a modified click", async ({ page }) => {
   test.skip(!hasCommand("git") || !hasCommand("tmux", ["-V"]), "git and tmux are required for the real workspace flow");
