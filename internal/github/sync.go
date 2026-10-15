@@ -875,7 +875,17 @@ type Syncer struct {
 	// onMergeQueueChanged fires for each pull request whose merge queue
 	// membership, position, or state changed.
 	onMergeQueueChanged func(context.Context, int64, int)
-	onStatusChange      func(status *SyncStatus)
+	// mergeQueueMethods caches, per repository and branch, the merge queue's
+	// merge method and when it was read.
+	mergeQueueMethods sync.Map
+	// mergeQueueBranchAbsent records, per repository and branch, when a read
+	// last found that branch without a merge queue.
+	mergeQueueBranchAbsent sync.Map
+	// mergeQueueReadDenied records, per repository, when the read
+	// credential was refused the merge queue, so reads use the write
+	// credential until mergeQueueReadRecheck passes.
+	mergeQueueReadDenied sync.Map
+	onStatusChange       func(status *SyncStatus)
 	// onNotificationSyncComplete fires after each notification sync run
 	// (periodic, manual, or sidecar) so the server can broadcast the same
 	// data-change signal the normal sync uses. Notification sync can insert
@@ -3507,9 +3517,6 @@ func (s *Syncer) syncWatchedMRs(ctx context.Context) {
 	}
 
 	syncedAny := false
-	// Only pull requests this pass admitted may refresh their merge queue,
-	// so skipped buckets keep their cadence.
-	var admitted []WatchedMR
 	for _, mr := range mrs {
 		host := watchedMRHost(mr)
 		repo := RepoRef{
@@ -3546,7 +3553,6 @@ func (s *Syncer) syncWatchedMRs(ctx context.Context) {
 			)
 			continue
 		}
-		admitted = append(admitted, mr)
 		probe, due := s.beginRepositoryFeatureProbe(
 			ctx, repo, platform.RepositoryFeatureMergeRequests,
 		)
@@ -3592,10 +3598,6 @@ func (s *Syncer) syncWatchedMRs(ctx context.Context) {
 		} else {
 			probe.abandon()
 		}
-		syncedAny = true
-	}
-
-	if s.refreshWatchedMergeQueues(ctx, admitted) {
 		syncedAny = true
 	}
 
@@ -6287,7 +6289,7 @@ func (s *Syncer) indexSyncRepo(
 				s.markRepoFailed(repo, failMR)
 				// The queue read does not depend on the pull list, so a
 				// failing list must not freeze queue state.
-				s.RefreshMergeQueue(ctx, repo, repoID)
+				s.refreshQueuedPullRequests(ctx, repo, repoID)
 				return fmt.Errorf("list open PRs: %w", err)
 			}
 		}
@@ -6385,7 +6387,7 @@ func (s *Syncer) indexSyncRepo(
 	// partial pull failure still observes the queue.
 	if repoPlatform(repo) == platform.KindGitHub && attemptedScope&failMR != 0 &&
 		disabledScope&failMR == 0 {
-		s.RefreshMergeQueue(ctx, repo, repoID)
+		s.refreshQueuedPullRequests(ctx, repo, repoID)
 	}
 
 	// Index issues — ETag-gated, with GraphQL when available.
@@ -8151,6 +8153,9 @@ func (s *Syncer) syncOpenMRFromBulk(
 		if !detailApplied {
 			return nil
 		}
+		// Bulk hydration marks the detail fresh, which postpones the
+		// scheduled detail refresh that would otherwise check queue state.
+		s.refreshMergeQueueAfterBulkDetail(ctx, repo, repoID, number)
 		// Refresh workflow approval state so the DB-only detail GET
 		// can render the Approve workflows button without a foreground
 		// sync. GraphQL doesn't return action_required runs, so this
@@ -8250,6 +8255,7 @@ func (s *Syncer) fetchMRDetail(
 	if errors.Is(err, db.ErrRepositoryIdentityChanged) {
 		return calls, nil
 	}
+	s.refreshMergeQueueAfterDetailSync(ctx, repo, repoID, number, &err)
 	return calls, err
 }
 
@@ -11160,7 +11166,7 @@ func (s *Syncer) syncMRForRepoResolved(
 	fetchedEvidence *mergeRequestFetchEvidence,
 	lifecyclePersisted *bool,
 	expectedRepoID *int64,
-) error {
+) (retErr error) {
 	if resolvedRepoID != nil {
 		*resolvedRepoID = 0
 	}
@@ -11215,6 +11221,7 @@ func (s *Syncer) syncMRForRepoResolved(
 		return nil
 	}
 	ctx = withCloneRepositoryIdentity(ctx, repo)
+	defer s.refreshMergeQueueAfterDetailSync(ctx, repo, repoID, number, &retErr)
 
 	// Preserve derived fields that provider detail doesn't populate. CI is
 	// refreshed later in this sync path; keeping the previous values here
