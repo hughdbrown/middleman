@@ -13,10 +13,18 @@ supersession, completion events, or pending-state presentation.
   terminal `deferred_merge_completed` (success or failure). Clients refresh
   detail the moment they see the event, and that first read must not report a
   queued merge.
-- A successful immediate merge supersedes the queued worker silently (per-key
-  handle): pending clears with the merge response and the worker emits no event.
+- A successful immediate merge or merge queue enqueue supersedes the queued
+  worker silently (per-key handle): pending clears with the merge response and the worker emits no event.
   An immediate provider response with `merged: false` leaves the queued merge and
   all merge-completion side effects untouched.
+- Immediate and deferred merges and enqueues hold a per-pull-request merge
+  lock through the provider call. The deferred worker checks supersession
+  under that lock, because an enqueue leaves the pull request open where
+  target checks cannot see it (`internal/server/pullapi/routes.go::Handler.mergePRWithBodyAdmitted`).
+- A deferred worker whose merge went to the target branch's merge queue
+  completes with status `queued`: clear pending, publish no merged status, and
+  leave the outcome to the pull request's queue state
+  (`internal/server/pullapi/deferred_merge.go::Handler.completeDeferredMerge`).
 - A deferred worker response with `merged: false` is a terminal failure: clear pending and publish the provider message,
   but never publish merged status or run merge-completion side effects
   (`internal/server/pullapi/deferred_merge.go::Handler.completeDeferredMerge`).

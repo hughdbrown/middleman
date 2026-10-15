@@ -311,7 +311,10 @@ type mergePRInputBody struct {
 }
 
 type mergePRBody struct {
-	Merged                  bool   `json:"merged"`
+	Merged bool `json:"merged"`
+	// Queued reports that the pull request was added to its base branch's
+	// merge queue instead of merging; the queue merges it later.
+	Queued                  bool   `json:"queued,omitempty"`
 	SHA                     string `json:"sha"`
 	Message                 string `json:"message"`
 	WorkspaceCleanupPending bool   `json:"workspace_cleanup_pending,omitempty"`
@@ -491,6 +494,14 @@ func (s *Handler) listPullsRouteCore(ctx context.Context, input *listPullsInput)
 	if err != nil {
 		return nil, httpapi.Internal("load stack placements failed")
 	}
+	mergeQueueEntries, err := s.db.ListMergeQueueEntriesForMRs(ctx, mrIDs)
+	if err != nil {
+		return nil, httpapi.Internal("load merge queue entries failed")
+	}
+	mergeQueueRemovals, err := s.db.ListMergeQueueRemovalsForMRs(ctx, mrIDs)
+	if err != nil {
+		return nil, httpapi.Internal("load merge queue removals failed")
+	}
 	links, err := s.db.GetWorktreeLinksForMRs(ctx, mrIDs)
 	if err != nil {
 		return nil, httpapi.Internal("load worktree links failed")
@@ -538,6 +549,12 @@ func (s *Handler) listPullsRouteCore(ctx context.Context, input *listPullsInput)
 		}
 		if placement, ok := stackPlacements[mr.ID]; ok && placement.Size > 1 {
 			resp.Stack = &StackPlacementResponse{StackID: placement.StackID, Position: placement.Position, Size: placement.Size}
+		}
+		if entry, ok := mergeQueueEntries[mr.ID]; ok {
+			resp.MergeQueue = mergeQueueEntryResponse(entry)
+		}
+		if removal, ok := mergeQueueRemovals[mr.ID]; ok {
+			resp.MergeQueueRemoval = mergeQueueRemovalResponse(removal)
 		}
 		out = append(out, resp)
 	}
@@ -655,6 +672,32 @@ func (s *Handler) buildPullDetailResponse(
 	if stack != nil {
 		stackContext := stackContextForPR(mr.Number, stack, members)
 		resp.Stack = &stackContext
+	}
+	mergeQueueEntry, err := s.db.GetMergeQueueEntry(ctx, mr.RepoID, mr.Number)
+	if err != nil {
+		return MergeRequestDetailResponse{}, httpapi.Internal("load merge queue entry failed")
+	}
+	if mergeQueueEntry != nil {
+		resp.MergeQueue = mergeQueueEntryResponse(*mergeQueueEntry)
+	}
+	mergeQueueRemoval, err := s.db.GetMergeQueueRemoval(ctx, mr.RepoID, mr.Number)
+	if err != nil {
+		return MergeRequestDetailResponse{}, httpapi.Internal("load merge queue removal failed")
+	}
+	if mergeQueueRemoval != nil {
+		resp.MergeQueueRemoval = mergeQueueRemovalResponse(*mergeQueueRemoval)
+	}
+	if mr.State == db.MergeRequestStateOpen {
+		mergeQueue, err := s.repoMergeQueueFor(ctx, *repo, mr)
+		if err != nil {
+			return MergeRequestDetailResponse{}, err
+		}
+		if mergeQueue != nil {
+			resp.MergeQueueTarget = &MergeQueueTargetResponse{
+				Branch:      mergeQueue.Branch,
+				MergeMethod: mergeQueue.MergeMethod,
+			}
+		}
 	}
 	responseMR := *mr
 	if stack != nil {
@@ -1790,6 +1833,27 @@ func (s *Handler) mergePRWithBody(
 	number int,
 	body mergePRInputBody,
 ) (mergePRBody, error) {
+	return s.mergePRWithBodyAdmitted(ctx, provider, platformHost, owner, name, number, body, nil)
+}
+
+// errMergeNotAdmitted reports that admit declined the provider mutation.
+var errMergeNotAdmitted = errors.New("merge was not admitted")
+
+// mergePRWithBodyAdmitted merges or enqueues while holding the pull request's
+// merge lock. admit, when set, runs under that lock immediately before the
+// provider mutation; returning false aborts with errMergeNotAdmitted. A
+// deferred worker uses it to check supersession without racing an immediate
+// merge or enqueue of the same pull request.
+func (s *Handler) mergePRWithBodyAdmitted(
+	ctx context.Context,
+	provider string,
+	platformHost string,
+	owner string,
+	name string,
+	number int,
+	body mergePRInputBody,
+	admit func() bool,
+) (mergePRBody, error) {
 	body.bindWorkspaceHost(ctx)
 	repo, err := s.requireRepoRouteCapability(
 		ctx,
@@ -1808,6 +1872,8 @@ func (s *Handler) mergePRWithBody(
 	if err != nil {
 		return mergePRBody{}, unsupportedCapabilityProblem(repo.Repo, capabilityMergeMutation)
 	}
+	release := s.mergeLocks.lock(deferredMergeKey(repo.Repo, number))
+	defer release()
 
 	mr, err := s.visibleMergeRequest(ctx, repo.ID, number)
 	if err != nil {
@@ -1824,15 +1890,37 @@ func (s *Handler) mergePRWithBody(
 		return mergePRBody{}, err
 	}
 
-	result, err := mutator.MergeMergeRequest(
-		ctx,
-		platformRepoRefFromDB(repo.Repo),
-		number,
-		body.CommitTitle,
-		body.CommitMessage,
-		body.Method,
-		expectedHeadSHA,
-	)
+	queueMutator, err := s.mergeQueueMutatorFor(ctx, repo.Repo, mr)
+	if err != nil {
+		return mergePRBody{}, err
+	}
+	if admit != nil && !admit() {
+		return mergePRBody{}, errMergeNotAdmitted
+	}
+	var result platform.MergeResult
+	enqueueRequestedAt := s.now().UTC()
+	priorAttempts, priorAttemptsKnown := 0, false
+	if queueMutator != nil {
+		// Counted before the request so the new attempt is told apart from
+		// earlier ones, even when sync observes its outcome while the
+		// asynchronous enqueue is still being confirmed.
+		priorAttempts, priorAttemptsKnown = s.syncer.MergeQueueAttempts(
+			ctx, mergeRequestRepoRef(repo.Repo), number,
+		)
+		result, err = queueMutator.EnqueueMergeRequest(
+			ctx, platformRepoRefFromDB(repo.Repo), number, expectedHeadSHA,
+		)
+	} else {
+		result, err = mutator.MergeMergeRequest(
+			ctx,
+			platformRepoRefFromDB(repo.Repo),
+			number,
+			body.CommitTitle,
+			body.CommitMessage,
+			body.Method,
+			expectedHeadSHA,
+		)
+	}
 	if err != nil {
 		if status, message, ok := mergeHTTPErrorStatus(err); ok {
 			slog.Error("provider merge failed",
@@ -1920,8 +2008,19 @@ func (s *Handler) mergePRWithBody(
 		)
 	}
 
+	if result.Queued {
+		// The queue now owns this merge, so a waiting "merge after CI"
+		// worker must not later enqueue again or report a failure.
+		s.supersedeDeferredMerge(deferredMergeKey(repo.Repo, number))
+		attempt, record := enqueuedAttempt(priorAttempts, priorAttemptsKnown, result.AlreadyQueued)
+		s.syncer.RecordEnqueue(
+			ctx, mergeRequestRepoRef(repo.Repo), repo.ID, number, attempt, record, enqueueRequestedAt,
+		)
+	}
+
 	return mergePRBody{
 		Merged:                  result.Merged,
+		Queued:                  result.Queued,
 		SHA:                     result.SHA,
 		Message:                 result.Message,
 		WorkspaceCleanupPending: workspaceCleanup.Pending,
@@ -2958,4 +3057,78 @@ func (s *Handler) getStackForPRRouteCore(ctx context.Context, input *repoNumberI
 	return &getStackForPROutput{
 		Body: stackContextForPR(input.Number, stack, members),
 	}, nil
+}
+
+func mergeQueueRemovalResponse(removal db.MergeQueueRemoval) *MergeQueueRemovalResponse {
+	return &MergeQueueRemovalResponse{
+		RemovedAt: formatUTCRFC3339(removal.RemovedAt),
+		Reason:    removal.Reason,
+	}
+}
+
+func mergeQueueEntryResponse(entry db.MergeQueueEntry) *MergeQueueEntryResponse {
+	resp := &MergeQueueEntryResponse{
+		Position:   entry.Position,
+		State:      strings.ToLower(entry.State),
+		EnqueuedAt: formatUTCRFC3339(entry.EnqueuedAt),
+		ObservedAt: formatUTCRFC3339(entry.ObservedAt),
+	}
+	if entry.EstimatedTimeToMerge != nil {
+		resp.EstimatedTimeToMergeSeconds = new(int64(entry.EstimatedTimeToMerge.Seconds()))
+	}
+	return resp
+}
+
+// mergeQueueMutatorFor returns the provider's merge queue mutator when the
+// pull request targets a branch whose merge queue sync last observed, so
+// merging adds it to the queue. It returns nil for a direct merge.
+func (s *Handler) mergeQueueMutatorFor(
+	ctx context.Context, repo db.Repo, mr *db.MergeRequest,
+) (platform.MergeQueueMutator, error) {
+	queue, err := s.repoMergeQueueFor(ctx, repo, mr)
+	if err != nil || queue == nil {
+		return nil, err
+	}
+	mutator, err := s.syncer.MergeQueueMutator(repoProviderKind(repo), repoProviderHost(repo))
+	if err != nil {
+		return nil, unsupportedCapabilityProblem(repo, capabilityMergeQueueMutation)
+	}
+	return mutator, nil
+}
+
+// repoMergeQueueFor returns the merge queue that a merge of mr goes through,
+// or nil when its target branch has none or the provider cannot enqueue.
+func (s *Handler) repoMergeQueueFor(
+	ctx context.Context, repo db.Repo, mr *db.MergeRequest,
+) (*db.RepoMergeQueue, error) {
+	if !s.capabilitiesForRepo(repo).MergeQueueMutation {
+		return nil, nil
+	}
+	queue, err := s.db.GetRepoMergeQueue(ctx, repo.ID)
+	if err != nil {
+		return nil, httpapi.Internal("load merge queue configuration failed")
+	}
+	if queue == nil || queue.Branch != mr.BaseBranch {
+		return nil, nil
+	}
+	return queue, nil
+}
+
+// enqueuedAttempt identifies the queue attempt an enqueue left the pull
+// request in, from the provider's attempt count read before the request. An
+// enqueue of an already-queued pull request starts no new attempt, so when
+// that attempt cannot be identified the cached state is left alone (record is
+// false). Otherwise 0 means a new attempt of unknown number: its departure is
+// never matched to a removal.
+func enqueuedAttempt(priorAttempts int, known, alreadyQueued bool) (attempt int, record bool) {
+	switch {
+	case alreadyQueued && !known:
+		return 0, false
+	case alreadyQueued:
+		return priorAttempts, true
+	case !known:
+		return 0, true
+	default:
+		return priorAttempts + 1, true
+	}
 }
