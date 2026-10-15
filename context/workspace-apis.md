@@ -272,9 +272,15 @@ embedder protocol for arbitrary host state.
 - Failed enrichment retains last-known-good values and component-owned errors;
   one component's success clears only its own error
   (`internal/server/workspaceapi/workspace_enrichment.go::recordWorkspaceEnrichmentResult`).
+- A partial tmux probe replaces last-known-good only when an answering session shows
+  the agent working; idle partials and failed sessions' fallback samples cannot, since
+  the failed session may be the working one (`internal/server/workspaceapi/routes_handlers.go::Handler.applyWorkspaceTmuxEnrichment`).
 - Each workspace admits one background enrichment flight at a time; a full
   refresh upgrade waits behind active tmux work, and only the matching unique
   flight may release ownership (`internal/server/workspaceapi/workspace_enrichment.go::nextWorkspaceEnrichmentJob`).
+- Do not rely on cached earlier tmux sessions to rescue later probes under load;
+  samples expire before the next enrichment refresh, so each pass needs sibling progress
+  (`internal/server/workspaceapi/routes_handlers.go::probeWorkspaceTmuxActivity`).
 - Overlapping tmux probes wait for the active sample within the caller budget;
   fallback carries an error only when waiting or sample production fails
   (`internal/server/workspaceapi/routes_handlers.go::probeOneTmuxSession`).
