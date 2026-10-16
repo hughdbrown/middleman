@@ -1639,6 +1639,76 @@ describe("WorkspaceListSidebar", () => {
     },
   );
 
+  it("keeps focus on the workspace row after pinning and unpinning it", async () => {
+    mockGet.mockResolvedValue({
+      data: {
+        workspaces: [
+          workspaceFixture({
+            id: "ws-focus",
+            provider: "github",
+            platformHost: "github.com",
+            owner: "acme",
+            name: "api",
+            number: 1,
+            title: "Focus workspace",
+          }),
+        ],
+      },
+    });
+    render(WorkspaceListSidebar, { props: { selectedId: "" } });
+    await screen.findByText("Focus workspace");
+    const focusRow = () => screen.getByText("Focus workspace").closest(".ws-row") as HTMLElement;
+
+    const unpinnedRow = focusRow();
+    unpinnedRow.focus();
+    await fireEvent.contextMenu(unpinnedRow);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Pin workspace", exact: true }));
+    await waitFor(() => expect(document.activeElement).toBe(focusRow()));
+    expect(focusRow()).not.toBe(unpinnedRow);
+
+    const pinnedRow = focusRow();
+    await fireEvent.contextMenu(pinnedRow);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Unpin workspace", exact: true }));
+    await waitFor(() => expect(document.activeElement).toBe(focusRow()));
+    expect(focusRow()).not.toBe(pinnedRow);
+  });
+
+  it("opens a collapsed repo group to keep focus on an unpinned workspace", async () => {
+    const repoWorkspace = (id: string, number: number, title: string) =>
+      workspaceFixture({
+        id,
+        provider: "github",
+        platformHost: "github.com",
+        owner: "acme",
+        name: "api",
+        number,
+        title,
+      });
+    mockGet.mockResolvedValue({
+      data: {
+        workspaces: [
+          repoWorkspace("ws-moving", 1, "Moving workspace"),
+          repoWorkspace("ws-staying", 2, "Staying workspace"),
+        ],
+      },
+    });
+    render(WorkspaceListSidebar, { props: { selectedId: "" } });
+    await screen.findByText("Moving workspace");
+    const movingRow = () => screen.queryByText("Moving workspace")?.closest(".ws-row") as HTMLElement | null;
+
+    await fireEvent.contextMenu(movingRow()!);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Pin workspace", exact: true }));
+    const groupHeader = screen.getByRole("button", { name: /api/, expanded: true });
+    await fireEvent.click(groupHeader);
+    expect(groupHeader.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("Staying workspace")).toBeNull();
+
+    await fireEvent.contextMenu(movingRow()!);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Unpin workspace", exact: true }));
+    await waitFor(() => expect(document.activeElement).toBe(movingRow()));
+    expect(groupHeader.getAttribute("aria-expanded")).toBe("true");
+  });
+
   it("pins only the chosen host when workspace IDs match", async () => {
     const local = workspaceFixture({
       id: "shared-id",
@@ -2595,7 +2665,7 @@ describe("WorkspaceListSidebar", () => {
     expect(mockNavigate).toHaveBeenCalledWith("/terminal/ws-delete-failed");
 
     await fireEvent.contextMenu(container.querySelector(".ws-row")!);
-    expect((screen.getByRole("menuitem", { name: "Retry deletion..." }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByRole("menuitem", { name: "Retry deletion..." }).getAttribute("aria-disabled")).toBeNull();
     await fireEvent.click(screen.getByRole("menuitem", { name: "Force delete workspace..." }));
 
     const dialog = await screen.findByRole("dialog", { name: "Force delete workspace?" });
@@ -2823,7 +2893,8 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("Ahead workspace");
 
-    await fireEvent.contextMenu(container.querySelector(".ws-row")!);
+    const row = container.querySelector(".ws-row")!;
+    await fireEvent.contextMenu(row);
 
     await fireEvent.click(screen.getByRole("menuitem", { name: /Push branch/ }));
 
@@ -2831,8 +2902,13 @@ describe("WorkspaceListSidebar", () => {
       params: { path: { id: "ws-ahead" } },
       signal: expect.any(AbortSignal),
     });
-    expect((screen.getByRole("menuitem", { name: /Pushing\.\.\./ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole("menu", { name: "Workspace actions" })).toBeNull();
     expect(screen.getByLabelText("Pushing branch")).toBeTruthy();
+
+    // Reopening the menu while the push runs shows it and blocks a second one.
+    await fireEvent.contextMenu(row);
+    expect(screen.getByRole("menuitem", { name: /Pushing\.\.\./ }).getAttribute("aria-disabled")).toBe("true");
+    expect(screen.getByRole("menuitem", { name: "Copy worktree path" }).getAttribute("aria-disabled")).toBe("true");
 
     push.resolve({ data: undefined, response: { ok: true, status: 200 } });
     await waitFor(() => {
@@ -2936,14 +3012,16 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("Behind workspace");
 
-    await fireEvent.contextMenu(container.querySelector(".ws-row")!);
+    const row = container.querySelector(".ws-row")!;
+    await fireEvent.contextMenu(row);
     await fireEvent.click(screen.getByRole("menuitem", { name: /Pull remote changes/ }));
 
     expect(mockPost).toHaveBeenCalledWith("/workspaces/{id}/pull", {
       params: { path: { id: "ws-behind" } },
       signal: expect.any(AbortSignal),
     });
-    expect((screen.getByRole("menuitem", { name: /Pulling\.\.\./ }) as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.contextMenu(row);
+    expect(screen.getByRole("menuitem", { name: /Pulling\.\.\./ }).getAttribute("aria-disabled")).toBe("true");
 
     pull.resolve({ data: undefined, response: { ok: true, status: 200 } });
     await waitFor(() => {

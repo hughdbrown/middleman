@@ -527,6 +527,18 @@ non-default state ("Strict date order", "Hide bot activity"), checked when
 active. Do not add a row for the default state, an exclusive radio pair, or an
 opaque single-word label for default behavior.
 
+### Context menus
+
+Right-click menus use kit `Menu` with a pointer `anchor` and `returnFocus` on the
+clicked row; group with separators, not heading rows. Show a shortcut hint only
+for a binding that exists. A row with no actions opens no menu, not a
+placeholder. Destructive items use `tone="danger"`. Library-rendered menus
+(Docs folder tree) mirror kit `MenuItem` metrics. An item that moves focus into
+a field or dialog must not restore focus to the row on close
+(`frontend/src/lib/components/docs/FolderTree.svelte::buildContextMenu`). An item
+that moves the row to another list expands that list if collapsed, then focuses
+the new row (`frontend/src/lib/components/terminal/WorkspaceListSidebar.svelte::togglePin`).
+
 ### Overlays
 
 Use shared overlay primitives for dropdowns, popovers, menus, tooltips, and similar floating controls.
