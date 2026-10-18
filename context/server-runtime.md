@@ -30,6 +30,9 @@
 
 ## Frontend assets
 
+- Probe the development frontend over HTTP; Vite's parent process can stay
+  alive after a config reload stops listening. Use the repository-local launcher
+  so updates use the installed project toolchain (`scripts/dev-stack-frontend.sh`).
 - Vite routes live at root even when the backend has a base path; login redirects
   must translate back to that namespace. The static dev-auth proxy check requires
   the tested helper (`frontend/src/lib/dev/authBootstrapProxy.ts::authBootstrapProxy`).
@@ -103,6 +106,9 @@ and the root event stream.
 - Bare `kenn-forge` is help-only, `serve` is foreground, and background
   lifecycle management is under `daemon start|status|stop|restart`
   (`cmd/kenn-forge/cli.go::newRootCommand`).
+- Development reloads must allow the full daemon shutdown budget; a short
+  Air or supervisor kill delay interrupts runtime cleanup
+  (`internal/shutdownbudget/budget.go::Total`).
 - Foreground listener flags belong only to `serve`; preserve explicit changed-state
   above environment values and redact endpoint credentials from startup source logs
   (`internal/cli/serve/serve.go::NewCommand`, `cmd/kenn-forge/main.go::logRuntimeConfig`).
@@ -146,6 +152,10 @@ and the root event stream.
   `--disable-sync` suppresses hub refresh and never weakens spoke absence
   (`cmd/kenn-forge/provider_startup.go::buildServeControlPlanes`,
   `cmd/kenn-forge/main.go::run`).
+
+- Keep process-compose as the backend's only restart owner; nested Air rerun
+  loops can spawn competing servers while one holds the data-directory lock.
+  Watch inputs must exclude generated clients and assets (`process-compose.yml`).
 
 ## Startup Lock
 
