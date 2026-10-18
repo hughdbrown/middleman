@@ -20,8 +20,6 @@ import (
 func TestReporterUsesKitDailyClaimsAcrossUpgradeAndRestart(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	t.Setenv(EnabledEnv, "1")
-	t.Setenv("KENN_FORGE_TELEMETRY_ENABLED", "1")
 	database := dbtest.Open(t)
 	now := time.Now().UTC()
 	for key, value := range map[string]string{
@@ -34,7 +32,8 @@ func TestReporterUsesKitDailyClaimsAcrossUpgradeAndRestart(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var screens []string
-	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	opts := Options{Database: database, DailyClaimsPath: filepath.Join(t.TempDir(), "daily.json")}
+	reporter := setupDailyReporter(t, opts, now, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var batch struct {
 			Batch []struct {
 				Properties map[string]any `json:"properties"`
@@ -53,15 +52,6 @@ func TestReporterUsesKitDailyClaimsAcrossUpgradeAndRestart(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer endpoint.Close()
-	swapKitReporter(t, func(opts posthog.Options, options ...posthog.Option) (Client, error) {
-		opts.Endpoint = endpoint.URL
-		return posthog.NewReporter(opts, options...)
-	})
-	opts := Options{Database: database, DailyClaimsPath: filepath.Join(t.TempDir(), "daily.json")}
-	reporter, err := newReporter(opts, now)
-	require.NoError(err)
-	t.Cleanup(func() { require.NoError(reporter.Close()) })
 	for _, properties := range []map[string]any{nil, {"screen": "unknown"}, {"screen": 42}} {
 		_, err := reporter.Report(t.Context(), "screen_viewed", properties)
 		require.ErrorIs(err, posthog.ErrInvalidProperty)
@@ -87,4 +77,20 @@ func TestReporterUsesKitDailyClaimsAcrossUpgradeAndRestart(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.ElementsMatch([]string{"docs", "settings"}, screens)
+}
+
+func setupDailyReporter(t *testing.T, opts Options, now time.Time, handler http.Handler) *Reporter {
+	t.Helper()
+	t.Setenv(EnabledEnv, "1")
+	t.Setenv("KENN_FORGE_TELEMETRY_ENABLED", "1")
+	endpoint := httptest.NewServer(handler)
+	t.Cleanup(endpoint.Close)
+	swapKitReporter(t, func(opts posthog.Options, options ...posthog.Option) (Client, error) {
+		opts.Endpoint = endpoint.URL
+		return posthog.NewReporter(opts, options...)
+	})
+	reporter, err := newReporter(opts, now)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reporter.Close()) })
+	return reporter
 }

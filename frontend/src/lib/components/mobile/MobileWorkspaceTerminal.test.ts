@@ -7,6 +7,8 @@ import { makeGeneratedClient } from "../../testing/generated-client.js";
 import { navigate } from "../../stores/router.svelte.js";
 import { getInlineWorkspaceController, resetWorkspaceHostForTest } from "../../stores/workspace-host.svelte.js";
 
+const coreActions = vi.hoisted(() => vi.fn(async (_body: unknown, _options?: unknown) => ({ status: "queued" })));
+
 const mocks = vi.hoisted(() => ({
   runtimeClient: {
     getWorkspace: vi.fn(),
@@ -55,6 +57,8 @@ import MobileWorkspaceTerminalTestHarness from "./MobileWorkspaceTerminalTestHar
 import type { WorkspaceEventsNotification } from "../../stores/events.svelte.js";
 import {
   markWorkspaceIdDeleted,
+  beginWorkspaceDeletion,
+  endWorkspaceDeletion,
   pendingWorkspaceLaunch,
   queueWorkspaceLaunch,
   resetWorkspaceCreatePendingForTest,
@@ -95,6 +99,7 @@ const workspaceRef = { id: "ws-a", status: "ready" };
 
 describe("MobileWorkspaceTerminal", () => {
   beforeEach(() => {
+    coreActions.mockClear();
     for (const mock of Object.values(mocks.runtimeClient)) mock.mockReset();
     mocks.runtimeClient.getWorkspace.mockResolvedValue(workspace);
     mocks.runtimeClient.getWorkspaceRuntime.mockResolvedValue(runtime);
@@ -103,6 +108,7 @@ describe("MobileWorkspaceTerminal", () => {
     events.subscribeWorkspaceEvents.mockReset().mockReturnValue(() => {});
     runtimeState.appRuntime = makeAppRuntime(
       makeGeneratedClient({
+        SystemService: { captureTelemetryEvent: coreActions },
         WorkspacesService: mocks.runtimeClient,
         FleetService: mocks.runtimeClient,
       }),
@@ -122,6 +128,58 @@ describe("MobileWorkspaceTerminal", () => {
     resetWorkspaceHostForTest();
     resetWorkspaceCreatePendingForTest();
     resetSessionHostForTest();
+    vi.useRealTimers();
+  });
+
+  it.each(["ready", "error", "creating", "pending", "deleted", "deleting", "deletion_failed"] as const)(
+    "reports mobile workspace use only when usable: %s",
+    async (state) => {
+      if (state === "pending") beginWorkspaceDeletion("ws-a", undefined);
+      if (state === "deleted") markWorkspaceIdDeleted("ws-a");
+      mocks.runtimeClient.getWorkspace.mockResolvedValue({
+        ...workspace,
+        status: state === "pending" || state === "deleted" ? "ready" : state,
+      });
+      render(MobileWorkspaceTerminalTestHarness, { props });
+      if (state === "pending" || state === "deleted" || state === "deleting" || state === "deletion_failed") {
+        await screen.findByTitle("acme/widgets · feature/test");
+        expect(coreActions).not.toHaveBeenCalled();
+        if (state !== "pending") return;
+        endWorkspaceDeletion("ws-a", undefined);
+      }
+      await waitFor(() =>
+        expect(coreActions.mock.calls[0]?.[0]).toMatchObject({
+          event: "workspace_opened",
+          properties: { item_type: "pull_request" },
+        }),
+      );
+      expect(coreActions).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("reports mobile workspace use again when the tab returns after the UTC day changes", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-17T23:59:59Z"));
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    const setVisibility = (state: DocumentVisibilityState) => {
+      visibility.mockReturnValue(state);
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    try {
+      render(MobileWorkspaceTerminalTestHarness, { props });
+      await waitFor(() => expect(coreActions).toHaveBeenCalledTimes(1));
+
+      setVisibility("hidden");
+      vi.setSystemTime(new Date("2026-10-18T00:00:01Z"));
+      setVisibility("visible");
+      await waitFor(() => expect(coreActions).toHaveBeenCalledTimes(2));
+      expect(coreActions.mock.calls[1]?.[0]).toEqual({
+        event: "workspace_opened",
+        properties: { item_type: "pull_request", surface: "web" },
+      });
+    } finally {
+      visibility.mockRestore();
+    }
   });
 
   it.each([
@@ -284,7 +342,11 @@ describe("MobileWorkspaceTerminal", () => {
     mocks.runtimeClient.launchWorkspaceAgentHandoff.mockReturnValue(handoff.promise);
     const appRuntime = runtimeState.appRuntime;
     if (!appRuntime) throw new Error("Missing test runtime");
-    runWorkspaceQuickAction(appRuntime, "ws-a", { label: "Review", agent: "chat", prompt: "Review this change" });
+    runWorkspaceQuickAction(appRuntime, "ws-a", "pull_request", {
+      label: "Review",
+      agent: "chat",
+      prompt: "Review this change",
+    });
     render(MobileWorkspaceTerminal, { props });
     await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
     expect(screen.getByText("Starting chat…")).toBeTruthy();
@@ -314,7 +376,11 @@ describe("MobileWorkspaceTerminal", () => {
       mocks.runtimeClient.launchWorkspaceAgentHandoff.mockReturnValue(handoff.promise);
       const appRuntime = runtimeState.appRuntime;
       if (!appRuntime) throw new Error("Missing test runtime");
-      runWorkspaceQuickAction(appRuntime, "ws-a", { label: "Review", agent: "chat", prompt: "Review this change" });
+      runWorkspaceQuickAction(appRuntime, "ws-a", "pull_request", {
+        label: "Review",
+        agent: "chat",
+        prompt: "Review this change",
+      });
       render(MobileWorkspaceTerminal, { props });
       await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
       if (state === "rejected") {

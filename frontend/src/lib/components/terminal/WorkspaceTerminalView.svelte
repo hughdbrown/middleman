@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { reportWorkspaceOpened } from "../../app/telemetry.js";
+  import { documentVisible } from "../../browser/document-visible.svelte.js";
   import { updateWorkspaceTarget, visitWorkspaceTargetReference } from "../../api/workspace-targets.js";
   import type { TabbedPanelLeaf } from "../shared/tabbed-panel-layout.js";
   import {
@@ -693,6 +695,17 @@
   const runtimeLive = $derived(
     runtime !== null && runtimeForId === workspaceId && runtimeForHostKey === workspaceHostKey && workspaceLive,
   );
+  // A workspace counts on its own visible page or when something launches in it;
+  // automatic display beside a PR or issue does not.
+  function reportWorkspaceLaunch(): void {
+    if (usableWorkspace) reportWorkspaceOpened(appRuntime, usableWorkspace.item_type);
+  }
+  $effect(() => {
+    if (!embeddedWorkspace && hostVisible && documentVisible() && usableWorkspace) {
+      reportWorkspaceOpened(appRuntime, usableWorkspace.item_type);
+    }
+  });
+
   const workspaceDetailsReady = $derived(workspaceLive && (runtimeLive || runtimeError !== null));
 
   function hasAppliedRuntimeFor(
@@ -1564,6 +1577,7 @@
       workspaceDeletionLifecycleActive ||
       forceDeleting,
   );
+  const usableWorkspace = $derived(workspaceLive && !actionsBlocked ? workspace : null);
   $effect(() => {
     if (!hostVisible || actionsBlocked) itemSearchAnchor = null;
   });
@@ -2950,6 +2964,7 @@
     admissionRuntime?: WorkspaceRuntimeState,
   ): void {
     if (!workspaceId || launchingKey || actionsBlocked) return;
+    reportWorkspaceLaunch();
     const id = workspaceId;
     const hostKey = workspaceHostKey;
     launchingKey = targetKey;
@@ -3005,7 +3020,7 @@
 
   function handleQuickAction(action: QuickAction, leaf?: WorkspaceRuntimeLaunchLeaf): void {
     if (!workspaceId || actionsBlocked) return;
-    runWorkspaceQuickAction(appRuntime, workspaceId, action, workspaceHostKey, undefined, leaf);
+    runWorkspaceQuickAction(appRuntime, workspaceId, workspace?.item_type, action, workspaceHostKey, undefined, leaf);
   }
 
   function startAcceptedWorkspaceLaunchReconciliation(
@@ -3110,6 +3125,7 @@
     placement: WorkspaceRuntimeLaunchPlacement = { _tag: "Terminal", insertIntoTree: true },
   ): void {
     if (!workspaceId || terminalLaunching || actionsBlocked) return;
+    reportWorkspaceLaunch();
     const id = workspaceId;
     const hostKey = workspaceHostKey;
     terminalLaunching = true;
