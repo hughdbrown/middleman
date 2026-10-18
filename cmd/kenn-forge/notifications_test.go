@@ -171,24 +171,24 @@ func TestTelemetryHeartbeatReportsDailyUntilStopped(t *testing.T) {
 		handle := newBackgroundLoopHandle(t.Context())
 		client := &fakeTelemetryClient{}
 		var repos atomic.Int64
-		repos.Store(3)
+		repos.Store(1)
 		startTelemetryHeartbeat(handle, client, func() int { return int(repos.Load()) })
 
 		synctest.Wait()
 		require.Empty(client.repoCounts())
 		time.Sleep(24 * time.Hour)
 		synctest.Wait()
-		require.Equal([]any{3}, client.repoCounts())
+		require.Equal([]any{"0-5"}, client.repoCounts())
 
-		repos.Store(5)
+		repos.Store(37)
 		time.Sleep(24 * time.Hour)
 		synctest.Wait()
-		require.Equal([]any{3, 5}, client.repoCounts())
+		require.Equal([]any{"0-5", "21-100"}, client.repoCounts())
 
 		require.NoError(handle.Stop(t.Context()))
 		time.Sleep(72 * time.Hour)
 		synctest.Wait()
-		require.Equal([]any{3, 5}, client.repoCounts())
+		require.Equal([]any{"0-5", "21-100"}, client.repoCounts())
 	})
 }
 
