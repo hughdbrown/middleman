@@ -72,6 +72,27 @@ Interactive surfaces must agree on which item is selected.
 - Confirmed workspace deletions evict the matching host and ID from visible rows and the shared snapshot
   before revalidation, preserving same-ID entries on other hosts
   (`frontend/src/lib/components/terminal/workspace-list-workflow.ts::removeWorkspaceListEntry`).
+- Workspace list multi-selection never navigates and covers only on-screen rows (not collapsed or filtered);
+  bulk delete never forces, so dirty worktrees survive and are reported
+  (`frontend/src/lib/components/terminal/WorkspaceListSidebar.svelte::confirmBulkDelete`).
+- PR and issue list multi-selection follows the same rules; a bulk quick action reuses an item's existing
+  workspace instead of creating another, uses the saved default target, runs in the background without a
+  progress dialog, and reports once every agent launch has finished
+  (`frontend/src/lib/stores/bulk-quick-action.ts::runQuickActionOnItems`).
+- PR and issue row menus apply each action to its eligible items only and gate it like the detail views,
+  with mutation availability read per repository because list rows omit it
+  (`frontend/src/lib/stores/item-actions.ts::actionEligibility`, `frontend/src/lib/stores/repo-operations.svelte.ts`).
+  Their writes use the detail views' per-item ProviderMutations keys, so edits from both surfaces apply in order
+  (`frontend/src/lib/stores/item-actions.ts::submitAction`).
+  Bulk assignees offer only people from the repository's synced history, with no typed-name entry: assigning
+  someone who never interacted with the repository is intentionally unsupported
+  (`frontend/src/lib/components/sidebar/ItemActionsMenu.svelte::searchUsers`).
+  Bulk label and assignee edits send only additions and removals, which the server applies to the provider's
+  live set read just before writing, under a process-wide per-item lock (`httpapi.LockItemMembership`) that the PUT routes and workspace
+  auto-assignment also take, never a full
+  replacement list; label additions wait until every repository label list is current and are dropped for repositories
+  whose list did not load or reports a refresh `sync_error`
+  (`internal/server/pullapi/membership_handlers.go::livePull`, `ItemActionsMenu.svelte::applyMembership`).
 - Repository pickers share the app's successful catalog during refresh and refresh failures;
   refreshed options preserve the selected stable identity across renames or clear it, never select another repository
   (`frontend/src/lib/components/terminal/NewWorkspaceDialog.svelte::loadRepositories`).
@@ -158,8 +179,9 @@ Interactive surfaces must agree on which item is selected.
 - Quick actions keep the automatic session picker closed for that workspace, local or devbox, during the
   browser session, regardless of launch outcome or session exit. Opening it remains an explicit user action
   (`frontend/src/lib/stores/workspace-quick-actions.ts::quickActionWorkspaceKey`).
-- Admit one quick action per workspace and host until its handoff is presented or fails
-  (`frontend/src/lib/stores/workspace-quick-actions.ts::runWorkspaceQuickAction`).
+- Quick actions for one workspace and host queue: each handoff starts after the previous one finishes, and none
+  is dropped; the latest launch is the one a mobile view presents
+  (`frontend/src/lib/stores/workspace-quick-actions.ts::launchWorkspaceQuickAction`).
 - Mounted workspace views activate completed handoffs in the requested pane unless the user moved the session.
   Preserve saved layout entries until authoritative runtime discovery can prune them
   (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte`).
