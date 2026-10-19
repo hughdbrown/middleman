@@ -26,7 +26,10 @@ export interface WorkspaceChat {
   errorData?: string;
   /** The chat's agent has exited; no other field is present. */
   exited: boolean;
+  lastMessageId?: string;
   messageCount?: number;
+  /** @minimum 0 */
+  messageCursor?: number;
   messageOffset?: number;
   messages?: WorkspaceChatMessage[];
   notices?: string[];

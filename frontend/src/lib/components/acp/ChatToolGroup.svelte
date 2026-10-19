@@ -7,22 +7,42 @@
   import ChatContentBlock from "./ChatContentBlock.svelte"
   import { isImageContent } from "./chat-content.js"
   import { decodeAppDescriptor } from "./mcp-app.js"
+  import type { ContentScrollPositions } from "./chat-content-scroll.js"
   import { toolStatus, type ChatMessage } from "./chat-types.js"
 
   let {
     messages,
+    anchorId,
+    openEntries,
+    expanded,
+    expandedThoughts,
+    rawOpen,
+    contentScroll,
+    onToggleThought,
+    onRawToggle,
+    onToggleGroup,
+    onToggleTool,
     childCounts = {},
     streaming = false,
   }: {
     messages: ChatMessage[]
+    anchorId: string
+    openEntries: Readonly<Record<string, boolean>>
+    expanded: Readonly<Record<string, boolean>>
+    expandedThoughts: Readonly<Record<string, boolean>>
+    contentScroll: ContentScrollPositions
+    rawOpen: Readonly<Record<string, { input?: boolean; output?: boolean }>>
+    onToggleThought: (id: string) => void
+    onRawToggle: (id: string, field: "input" | "output", open: boolean) => void
+    onToggleGroup: (messages: readonly ChatMessage[], open: boolean) => void
+    onToggleTool: (id: string) => void
     /** Tool calls made inside each sub-agent, keyed by its toolCallId. */
     childCounts?: Readonly<Record<string, number>>
     /** The group's last message is still receiving chunks. */
     streaming?: boolean
   } = $props()
   const id = $props.id()
-  let open = $state(false)
-  let expanded = $state<Record<number, boolean>>({})
+  const open = $derived(messages.some((message) => openEntries[message.id]))
   function hasDetails(message: ChatMessage): boolean {
     return !!(
       message.kind ||
@@ -61,14 +81,14 @@
   )
 </script>
 
-<div class="tool-group">
+<div class="tool-group" data-activity-group={anchorId}>
   <button
     type="button"
     class="chip kit-control-states"
     class:failed={failed > 0}
     aria-expanded={open}
     aria-controls={`${id}-list`}
-    onclick={() => (open = !open)}
+    onclick={() => onToggleGroup(messages, !open)}
   >
     {#if running}<Spinner size={12} label="Tools running" />{:else if subagents}<Bot
         size={12}
@@ -82,13 +102,14 @@
   </button>
   {#if open}
     <ul id={`${id}-list`} class="list">
-      {#each messages as message, index (index)}
+      {#each messages as message, index (message.id)}
+        {@const key = message.id}
         {#if message.role === "thought"}
-          <li class="thought-row"><ChatMessageView {message} streaming={streaming && index === messages.length - 1} /></li>
+          <li class="thought-row" data-message-id={message.id}><ChatMessageView {message} thoughtOpen={!!expandedThoughts[message.id]} onThoughtToggle={() => onToggleThought(message.id)} streaming={streaming && index === messages.length - 1} /></li>
         {:else}
         {@const status = toolStatus(message)}
         {@const expandable = hasDetails(message)}
-        <li class={`status-${status}`}>
+        <li class={`status-${status}`} data-message-id={message.id}>
           {#snippet row()}
           <span class="icon" aria-hidden="true">
             {#if status === "failed"}<X size={12} />
@@ -123,14 +144,14 @@
             <button
               type="button"
               class="row row--button"
-              aria-expanded={!!expanded[index]}
+              aria-expanded={!!expanded[key]}
               aria-controls={`${id}-tool-${index}`}
-              onclick={() => (expanded[index] = !expanded[index])}
+              onclick={() => onToggleTool(key)}
             >
               {@render row()}
             </button>
-            {#if expanded[index]}
-              <ChatToolDetails {message} id={`${id}-tool-${index}`} />
+            {#if expanded[key]}
+              <ChatToolDetails {message} {contentScroll} id={`${id}-tool-${index}`} rawInputOpen={!!rawOpen[message.id]?.input} rawOutputOpen={!!rawOpen[message.id]?.output} onRawToggle={(field, open) => onRawToggle(message.id, field, open)} />
             {/if}
           {:else}
             <div class="row">{@render row()}</div>
@@ -140,7 +161,7 @@
       {/each}
     </ul>
   {/if}
-  {#each messages as message, messageIndex (messageIndex)}
+  {#each messages as message (message.id)}
     {#each message.toolContent ?? [] as item, contentIndex (contentIndex)}
       {#if item.content && (isImageContent(item.content) || decodeAppDescriptor(item.content))}
         <ChatContentBlock content={item.content} />

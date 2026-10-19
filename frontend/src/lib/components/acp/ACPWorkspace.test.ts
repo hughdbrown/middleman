@@ -4,6 +4,7 @@ import { tick } from "svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { makeAppRuntime, type OwnedAppRuntime } from "../../app/runtime.js";
 import type { TerminalSessionOptions } from "../terminal/terminal-session.js";
+import { fixtureMessages, fixtureState } from "./chat-test-fixtures.js";
 import ACPWorkspace from "./ACPWorkspace.svelte";
 import { STORES_KEY } from "../../context.js";
 import { createSettingsStore } from "../../stores/settings.svelte.js";
@@ -36,6 +37,7 @@ vi.mock("../terminal/terminal-session.js", async () => {
 });
 
 const baseState = {
+  messageCursor: 1,
   messages: [],
   configOptions: [],
   configuring: false,
@@ -45,7 +47,10 @@ const baseState = {
   error: "",
 };
 
-async function openChat(state: Record<string, unknown>, props: { disabled?: boolean } = {}) {
+async function openChat(
+  state: Record<string, unknown>,
+  props: { disabled?: boolean; onExit?: (code: number) => void } = {},
+) {
   render(ACPWorkspace, {
     context: new Map([[STORES_KEY, { settings }]]),
     props: { websocketPath: "/ws/chat", ...props },
@@ -59,7 +64,7 @@ async function push(state: Record<string, unknown>) {
   // An unpaged fixture is the whole transcript.
   const messages = (state.messages ?? []) as unknown[];
   socket.options!.onMessage(
-    JSON.stringify({ ...baseState, messageOffset: 0, messageCount: messages.length, ...state }),
+    JSON.stringify(fixtureState({ ...baseState, messageOffset: 0, messageCount: messages.length, ...state })),
   );
   await tick();
 }
@@ -84,6 +89,63 @@ afterEach(async () => {
   vi.unstubAllGlobals();
   if (runtimeCapture.current) await Effect.runPromise(runtimeCapture.current.disposeEffect);
   runtimeCapture.current = undefined;
+});
+
+describe("ACPWorkspace final transcript", () => {
+  it("reports exit after the final update batch while showing permission requests immediately", async () => {
+    const onExit = vi.fn();
+    await openChat(
+      {
+        messages: [
+          { role: "tool", text: "Old result", toolCallId: "tool-1" },
+          { role: "assistant", text: "Working" },
+        ],
+      },
+      { onExit },
+    );
+    const finalState = {
+      ...baseState,
+      messageCount: 2,
+      messageOffset: 0,
+      messageCursor: 2,
+      lastMessageId: "entry-1",
+      connected: false,
+    };
+    socket.options!.onMessage(
+      JSON.stringify({
+        updates: {
+          ...finalState,
+          more: true,
+          permissions: [
+            {
+              id: "approve",
+              title: "Edit file",
+              options: [{ optionId: "allow", name: "Allow once", kind: "allow_once" }],
+            },
+          ],
+          messages: fixtureMessages([{ role: "tool", text: "Final result", toolCallId: "tool-1", version: 2 }]),
+        },
+      }),
+    );
+    await tick();
+    expect(onExit).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeTruthy();
+    expect(sentCommands()).toEqual([]);
+    socket.options!.onMessage(
+      JSON.stringify({
+        updates: {
+          ...finalState,
+          more: false,
+          messages: fixtureMessages([{ role: "assistant", text: "Done", version: 2 }], 1),
+        },
+      }),
+    );
+    await tick();
+    expect(onExit).toHaveBeenCalledExactlyOnceWith(-1);
+    await fireEvent.click(screen.getByRole("button", { name: /1 tool/ }));
+    expect(screen.getByText("Final result")).toBeTruthy();
+    expect(within(screen.getByRole("article", { name: "Assistant" })).getByText("Done")).toBeTruthy();
+  });
 });
 
 describe("ACPWorkspace elicitations", () => {
@@ -1179,7 +1241,13 @@ describe("ACPWorkspace terminal output", () => {
 });
 
 describe("ACPWorkspace transcript paging", () => {
-  const user = (index: number) => ({ role: "user", text: `Message ${index}` });
+  const user = (index: number) => ({
+    id: `entry-${index}`,
+    previousId: index === 0 ? "" : `entry-${index - 1}`,
+    version: 1,
+    role: "user",
+    text: `Message ${index}`,
+  });
   const range = (from: number, to: number) => Array.from({ length: to - from }, (_, offset) => user(from + offset));
   const texts = () => screen.queryAllByRole("article").map((article) => article.textContent?.trim());
   const historyRequests = () =>
@@ -1191,7 +1259,7 @@ describe("ACPWorkspace transcript paging", () => {
     expect(texts()).toEqual(["Message 200", "Message 201"]);
 
     await fireEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
-    expect(historyRequests()).toEqual([{ type: "history", before: 200, limit: 100 }]);
+    expect(historyRequests()).toEqual([{ type: "history", beforeId: "entry-200", limit: 100 }]);
     const loading = screen.getByRole("button", { name: "Loading earlier messages…" }) as HTMLButtonElement;
     expect(loading.disabled).toBe(true);
 
@@ -1199,25 +1267,40 @@ describe("ACPWorkspace transcript paging", () => {
     await fireEvent.scroll(conversation());
     expect(historyRequests()).toHaveLength(1);
 
-    socket.options!.onMessage(JSON.stringify({ history: { offset: 100, messages: range(100, 200) } }));
+    socket.options!.onMessage(
+      JSON.stringify({ history: { beforeId: "entry-200", offset: 100, messages: range(100, 200) } }),
+    );
     await tick();
     expect(texts()).toHaveLength(102);
     expect(texts().slice(0, 2)).toEqual(["Message 100", "Message 101"]);
     expect(texts().slice(-3)).toEqual(["Message 199", "Message 200", "Message 201"]);
 
     await fireEvent.scroll(conversation());
-    expect(historyRequests().at(-1)).toEqual({ type: "history", before: 100, limit: 100 });
+    expect(historyRequests().at(-1)).toEqual({ type: "history", beforeId: "entry-100", limit: 100 });
   });
 
   it("asks for earlier history when the conversation scrolls near the top", async () => {
     await openChat({ messages: range(50, 52), messageOffset: 50, messageCount: 52 });
     await fireEvent.scroll(conversation());
-    expect(historyRequests()).toEqual([{ type: "history", before: 50, limit: 100 }]);
+    expect(historyRequests()).toEqual([{ type: "history", beforeId: "entry-50", limit: 100 }]);
   });
 
   it("keeps loaded messages when the window slides forward", async () => {
     await openChat({ messages: range(0, 3), messageOffset: 0, messageCount: 3 });
-    await push({ messages: range(2, 5), messageOffset: 2, messageCount: 5 });
+    socket.options!.onMessage(
+      JSON.stringify({
+        updates: {
+          ...baseState,
+          messages: range(2, 5),
+          messageOffset: 2,
+          messageCount: 5,
+          lastMessageId: "entry-4",
+          messageCursor: 2,
+          more: false,
+        },
+      }),
+    );
+    await tick();
 
     expect(texts()).toEqual(["Message 0", "Message 1", "Message 2", "Message 3", "Message 4"]);
     expect(screen.queryByRole("button", { name: "Load earlier messages" })).toBeNull();
@@ -1254,7 +1337,9 @@ describe("ACPWorkspace transcript paging", () => {
   it("starts over from the new window after reconnecting", async () => {
     await openChat({ messages: range(200, 202), messageOffset: 200, messageCount: 202 });
     await fireEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
-    socket.options!.onMessage(JSON.stringify({ history: { offset: 100, messages: range(100, 200) } }));
+    socket.options!.onMessage(
+      JSON.stringify({ history: { beforeId: "entry-200", offset: 100, messages: range(100, 200) } }),
+    );
     await tick();
     expect(texts()).toHaveLength(102);
 

@@ -75,6 +75,7 @@ func (a *ACP) persistLocked() error {
 	if a.recordPath == "" {
 		return nil
 	}
+	a.initializeMessagesLocked()
 	data, err := json.Marshal(acpSavedSession{SessionID: a.sessionID, State: a.state, LoadSession: a.loadSession}, json.Deterministic(true))
 	if err != nil {
 		return err
@@ -119,6 +120,10 @@ func (a *ACP) restoreSendersLocked() {
 // its own.
 func (a *ACP) restoreTranscriptLocked(saved ACPState) {
 	a.state.Messages = saved.Messages
+	a.messageIndex = nil
+	a.messageChanges.Init()
+	a.messageCursor = 0
+	a.initializeMessagesLocked()
 	a.state.Queue = saved.Queue
 	a.restoreSubmissionsLocked(saved)
 	a.restoreSendersLocked()
@@ -383,7 +388,7 @@ func (m *Manager) attachACPOwner(ctx context.Context, info SessionInfo) (*sessio
 
 func (m *Manager) acpAttachment(ctx context.Context, info SessionInfo, conn net.Conn) (*session, error) {
 	client := rpc.NewClient(conn)
-	remote := &acpAttachment{address: conn.RemoteAddr().String(), client: client, done: make(chan struct{}), subscribers: make(map[chan struct{}]struct{}), workspaceID: info.WorkspaceID, key: info.Key}
+	remote := &acpAttachment{client: client, done: make(chan struct{}), subscribers: make(map[chan struct{}]struct{}), workspaceID: info.WorkspaceID, key: info.Key}
 	var reply struct{}
 	if err := remote.call(ctx, "ACP.Bind", ACPMCPBinding{URL: m.agentMCPURL, Token: m.agentMCPToken}, &reply); err != nil {
 		_ = client.Close()
@@ -470,12 +475,30 @@ func RunACPOwner(ctx context.Context, configPath string) error {
 			clients.Go(func() { defer connections.Delete(conn); server.ServeConn(conn) })
 		}
 	}()
+	naturalExit := false
 	select {
 	case <-ctx.Done():
 	case <-agent.Done():
+		naturalExit = true
 	case <-service.stop:
 	}
 	err = agent.Stop(context.Background())
+	// Close the listener, which removes the socket, before acknowledging a
+	// stop, so a caller that sees the reply finds no socket left to dial.
+	_ = listener.Close()
+	<-accepted
+	drained := make(chan struct{})
+	go func() { clients.Wait(); close(drained) }()
+	if naturalExit {
+		// Existing viewers drain final updates over their open connections.
+		// An explicit stop still removes saved state before acknowledging it.
+		select {
+		case <-drained:
+			return err
+		case <-ctx.Done():
+		case <-service.stop:
+		}
+	}
 	select {
 	case <-service.stop:
 		if service.park {
@@ -487,13 +510,8 @@ func RunACPOwner(ctx context.Context, configPath string) error {
 	default:
 	}
 	service.stopErr = err
-	// Close the listener, which removes the socket, before acknowledging a
-	// stop, so a caller that sees the reply finds no socket left to dial.
-	_ = listener.Close()
 	close(service.stopped)
-	<-accepted
-	drained := make(chan struct{})
-	go func() { clients.Wait(); close(drained) }()
+
 	select {
 	case <-drained:
 	case <-time.After(2 * time.Second):

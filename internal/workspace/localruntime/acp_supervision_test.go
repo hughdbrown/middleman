@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -384,6 +385,43 @@ func TestACPPromptsNameTheirSenderToTheAgent(t *testing.T) {
 		{"sender": "user", "submissionId": "ui"},
 		{"sender": "coordinator", "senderName": "planner", "submissionId": "c1"},
 	}, meta)
+}
+
+func TestACPSteeringPreservesIDsBeforeOversizedOutput(t *testing.T) {
+	agent, peer := newScriptedACP(t)
+	agent.state.SteeringSupported = true
+	require.NoError(t, agent.Command(ACPCommand{Type: "prompt", Text: "work", ID: "first"}))
+	steered := make(chan error, 1)
+	go func() { steered <- agent.Command(ACPCommand{Type: "prompt", Mode: "steer", Text: "also", ID: "steer"}) }()
+	require.Eventually(t, func() bool { return len(peer.params(acpSteeringMethod)) == 1 }, time.Second, time.Millisecond)
+	acpUpdate(t, agent, acpsdk.SessionUpdate{ToolCall: &acpsdk.SessionUpdateToolCall{
+		ToolCallId: "large", Title: "Output", RawOutput: strings.Repeat("x", 300_000),
+	}})
+	before := publishedACPState(t, agent)
+	require.Equal(t, 1, before.MessageOffset)
+	peer.answer(acpSteeringMethod, `{"outcome":"injected"}`)
+	require.NoError(t, <-steered)
+	after := publishedACPState(t, agent)
+	require.Equal(t, 2, after.MessageOffset)
+	changes, err := decodedACPUpdates(t, agent, before.MessageCursor)
+	require.NoError(t, err)
+	require.Len(t, changes.Messages, 1)
+	assert.Equal(t, "steer", changes.Messages[0].SubmissionID)
+	assert.True(t, changes.More)
+	tail, err := decodedACPUpdates(t, agent, changes.MessageCursor)
+	require.NoError(t, err)
+	require.Len(t, tail.Messages, 1)
+	assert.Equal(t, before.Messages[0].ID, tail.Messages[0].ID)
+	assert.Equal(t, changes.Messages[0].ID, tail.Messages[0].PreviousID)
+	data, err := agent.History(after.Messages[0].ID, 100)
+	require.NoError(t, err)
+	var frame map[string]ACPHistory
+	require.NoError(t, json.Unmarshal(data, &frame))
+	messages := append(frame["history"].Messages, after.Messages...)
+	require.Len(t, messages, 3)
+	assert.Equal(t, "first", messages[0].SubmissionID)
+	assert.Equal(t, "steer", messages[1].SubmissionID)
+	assert.Equal(t, "large", messages[2].ToolCallID)
 }
 
 func TestACPSteeringNamesThePersonToTheAgent(t *testing.T) {

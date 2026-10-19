@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/rpc"
 	"sync"
 	"time"
@@ -122,12 +121,21 @@ func acpCodeError(code string) error {
 	return nil
 }
 
-// ACPHistoryRequest selects transcript messages [Before-Limit, Before).
-type ACPHistoryRequest struct{ Before, Limit int }
+// ACPHistoryRequest selects messages preceding a stable transcript entry ID.
+type ACPHistoryRequest struct {
+	BeforeID string
+	Limit    int
+}
 
 func (o *acpOwnerRPC) History(request ACPHistoryRequest, reply *[]byte) error {
-	data, err := o.agent.History(request.Before, request.Limit)
+	data, err := o.agent.History(request.BeforeID, request.Limit)
 	*reply = data
+	return err
+}
+
+func (o *acpOwnerRPC) Updates(after uint64, reply *ACPBatch) error {
+	changes, err := o.agent.Updates(after)
+	*reply = changes
 	return err
 }
 
@@ -175,14 +183,16 @@ func (o *acpOwnerRPC) shutdown(park bool) error {
 }
 
 type acpAttachment struct {
-	address string
 	// workspaceID and key name the chat in the daemon log.
 	workspaceID string
 	key         string
 	client      *rpc.Client
 	done        chan struct{}
+	doneOnce    sync.Once
 	mu          sync.Mutex
 	exitCode    int
+	exited      bool
+	stopping    bool
 	subscribers map[chan struct{}]struct{}
 }
 
@@ -226,9 +236,15 @@ func (a *acpAttachment) Command(command ACPCommand) error {
 	return nil
 }
 
-func (a *acpAttachment) History(before, limit int) ([]byte, error) {
+func (a *acpAttachment) History(beforeID string, limit int) ([]byte, error) {
 	var reply []byte
-	err := a.client.Call("ACP.History", ACPHistoryRequest{Before: before, Limit: limit}, &reply)
+	err := a.client.Call("ACP.History", ACPHistoryRequest{BeforeID: beforeID, Limit: limit}, &reply)
+	return reply, err
+}
+
+func (a *acpAttachment) Updates(after uint64) (ACPBatch, error) {
+	var reply ACPBatch
+	err := a.client.Call("ACP.Updates", after, &reply)
 	return reply, err
 }
 
@@ -243,17 +259,19 @@ func (a *acpAttachment) Prompt(text string, sender ACPSender) error {
 }
 func (a *acpAttachment) Done() <-chan struct{} { return a.done }
 func (a *acpAttachment) ExitCode() int         { a.mu.Lock(); defer a.mu.Unlock(); return a.exitCode }
-func (a *acpAttachment) Detach()               { _ = a.client.Close() }
+
+func (a *acpAttachment) Detach() {
+	_ = a.client.Close()
+	a.doneOnce.Do(func() { close(a.done) })
+}
+
 func (a *acpAttachment) Stop(ctx context.Context) error {
-	// The watch connection closes as soon as the agent exits. Use an independent
-	// request connection so that cannot discard the stop acknowledgement.
-	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", a.address)
-	if err != nil {
-		return err
-	}
-	request := &acpAttachment{client: rpc.NewClient(conn)}
-	defer request.client.Close()
-	err = request.call(ctx, "ACP.Stop", struct{}{}, &struct{}{})
+	// Keep the existing connection through the stop acknowledgement: after
+	// natural exit the listener is closed while this viewer drains final updates.
+	a.mu.Lock()
+	a.stopping = true
+	a.mu.Unlock()
+	err := a.call(ctx, "ACP.Stop", struct{}{}, &struct{}{})
 	a.Detach()
 	return err
 }
@@ -264,18 +282,25 @@ func (a *acpAttachment) Subscribe() (<-chan struct{}, func()) {
 	a.subscribers[ch] = struct{}{}
 	ch <- struct{}{}
 	a.mu.Unlock()
-	return ch, func() { a.mu.Lock(); delete(a.subscribers, ch); a.mu.Unlock() }
+	return ch, func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		delete(a.subscribers, ch)
+		if a.exited && !a.stopping && len(a.subscribers) == 0 {
+			_ = a.client.Close()
+			a.doneOnce.Do(func() { close(a.done) })
+		}
+	}
 }
 
 func (a *acpAttachment) watch() {
-	defer close(a.done)
-	defer a.client.Close()
 	var revision uint64
 	for {
 		var reply ACPUpdate
 		err := a.client.Call("ACP.Watch", ACPWatch{Revision: revision}, &reply)
 		a.mu.Lock()
 		a.exitCode = reply.ExitCode
+		a.exited = err != nil || reply.Exited
 		if err != nil || reply.Revision != revision || reply.Exited {
 			for ch := range a.subscribers {
 				select {
@@ -283,6 +308,12 @@ func (a *acpAttachment) watch() {
 				default:
 				}
 			}
+		}
+		// Final updates may need several batches. Existing viewers keep the
+		// read connection until they finish draining updates and unsubscribe.
+		if err != nil || (reply.Exited && !a.stopping && len(a.subscribers) == 0) {
+			_ = a.client.Close()
+			a.doneOnce.Do(func() { close(a.done) })
 		}
 		a.mu.Unlock()
 		if err != nil || reply.Exited {

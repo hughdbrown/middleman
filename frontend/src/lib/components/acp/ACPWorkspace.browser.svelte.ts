@@ -11,6 +11,7 @@ import "../../../app.css";
 
 import { makeAppRuntime, type OwnedAppRuntime } from "../../app/runtime.js";
 import type { TerminalSessionOptions } from "../terminal/terminal-session.js";
+import { fixtureMessages, fixtureState } from "./chat-test-fixtures.js";
 import ACPWorkspace from "./ACPWorkspace.svelte";
 import { STORES_KEY } from "../../context.js";
 import { createSettingsStore } from "../../stores/settings.svelte.js";
@@ -37,6 +38,10 @@ vi.mock("../terminal/terminal-session.js", async () => {
   };
 });
 
+function encodeFixture(frame: Record<string, unknown>) {
+  return JSON.stringify("messages" in frame ? fixtureState(frame) : frame);
+}
+
 const nextFrame = () => new Promise((resolve) => requestAnimationFrame(resolve));
 
 async function renderChat(width: number) {
@@ -52,11 +57,12 @@ async function renderChat(width: number) {
   await expect.poll(() => socket.options).toBeDefined();
   socket.options!.onOpen?.();
   socket.options!.onMessage(
-    JSON.stringify({
+    encodeFixture({
       messages: [
         { role: "user", text: "Summarize the change", createdAt: "2026-09-28T21:09:00Z" },
         { role: "assistant", text: "The change adds a gutter.", createdAt: "2026-09-28T21:10:00Z" },
       ],
+      messageCursor: 1,
       messageOffset: 0,
       messageCount: 2,
       configOptions: [],
@@ -208,8 +214,9 @@ describe("ACPWorkspace notices and errors (browser)", () => {
   it("keeps errors and the notice icon in the reading column", async () => {
     const { host } = await renderChat(1400);
     socket.options!.onMessage(
-      JSON.stringify({
+      encodeFixture({
         messages: [],
+        messageCursor: 1,
         messageOffset: 0,
         messageCount: 0,
         configOptions: [],
@@ -248,7 +255,7 @@ describe("ACPWorkspace image output (browser)", () => {
     );
     const imageURL = new URL("../../../../public/favicon.svg", import.meta.url).href;
     socket.options!.onMessage(
-      JSON.stringify({
+      encodeFixture({
         messages: [
           { role: "user", text: "Show the image in chat" },
           {
@@ -265,6 +272,7 @@ describe("ACPWorkspace image output (browser)", () => {
             text: `![Markdown image](data:image/svg+xml;base64,${data})\n\n![URL image](${imageURL})`,
           },
         ],
+        messageCursor: 1,
         messageOffset: 0,
         messageCount: 3,
         configOptions: [],
@@ -297,8 +305,9 @@ describe("ACPWorkspace grouped activity (browser)", () => {
     await renderChat(900);
     settings.setACPSettings({ font_family: "serif", font_size: 32 });
     socket.options!.onMessage(
-      JSON.stringify({
+      encodeFixture({
         messages: [],
+        messageCursor: 1,
         messageOffset: 0,
         messageCount: 0,
         configOptions: [
@@ -350,13 +359,14 @@ describe("ACPWorkspace grouped activity (browser)", () => {
     settings.setTerminalSettings({ ...settings.getTerminalSettings(), font_family: "monospace", font_size: 11 });
     settings.setACPSettings({ font_family: "serif", font_size: 26 });
     socket.options!.onMessage(
-      JSON.stringify({
+      encodeFixture({
         messages: [
           { role: "user", text: "Review the code" },
           { role: "tool", text: "Read options", status: "completed", toolCallId: "read" },
           { role: "thought", text: "Compare the available options." },
           { role: "assistant", text: "Here is the result.\n\n```js\nconst value = 1;\n```" },
         ],
+        messageCursor: 1,
         messageOffset: 0,
         messageCount: 4,
         configOptions: [],
@@ -396,13 +406,14 @@ describe("ACPWorkspace grouped activity (browser)", () => {
     await page.viewport(420, 720);
     const { host } = await renderChat(420);
     socket.options!.onMessage(
-      JSON.stringify({
+      encodeFixture({
         messages: [
           { role: "tool", text: "Read options", status: "completed", toolCallId: "read" },
           { role: "thought", text: "Compare the available options." },
           { role: "tool", text: "Check result", status: "failed", toolCallId: "check" },
           { role: "assistant", text: "Here is the result." },
         ],
+        messageCursor: 1,
         messageOffset: 0,
         messageCount: 4,
         configOptions: [],
@@ -453,10 +464,394 @@ describe("ACPWorkspace grouped activity (browser)", () => {
 
 describe("ACPWorkspace transcript paging (browser)", () => {
   const message = (index: number) => ({
+    id: `entry-${index}`,
+    previousId: index === 0 ? "" : `entry-${index - 1}`,
+    version: 1,
     role: index % 2 ? "assistant" : "user",
     text: `Message ${index}: ${"a longer line of transcript text ".repeat((index % 3) + 1)}`,
   });
   const range = (from: number, to: number) => Array.from({ length: to - from }, (_, offset) => message(from + offset));
+
+  it("renders separate tool calls when an agent reuses a call ID", async () => {
+    const { host } = await renderChat(900);
+    const tool = { role: "tool", toolCallId: "edit", createdAt: "2026-10-19T16:00:00Z", status: "completed" };
+    socket.options!.onMessage(
+      encodeFixture({
+        messages: [
+          { role: "user", text: "First turn" },
+          { ...tool, text: "First edit" },
+          { role: "user", text: "Second turn" },
+          { ...tool, text: "Second edit" },
+          { ...tool, text: "Third edit" },
+        ],
+        messageCursor: 1,
+        messageOffset: 0,
+        messageCount: 5,
+        configOptions: [],
+        configuring: false,
+        permissions: [],
+        busy: false,
+        connected: true,
+        error: "",
+      }),
+    );
+    await expect.element(page.getByRole("button", { name: "1 tool", exact: true })).toBeVisible();
+    await expect.element(page.getByRole("button", { name: "2 tools", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "1 tool", exact: true }).click();
+    await page.getByRole("button", { name: "2 tools", exact: true }).click();
+    expect(host.textContent).toContain("First edit");
+    expect(host.textContent).toContain("Second edit");
+    expect(host.textContent).toContain("Third edit");
+  });
+
+  it("keeps an expanded thought group mounted as tools arrive and agent call IDs are reused", async () => {
+    const { host } = await renderChat(900);
+    const initial = fixtureState({
+      messages: [{ role: "thought", text: "Considering the files" }],
+      messageOffset: 0,
+      messageCount: 1,
+      configOptions: [],
+      configuring: false,
+      permissions: [],
+      busy: true,
+      connected: true,
+      error: "",
+    });
+    socket.options!.onMessage(JSON.stringify(initial));
+    await page.getByRole("button", { name: "1 thought", exact: true }).click();
+    const group = host.querySelector<HTMLElement>(".tool-group")!;
+    socket.options!.onMessage(
+      JSON.stringify({
+        updates: {
+          ...initial,
+          lastMessageId: "entry-1",
+          messageCount: 2,
+          messageCursor: 2,
+          more: false,
+          messages: fixtureMessages(
+            [{ role: "tool", text: "First edit", toolCallId: "edit", status: "completed", version: 2 }],
+            1,
+          ),
+        },
+      }),
+    );
+    await expect
+      .element(page.getByRole("button", { name: "1 tool · 1 thought", exact: true }))
+      .toHaveAttribute("aria-expanded", "true");
+    socket.options!.onMessage(
+      JSON.stringify({
+        updates: {
+          ...initial,
+          lastMessageId: "entry-3",
+          messageCount: 4,
+          messageCursor: 3,
+          more: false,
+          messages: fixtureMessages(
+            [
+              { role: "user", text: "Continue", version: 3 },
+              { role: "tool", text: "Next edit", toolCallId: "edit", status: "completed", version: 3 },
+            ],
+            2,
+          ),
+        },
+      }),
+    );
+    await expect.element(page.getByRole("button", { name: "1 tool", exact: true })).toBeVisible();
+    expect(group.isConnected).toBe(true);
+    await expect
+      .element(page.getByRole("button", { name: "1 tool · 1 thought", exact: true }))
+      .toHaveAttribute("aria-expanded", "true");
+    expect(group.textContent).toContain("First edit");
+  });
+
+  it.each(["tool", "text"])(
+    "keeps expanded details and the %s row reading position through steering and batched updates",
+    async (anchorKind) => {
+      const { host } = await renderChat(900);
+      const tool = {
+        role: "tool",
+        toolCallId: "inspect-files",
+        text: "Inspect files",
+        status: "in_progress",
+        toolContent: [{ type: "terminal", output: "Initial output" }],
+      };
+      const state = {
+        messages: [...range(0, 9), { role: "thought", text: "Inspect the relevant files" }, tool, ...range(11, 40)],
+        messageCursor: 1,
+        messageOffset: 0,
+        messageCount: 40,
+        configOptions: [],
+        configuring: false,
+        permissions: [],
+        busy: true,
+        connected: true,
+        error: "",
+      };
+      socket.options!.onMessage(encodeFixture(state));
+      await nextFrame();
+      await page.getByRole("button", { name: /1 tool · 1 thought · running/ }).click();
+      await page.getByRole("button", { name: /Inspect files/ }).click();
+      await expect.element(page.getByText("Initial output", { exact: true })).toBeVisible();
+      const conversation = host.querySelector<HTMLElement>(".conversation")!;
+      conversation.style.overflowAnchor = "none";
+      const anchor =
+        anchorKind === "tool"
+          ? host.querySelector<HTMLElement>(".tool-group")!
+          : [...host.querySelectorAll<HTMLElement>("article")].find((article) =>
+              article.textContent?.includes("Message 4:"),
+            )!;
+      conversation.scrollTop += anchor.getBoundingClientRect().top - conversation.getBoundingClientRect().top - 2;
+      conversation.dispatchEvent(new Event("scroll"));
+      await nextFrame();
+      const before = anchor.getBoundingClientRect().top;
+
+      const updateState = { ...state, messageCursor: 2, lastMessageId: "entry-39", messageCount: 41 };
+      socket.options!.onMessage(
+        encodeFixture({
+          updates: {
+            ...updateState,
+            more: true,
+            messages: [
+              { id: "steering", previousId: "", version: 2, role: "user", text: "Steer the work" },
+              { ...message(0), previousId: "steering", version: 2 },
+            ],
+          },
+        }),
+      );
+      await nextFrame();
+      await expect.element(page.getByText("Initial output", { exact: true })).toBeVisible();
+      socket.options!.onMessage(
+        encodeFixture({
+          updates: {
+            ...updateState,
+            more: false,
+            messages: [
+              {
+                ...tool,
+                id: "entry-10",
+                previousId: "entry-9",
+                version: 2,
+                status: "completed",
+                toolContent: [{ type: "terminal", output: "Final output" }],
+              },
+            ],
+          },
+        }),
+      );
+      expect(socket.sent).toEqual([]);
+      await expect.element(page.getByText("Final output", { exact: true })).toBeVisible();
+      await nextFrame();
+      await nextFrame();
+      expect(anchor.isConnected).toBe(true);
+      if (anchorKind === "text") expect(anchor.textContent).toContain("Message 4:");
+      expect(Math.abs(anchor.getBoundingClientRect().top - before)).toBeLessThan(2);
+      await expect
+        .element(page.getByRole("button", { name: "1 tool · 1 thought", exact: true }))
+        .toHaveAttribute("aria-expanded", "true");
+      await expect
+        .element(page.getByRole("button", { name: /Inspect files/ }))
+        .toHaveAttribute("aria-expanded", "true");
+    },
+  );
+
+  it.each(["prepend", "split"])(
+    "keeps expanded tools and the reading position when activity groups %s",
+    async (change) => {
+      const { host } = await renderChat(900);
+      const tool = (index: number) => ({
+        id: `entry-${index}`,
+        previousId: `entry-${index - 1}`,
+        version: 1,
+        role: "tool",
+        toolCallId: `call-${index}`,
+        text: `Inspect ${index}`,
+        status: "completed",
+        toolContent: [{ type: "terminal", output: `Output ${index}\n${"line of output\n".repeat(35)}` }],
+      });
+      const initial = {
+        messages: [tool(10), tool(11), ...range(12, 40)],
+        messageOffset: 10,
+        messageCount: 40,
+        messageCursor: 1,
+        lastMessageId: "entry-39",
+        configOptions: [],
+        configuring: false,
+        permissions: [],
+        busy: false,
+        connected: true,
+        error: "",
+      };
+      socket.options!.onMessage(encodeFixture(initial));
+      await page.getByRole("button", { name: "2 tools", exact: true }).click();
+      await page.getByRole("button", { name: /Inspect 10/ }).click();
+      await page.getByRole("button", { name: /Inspect 11/ }).click();
+      const conversation = host.querySelector<HTMLElement>(".conversation")!;
+      conversation.style.overflowAnchor = "none";
+      const readingRow = [...host.querySelectorAll<HTMLElement>(".tool-group li")].find((row) =>
+        row.textContent?.includes("Inspect 11"),
+      )!;
+      conversation.scrollTop += readingRow.getBoundingClientRect().top - conversation.getBoundingClientRect().top + 2;
+      conversation.dispatchEvent(new Event("scroll"));
+      await nextFrame();
+      const before = readingRow.getBoundingClientRect().top;
+      const originalGroup = readingRow.closest(".tool-group");
+      if (change === "prepend") {
+        host
+          .querySelector<HTMLButtonElement>(".earlier button")!
+          .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await expect
+          .poll(() => socket.sent.map((frame) => JSON.parse(frame)))
+          .toContainEqual({ type: "history", beforeId: "entry-10", limit: 100 });
+        socket.options!.onMessage(encodeFixture({ history: { beforeId: "entry-10", offset: 9, messages: [tool(9)] } }));
+      } else {
+        socket.options!.onMessage(
+          encodeFixture({
+            updates: {
+              ...initial,
+              messageCount: 41,
+              messageCursor: 2,
+              more: false,
+              messages: [
+                { id: "steer", previousId: "entry-10", version: 2, role: "user", text: "Focus on the second file" },
+                { ...tool(11), previousId: "steer", version: 2 },
+              ],
+            },
+          }),
+        );
+      }
+      await expect.element(page.getByRole("button", { name: /Inspect 11/ })).toHaveAttribute("aria-expanded", "true");
+      await nextFrame();
+      await nextFrame();
+      const restoredRow = [...host.querySelectorAll<HTMLElement>(".tool-group li")].find((row) =>
+        row.textContent?.includes("Inspect 11"),
+      )!;
+      expect(restoredRow.textContent).toContain("Output 11");
+      expect(Math.abs(restoredRow.getBoundingClientRect().top - before)).toBeLessThan(2);
+      if (change === "prepend") expect(restoredRow.closest(".tool-group")).toBe(originalGroup);
+      else expect(restoredRow.closest(".tool-group")).not.toBe(originalGroup);
+    },
+  );
+
+  it("keeps expanded thoughts, disclosures and inner scroll positions when steering splits their group", async () => {
+    const { host } = await renderChat(900);
+    const thought = {
+      id: "entry-11",
+      previousId: "entry-10",
+      version: 1,
+      role: "thought",
+      text: "Compare the file changes before editing.",
+    };
+    const tool = {
+      id: "entry-12",
+      previousId: "entry-11",
+      version: 1,
+      role: "tool",
+      toolCallId: "inspect",
+      text: "Inspect changes",
+      status: "completed",
+      rawInput: JSON.stringify({ paths: Array.from({ length: 25 }, (_, index) => `src/file-${index}.ts`) }, null, 2),
+      rawOutput: JSON.stringify(
+        { results: Array.from({ length: 40 }, (_, index) => `Finished file ${index}`) },
+        null,
+        2,
+      ),
+      toolContent: [
+        {
+          type: "terminal",
+          terminalId: "inspect-output",
+          output: Array.from({ length: 80 }, (_, index) => `Line ${index}: ${"long output ".repeat(40)}`).join("\n"),
+        },
+        {
+          type: "diff",
+          path: "src/example.ts",
+          oldText: "",
+          newText: Array.from({ length: 80 }, (_, index) => `const value${index} = ${index};`).join("\n"),
+        },
+      ],
+    };
+    const initial = {
+      messages: [
+        {
+          id: "entry-10",
+          previousId: "entry-9",
+          version: 1,
+          role: "tool",
+          text: "Prepare inspection",
+          status: "completed",
+        },
+        thought,
+        tool,
+        ...range(13, 40),
+      ],
+      messageOffset: 10,
+      messageCount: 40,
+      messageCursor: 1,
+      lastMessageId: "entry-39",
+      configOptions: [],
+      configuring: false,
+      permissions: [],
+      busy: false,
+      connected: true,
+      error: "",
+    };
+    socket.options!.onMessage(encodeFixture(initial));
+    await page.getByRole("button", { name: "2 tools · 1 thought", exact: true }).click();
+    await page.getByRole("button", { name: "Thinking", exact: true }).click();
+    await page.getByRole("button", { name: /Inspect changes/ }).click();
+    await page.getByText("Raw input", { exact: true }).click();
+    await page.getByText("Raw output", { exact: true }).click();
+    const rawDetails = () => [...host.querySelectorAll<HTMLDetailsElement>("details.raw")];
+    await expect.poll(() => rawDetails().map((details) => details.open)).toEqual([true, true]);
+    const scrollRegions = () => [
+      host.querySelector<HTMLElement>(".terminal-output pre")!,
+      host.querySelector<HTMLElement>(".diff ol")!,
+      ...rawDetails().map((details) => details.querySelector<HTMLElement>("pre")!),
+    ];
+    for (const region of scrollRegions()) {
+      expect(region.scrollHeight).toBeGreaterThan(region.clientHeight + 90);
+      region.scrollTop = 90;
+      region.dispatchEvent(new Event("scroll"));
+    }
+    const terminalOutput = scrollRegions()[0]!;
+    expect(terminalOutput.scrollWidth).toBeGreaterThan(terminalOutput.clientWidth + 120);
+    terminalOutput.scrollLeft = 120;
+    terminalOutput.dispatchEvent(new Event("scroll"));
+    await nextFrame();
+    const priorScroll = scrollRegions().map((region) => ({ top: region.scrollTop, left: region.scrollLeft }));
+    const oldThought = host.querySelector('article[aria-label="Assistant thinking"]')!;
+    const output = rawDetails()[1]!.querySelector("pre")!;
+    const conversation = host.querySelector<HTMLElement>(".conversation")!;
+    conversation.style.overflowAnchor = "none";
+    conversation.scrollTop += output.getBoundingClientRect().top - conversation.getBoundingClientRect().top + 2;
+    conversation.dispatchEvent(new Event("scroll"));
+    await nextFrame();
+    const before = output.getBoundingClientRect().top;
+    socket.options!.onMessage(
+      encodeFixture({
+        updates: {
+          ...initial,
+          messageCount: 41,
+          messageCursor: 2,
+          more: false,
+          messages: [
+            { id: "steer", previousId: "entry-10", version: 2, role: "user", text: "Explain the changes" },
+            { ...thought, previousId: "steer", version: 2 },
+          ],
+        },
+      }),
+    );
+    await expect
+      .element(page.getByRole("button", { name: "Thinking", exact: true }))
+      .toHaveAttribute("aria-expanded", "true");
+    await expect.poll(() => rawDetails().map((details) => details.open)).toEqual([true, true]);
+    await nextFrame();
+    await nextFrame();
+    expect(oldThought.isConnected).toBe(false);
+    expect(terminalOutput.isConnected).toBe(false);
+    expect(scrollRegions().map((region) => ({ top: region.scrollTop, left: region.scrollLeft }))).toEqual(priorScroll);
+    expect(host.querySelector(".thought-body")!.textContent).toContain(thought.text);
+    expect(Math.abs(rawDetails()[1]!.querySelector("pre")!.getBoundingClientRect().top - before)).toBeLessThan(2);
+  });
 
   it("keeps the reader's place when earlier messages load above", async () => {
     const host = document.createElement("div");
@@ -470,8 +865,9 @@ describe("ACPWorkspace transcript paging (browser)", () => {
     await expect.poll(() => socket.options).toBeDefined();
     socket.options!.onOpen?.();
     socket.options!.onMessage(
-      JSON.stringify({
+      encodeFixture({
         messages: range(200, 240),
+        messageCursor: 1,
         messageOffset: 200,
         messageCount: 240,
         configOptions: [],
@@ -497,7 +893,7 @@ describe("ACPWorkspace transcript paging (browser)", () => {
       .poll(() => socket.sent.map((frame) => JSON.parse(frame) as unknown))
       .toContainEqual({
         type: "history",
-        before: 200,
+        beforeId: "entry-200",
         limit: 100,
       });
     const anchor = [...host.querySelectorAll<HTMLElement>("article")].find((article) =>
@@ -505,7 +901,9 @@ describe("ACPWorkspace transcript paging (browser)", () => {
     )!;
     const before = anchor.getBoundingClientRect().top;
 
-    socket.options!.onMessage(JSON.stringify({ history: { offset: 100, messages: range(100, 200) } }));
+    socket.options!.onMessage(
+      encodeFixture({ history: { beforeId: "entry-200", offset: 100, messages: range(100, 200) } }),
+    );
     await nextFrame();
     await nextFrame();
 
@@ -520,8 +918,9 @@ describe("ACPWorkspace queued coordinator prompts (browser)", () => {
   async function openQueue(width: number) {
     const { host } = await renderChat(width);
     socket.options!.onMessage(
-      JSON.stringify({
+      encodeFixture({
         messages: [],
+        messageCursor: 1,
         messageOffset: 0,
         messageCount: 0,
         configOptions: [],

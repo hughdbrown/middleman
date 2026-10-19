@@ -70,8 +70,14 @@ export const schemaConstraints = {
   WorkerWorkspaceTargetRequest: {
     number: { minimum: 1 },
   },
+  WorkspaceChat: {
+    messageCursor: { minimum: 0 },
+  },
   WorkspaceChatCommand: {
     generation: { minimum: 0 },
+  },
+  WorkspaceChatMessage: {
+    version: { minimum: 0 },
   },
   WorkspaceLaunchPull: {
     snapshot_revision: { minimum: 1 },

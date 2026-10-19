@@ -11574,8 +11574,14 @@ components:
         exited:
           description: The chat's agent has exited; no other field is present.
           type: boolean
+        lastMessageId:
+          type: string
         messageCount:
           format: int64
+          type: integer
+        messageCursor:
+          format: int64
+          minimum: 0
           type: integer
         messageOffset:
           format: int64
@@ -11693,6 +11699,8 @@ components:
           $ref: "#/components/schemas/ACPContent"
         createdAt:
           type: string
+        id:
+          type: string
         images:
           items:
             $ref: "#/components/schemas/ACPContent"
@@ -11710,6 +11718,8 @@ components:
         messageId:
           type: string
         parentToolCallId:
+          type: string
+        previousId:
           type: string
         rawInput:
           type: string
@@ -11733,8 +11743,15 @@ components:
           items:
             $ref: "#/components/schemas/ACPToolContent"
           type: array
+        version:
+          format: int64
+          minimum: 0
+          type: integer
       required:
         - index
+        - id
+        - previousId
+        - version
         - role
         - text
         - createdAt

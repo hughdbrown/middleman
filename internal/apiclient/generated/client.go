@@ -63024,7 +63024,9 @@ type WorkspaceChat struct {
 
 	// Exited The chat's agent has exited; no other field is present.
 	Exited            bool                   `json:"exited"`
+	LastMessageID     *string                `json:"lastMessageId,omitempty"`
 	MessageCount      *int64                 `json:"messageCount,omitempty"`
+	MessageCursor     *int64                 `json:"messageCursor,omitempty"`
 	MessageOffset     *int64                 `json:"messageOffset,omitempty"`
 	Messages          []WorkspaceChatMessage `json:"messages,omitempty"`
 	Notices           []string               `json:"notices,omitempty"`
@@ -63064,6 +63066,7 @@ type WorkspaceChatCommand struct {
 type WorkspaceChatMessage struct {
 	Content   *ACPContent  `json:"content,omitempty"`
 	CreatedAt string       `json:"createdAt"`
+	ID        string       `json:"id"`
 	Images    []ACPContent `json:"images,omitempty"`
 
 	// Index Position of the message in the whole transcript. A sent or steered user message is inserted before output that arrived while it was being sent, so later messages can move up by one; the inserted message carries its submissionId.
@@ -63072,6 +63075,7 @@ type WorkspaceChatMessage struct {
 	Locations        []ACPToolLocation `json:"locations,omitempty"`
 	MessageID        *string           `json:"messageId,omitempty"`
 	ParentToolCallID *string           `json:"parentToolCallId,omitempty"`
+	PreviousID       string            `json:"previousId"`
 	RawInput         *string           `json:"rawInput,omitempty"`
 	RawOutput        *string           `json:"rawOutput,omitempty"`
 	Role             string            `json:"role"`
@@ -63082,6 +63086,7 @@ type WorkspaceChatMessage struct {
 	Text             string            `json:"text"`
 	ToolCallID       *string           `json:"toolCallId,omitempty"`
 	ToolContent      []ACPToolContent  `json:"toolContent,omitempty"`
+	Version          int64             `json:"version"`
 }
 
 type WorkspaceDiffWatchResponse struct {
