@@ -60,7 +60,7 @@ func sourceBoundary(ctx context.Context, v *objectView, c Candidate) (string, Ga
 	return before, g
 }
 
-func proveSquash(ctx context.Context, v *objectView, c Candidate, before string) (Landing, Gap) {
+func proveSquash(ctx context.Context, v *objectView, c Candidate, before string, declared map[string]string) (Landing, Gap) {
 	sourceBefore, _, g := sourceShape(ctx, v, c)
 	if g.Reason != "" {
 		return Landing{}, g
@@ -68,7 +68,7 @@ func proveSquash(ctx context.Context, v *objectView, c Candidate, before string)
 	if _, err := v.parents(ctx, before); err != nil {
 		return Landing{}, Gap{CandidateID: c.ID, ObjectID: before, Reason: graphReason(err)}
 	}
-	matched, g := squashCorrespondence(ctx, v, c, sourceBefore, before)
+	matched, g := squashCorrespondence(ctx, v, c, sourceBefore, before, declared)
 	if g.Reason != "" {
 		return Landing{}, g
 	}
@@ -80,7 +80,7 @@ func proveSquash(ctx context.Context, v *objectView, c Candidate, before string)
 
 // False with no gap is a conclusive mismatch. Unreadable or ambiguous edits are
 // not evidence against this alternative and must prevent choosing another one.
-func squashCorrespondence(ctx context.Context, v *objectView, c Candidate, sourceBefore, before string) (bool, Gap) {
+func squashCorrespondence(ctx context.Context, v *objectView, c Candidate, sourceBefore, before string, declared map[string]string) (bool, Gap) {
 	g := Gap{CandidateID: c.ID}
 	linear := sourceBefore != ""
 	if !linear {
@@ -93,9 +93,12 @@ func squashCorrespondence(ctx context.Context, v *objectView, c Candidate, sourc
 		if err != nil {
 			return false, Gap{CandidateID: c.ID, ObjectID: c.SourceHead, Reason: editReason(err)}
 		}
-		matched, err := v.mergeTreeMatches(ctx, "", before, c.SourceHead, c.Terminal)
+		matched, empty, err := v.exactMerge(ctx, "", before, c.SourceHead, c.Terminal)
 		if err != nil {
 			return false, Gap{CandidateID: c.ID, ObjectID: c.Terminal, Reason: editReason(err)}
+		}
+		if empty && !matched {
+			return false, Gap{CandidateID: c.ID, ObjectID: c.Terminal, Reason: "empty_tree_edits"}
 		}
 		if !matched {
 			return false, Gap{}
@@ -110,7 +113,14 @@ func squashCorrespondence(ctx context.Context, v *objectView, c Candidate, sourc
 	}
 	_, err := v.compareTreeEdits(ctx, sourceBefore, c.SourceHead, before, c.Terminal)
 	if errors.Is(err, errCorrespondence) {
-		return witnessedSquash(ctx, v, c, sourceBefore, before, linear)
+		return witnessedSquash(ctx, v, c, sourceBefore, before, linear, declared)
+	}
+	if errors.Is(err, editProofError("empty_tree_edits")) {
+		// Without the witness, an empty terminal could be the last commit of a
+		// rewritten range, so it stays unproven rather than a mismatch.
+		if matched, g := witnessedSquash(ctx, v, c, sourceBefore, before, linear, declared); matched || g.Reason != "" {
+			return matched, g
+		}
 	}
 	if err != nil {
 		g.ObjectID, g.Reason = c.Terminal, editReason(err)
@@ -126,7 +136,7 @@ func editReason(err error) string {
 	return graphReason(err)
 }
 
-func proveSingleParent(ctx context.Context, v *objectView, p *Interval, c Candidate, before string) (Landing, Gap) {
+func proveSingleParent(ctx context.Context, v *objectView, p *Interval, c Candidate, before string, declared map[string]string) (Landing, Gap) {
 	sourceBefore, linear, g := sourceShape(ctx, v, c)
 	if g.Reason != "" {
 		return Landing{}, g
@@ -134,7 +144,7 @@ func proveSingleParent(ctx context.Context, v *objectView, p *Interval, c Candid
 	if _, err := v.parents(ctx, before); err != nil {
 		return Landing{}, Gap{CandidateID: c.ID, ObjectID: before, Reason: graphReason(err)}
 	}
-	matched, g := squashCorrespondence(ctx, v, c, sourceBefore, before)
+	matched, g := squashCorrespondence(ctx, v, c, sourceBefore, before, declared)
 	squash := proofAttempt{state: attemptMismatch}
 	if g.Reason != "" {
 		squash = proofAttempt{gap: g}
@@ -145,7 +155,7 @@ func proveSingleParent(ctx context.Context, v *objectView, p *Interval, c Candid
 	// source chain required by either rewritten-range alternative.
 	ranges := [2]proofAttempt{{state: attemptMismatch}, {state: attemptMismatch}}
 	if linear {
-		ranges = rangeAlternatives(ctx, v, p, c, sourceBefore, before)
+		ranges = rangeAlternatives(ctx, v, p, c, sourceBefore, before, declared)
 	}
 	return resolveAlternatives(c, []proofAttempt{squash, ranges[0], ranges[1]}, v.meter.failed)
 }

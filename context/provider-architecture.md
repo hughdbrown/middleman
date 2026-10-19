@@ -85,6 +85,13 @@ Across different bases, repeated text needs an exact three-way location witness
 A squash onto a target already carrying some source edits needs an exact
 three-way tree witness and must exclude a longer rebase: the terminal and its
 parent must not replay source commits in order (`landedwork/squash_witness.go::witnessedSquash`).
+An empty terminal uses the same witness. Another change's declared terminal, or
+an ancestor of the source head outside the source, is never a replay (`landedwork/squash_witness.go::rebaseReplayPossible`).
+A rewritten range cannot contain another change's declared terminal (outside that
+change's source) or an ancestor of its own source head (`landedwork/range.go::rangeCorrespondence`).
+A terminal outside the interval with a complete source owns none of it unless its
+first max(1, source length) first parents reach an interval commit that is a
+source commit or not an ancestor of the source head (`landedwork/origins.go::reachesInterval`).
 Synthesized merge objects belong only to the disposable view; caller objects
 are read-only alternates (`landedwork/git.go::openView`).
 Read blobs and commit checks through the view's one `cat-file --batch` process,

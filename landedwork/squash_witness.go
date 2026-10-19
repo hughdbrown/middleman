@@ -3,6 +3,7 @@ package landedwork
 import (
 	"context"
 	"errors"
+	"slices"
 )
 
 // witnessedSquash proves a squash whose full net edits differ from the
@@ -16,10 +17,16 @@ import (
 // replays source commits in source order, each a clean cherry-pick onto the
 // previous one. The squash stays unproven unless that is disproved.
 //
+// An empty terminal, whose tree equals the squash parent's, is witnessed the
+// same way when the target already carried every source edit. Every source
+// commit counts as a replay onto an empty terminal, so only a one-commit
+// source, a declared parent, or a parent that replays no source commit clears
+// the longer rebase.
+//
 // False with no gap is a mismatch: a missing witness keeps the earlier
 // conclusive edit mismatch, so it cannot block another alternative.
-func witnessedSquash(ctx context.Context, v *objectView, c Candidate, sourceBefore, before string, ordered bool) (bool, Gap) {
-	matched, err := v.mergeTreeMatches(ctx, sourceBefore, before, c.SourceHead, c.Terminal)
+func witnessedSquash(ctx context.Context, v *objectView, c Candidate, sourceBefore, before string, ordered bool, declared map[string]string) (bool, Gap) {
+	matched, _, err := v.exactMerge(ctx, sourceBefore, before, c.SourceHead, c.Terminal)
 	if _, ok := errors.AsType[editProofError](err); ok {
 		return false, Gap{}
 	}
@@ -29,7 +36,7 @@ func witnessedSquash(ctx context.Context, v *objectView, c Candidate, sourceBefo
 	if !matched {
 		return false, Gap{}
 	}
-	rebased, err := rebaseReplayPossible(ctx, v, c, before, ordered)
+	rebased, err := rebaseReplayPossible(ctx, v, c, before, ordered, declared)
 	if err != nil {
 		return false, Gap{CandidateID: c.ID, ObjectID: c.Terminal, Reason: editReason(err)}
 	}
@@ -40,9 +47,10 @@ func witnessedSquash(ctx context.Context, v *objectView, c Candidate, sourceBefo
 // source commit onto before, and before a replay of an earlier one onto its
 // own parent. Disproving either half leaves the terminal as the only possible
 // landing commit. Linear sources fix the order; otherwise any distinct pair
-// counts.
-func rebaseReplayPossible(ctx context.Context, v *objectView, c Candidate, before string, ordered bool) (bool, error) {
-	if len(c.Source) < 2 {
+// counts. A parent that another change declared as its terminal was created by
+// that landing, so it is never a replay from this one.
+func rebaseReplayPossible(ctx context.Context, v *objectView, c Candidate, before string, ordered bool, declared map[string]string) (bool, error) {
+	if len(c.Source) < 2 || declaredByOther(declared, c, before) {
 		return false, nil
 	}
 	// Only the latest replayed position matters in order; without an order,
@@ -67,6 +75,14 @@ func rebaseReplayPossible(ctx context.Context, v *objectView, c Candidate, befor
 	if len(parents) != 1 {
 		// A merge or root commit is never a rebase replay.
 		return false, nil
+	}
+	if !slices.Contains(c.Source, before) {
+		// The source was written on top of before, so its landing did not
+		// create it. This matters when before is empty and so replays anything.
+		earlier, err := v.ancestor(ctx, before, c.SourceHead)
+		if err != nil || earlier {
+			return false, err
+		}
 	}
 	for i, id := range c.Source {
 		if ordered && i >= terminal[0] {
