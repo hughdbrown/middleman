@@ -1,3 +1,4 @@
+import { startTestTelemetry } from "../../testing/telemetry.js";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { Effect } from "effect";
 import { tick, type ComponentProps } from "svelte";
@@ -3684,10 +3685,6 @@ describe("PullDetail inline workspace handoff", () => {
     const apiClient = {
       GET: vi.fn(async () => ({ data: {} })),
       POST: vi.fn(async (path: string, options?: Record<string, unknown>) => {
-        if (path === "/telemetry/events") {
-          telemetry(options?.body);
-          return { data: { status: "queued" } };
-        }
         posts.push({ path, options });
         if (path === "/workspaces") return { data: { id: "ws-new", status: "creating", created: true } };
         return handoff.promise;
@@ -3698,6 +3695,7 @@ describe("PullDetail inline workspace handoff", () => {
       inlineWorkspace: controller,
     });
     settings.setLaunchTargets([{ key: "chat", label: "Chat agent", kind: "acp", available: true }]);
+    startTestTelemetry(detailRuntime!, (event) => telemetry(event));
     settings.setQuickActions([rebase]);
 
     await fireEvent.click(await screen.findByRole("button", { name: "Quick actions" }));

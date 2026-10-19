@@ -1,5 +1,11 @@
-import { Effect } from "effect";
-import { executeGeneratedApiRequest } from "../api/generated-api.js";
+import {
+  startBrowserTelemetry,
+  type BrowserTelemetryOptions,
+  type TelemetryReceipt,
+  type VisitEvent,
+} from "@kenn-io/kit-ui/utils/browser-telemetry";
+import { getCaptureTelemetryEventUrl } from "../api/generated/system/system.js";
+import { orvalRequest } from "../api/runtime.js";
 import type { WorkspaceDetail } from "../components/terminal/workspace-detail.js";
 import { canonicalProvider } from "../api/provider-routes.js";
 import type { AppRuntime } from "./runtime.js";
@@ -61,54 +67,189 @@ type CoreAction =
   | { event: "pr_viewed"; properties: { provider: (typeof PR_PROVIDERS)[number] } }
   | { event: "workspace_opened"; properties: { item_type: WorkspaceDetail["item_type"] } };
 
-function createDailyReporter(now: () => Date = () => new Date()) {
-  const reportedDay = new Map<string, string>();
-  const hasReportedToday = (key: string) => reportedDay.get(key) === now().toISOString().slice(0, 10);
-  const report = Effect.fn("Telemetry.reportDaily")(function* (
-    key: string,
-    event: string,
-    properties: Record<string, string>,
-  ) {
-    const day = now().toISOString().slice(0, 10);
-    if (reportedDay.get(key) === day) return;
-    reportedDay.set(key, day);
-    yield* executeGeneratedApiRequest("report daily telemetry", (client, signal) =>
-      client.SystemService.captureTelemetryEvent({ event, properties: { ...properties, surface: "web" } }, { signal }),
-    ).pipe(
-      Effect.timeout("8 seconds"),
-      Effect.onExit((exit) =>
-        Effect.sync(() => {
-          if (exit._tag === "Failure" && reportedDay.get(key) === day) reportedDay.delete(key);
-        }),
-      ),
-    );
-  });
-  return { report, hasReportedToday };
+const today = () => new Date().toISOString().slice(0, 10);
+const coreKey = (action: VisitEvent) =>
+  action.event === "pr_viewed"
+    ? `pr_viewed:${String(action.properties.provider)}`
+    : action.event === "workspace_opened"
+      ? `workspace_opened:${String(action.properties.item_type)}`
+      : undefined;
+
+/**
+ * Keeps the last UTC day a 202 receipt confirmed each core action. Tabs racing at
+ * midnight can overwrite each other's day, costing one send the daemon deduplicates.
+ * Blocked storage reads as unclaimed and drops writes, leaving the page-local guard.
+ */
+function actionClaims(storageKey: string) {
+  const prefix = `${storageKey}.actions.v1.`;
+  const item = (key: string) => prefix + encodeURIComponent(key);
+  const has = (key: string, day: string) => {
+    try {
+      return localStorage.getItem(item(key)) === day;
+    } catch {
+      return false;
+    }
+  };
+  const add = (key: string, day: string) => {
+    try {
+      localStorage.setItem(item(key), day);
+    } catch {
+      /* The page-local guard still holds this claim. */
+    }
+  };
+  // Opting out drops these claims, like kit-ui drops stored screen names.
+  const forget = () => {
+    try {
+      for (const stored of Object.keys(localStorage)) if (stored.startsWith(prefix)) localStorage.removeItem(stored);
+    } catch {
+      /* Blocked storage holds no claims to drop. */
+    }
+  };
+  return { has, add, forget };
 }
 
-/** Reports each screen at most once per UTC day per page; the daemon still dedupes across tabs. */
-export function createScreenViewReporter(now: () => Date = () => new Date()) {
-  const { report } = createDailyReporter(now);
-  return (screen: ScreenName) => report(`screen_viewed:${screen}`, "screen_viewed", { screen });
-}
+const replyStatus = (data: unknown) =>
+  data !== null && typeof data === "object" && "status" in data ? data.status : undefined;
 
-const coreReporters = new WeakMap<AppRuntime, ReturnType<typeof createDailyReporter>>();
-function reportCoreAction(runtime: AppRuntime, action: CoreAction): void {
-  let report = coreReporters.get(runtime);
-  if (!report) {
-    report = createDailyReporter();
-    coreReporters.set(runtime, report);
+/** Hands a 202 receipt's body to `read` once the gate reads it, even when the body is unreadable. */
+function observeReceipt(response: TelemetryReceipt, read: (data: unknown) => void): TelemetryReceipt {
+  if ("data" in response) {
+    read(response.data);
+    return response;
   }
-  const key =
-    action.event === "pr_viewed"
-      ? `pr_viewed:${action.properties.provider}`
-      : `workspace_opened:${action.properties.item_type}`;
-  if (report.hasReportedToday(key)) return;
-  runtime.runCommand(report.report(key, action.event, action.properties).pipe(Effect.ignore), {
-    operation: "report core action",
-    safeContext: {},
-    onFailure: () => {},
+  return {
+    status: response.status,
+    json: async () => {
+      let data: unknown;
+      try {
+        return (data = await response.json());
+      } finally {
+        read(data);
+      }
+    },
+  };
+}
+
+/** Posts through the daemon client, aborting a stalled request or receipt body after 8 seconds. */
+const postReceipt: BrowserTelemetryOptions["post"] = async (route, event, visitOptions) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8_000);
+  try {
+    const response = await orvalRequest(route, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(event),
+      keepalive: visitOptions?.keepalive ?? false,
+      signal: controller.signal,
+    });
+    if (response.status !== 202) {
+      clearTimeout(timeout);
+      return response;
+    }
+    return {
+      status: response.status,
+      json: async () => {
+        try {
+          return await response.json();
+        } finally {
+          clearTimeout(timeout);
+        }
+      },
+    };
+  } catch (error) {
+    clearTimeout(timeout);
+    throw error;
+  }
+};
+
+const reporters = new WeakMap<
+  AppRuntime,
+  {
+    reportScreen: (screen: ScreenName) => void;
+    reportAction: (action: CoreAction) => void;
+  }
+>();
+
+export function startRuntimeTelemetry(
+  runtime: AppRuntime,
+  options: Partial<Pick<BrowserTelemetryOptions, "storageKey" | "post">> = {},
+) {
+  const reportedDay = new Map<string, string>();
+  const pending = new Map<string, { action: CoreAction; day: string }>();
+  const storageKey = options.storageKey ?? "kit-ui.app-opened.web";
+  const stored = actionClaims(storageKey);
+  const post = options.post ?? postReceipt;
+  const reporter = startBrowserTelemetry({
+    route: getCaptureTelemetryEventUrl(),
+    surface: "web",
+    ...options,
+    storageKey,
+    post: async (route, event, visitOptions) => {
+      const key = coreKey(event);
+      const day = today();
+      if (key) {
+        reportedDay.set(key, day);
+        pending.delete(key);
+      }
+      const release = () => {
+        if (key && reportedDay.get(key) === day) reportedDay.delete(key);
+      };
+      try {
+        const response = await post(route, event, visitOptions);
+        if (response.status < 200 || response.status >= 300) release();
+        if (response.status !== 202) return response;
+        // Actions dropped during backoff resend once the gate has applied this receipt.
+        return observeReceipt(response, (data) => {
+          const status = replyStatus(data);
+          if (status === "disabled") stored.forget();
+          else if (key && (status === "queued" || status === "skipped")) stored.add(key, day);
+          setTimeout(flush, 0);
+        });
+      } catch (error) {
+        release();
+        throw error;
+      }
+    },
   });
+  // Pending actions stay queued until posted; the post wrapper removes them.
+  const claimed = (key: string) => reportedDay.get(key) === today() || stored.has(key, today());
+  const send = (action: CoreAction) => {
+    if (claimed(coreKey(action)!)) return void pending.delete(coreKey(action)!);
+    reporter.reportVisit({ event: action.event, properties: { ...action.properties, surface: "web" } });
+  };
+  const flush = () => {
+    for (const [key, { action, day }] of pending) {
+      if (day === today()) send(action);
+      else pending.delete(key);
+    }
+  };
+  const unsubscribe = reporter.onQuietChange((value) => {
+    if (!value) flush();
+  });
+  reporters.set(runtime, {
+    reportScreen: (screen) => reporter.reportScreen(screen),
+    reportAction: (action) => {
+      pending.set(coreKey(action)!, { action, day: today() });
+      send(action);
+    },
+  });
+  return {
+    ...reporter,
+    stop: () => {
+      reporters.delete(runtime);
+      pending.clear();
+      unsubscribe();
+      reporter.stop();
+    },
+  };
+}
+
+export function reportScreen(runtime: AppRuntime, screen: ScreenName): void {
+  reporters.get(runtime)?.reportScreen(screen);
+}
+
+function reportCoreAction(runtime: AppRuntime, action: CoreAction): void {
+  reporters.get(runtime)?.reportAction(action);
 }
 
 export function reportPRViewed(runtime: AppRuntime, rawProvider: string): void {

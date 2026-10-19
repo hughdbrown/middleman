@@ -1,10 +1,10 @@
+import { startTestTelemetry } from "../../testing/telemetry.js";
 import { cleanup, render, waitFor } from "@testing-library/svelte";
 import { Effect } from "effect";
 import { tick } from "svelte";
 import { expect, it, vi } from "vite-plus/test";
 import type { PullDetail } from "../../api/types.js";
 import { makeAppRuntime } from "../../app/runtime.js";
-import { makeGeneratedClient } from "../../testing/generated-client.js";
 import { createMockApiFetch } from "../../../test/mockApiFetch.js";
 import Harness from "./PullDetailPaneTelemetryHarness.svelte";
 
@@ -15,7 +15,8 @@ vi.mock("../diff/DiffFilesLayout.svelte", async () => ({
 it.each(["detail", "files"])("counts PR %s when the pane and document are visible", async (content) => {
   const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
   const capture = vi.fn(async () => ({ status: "queued" }));
-  const runtime = makeAppRuntime(makeGeneratedClient({ SystemService: { captureTelemetryEvent: capture } }));
+  const runtime = makeAppRuntime();
+  await startTestTelemetry(runtime, capture).ready;
   const api = createMockApiFetch();
   const detail = (await (await api.fetch("/api/v1/pulls/github/acme/widgets/42")).json()) as PullDetail;
   const paneProps = {

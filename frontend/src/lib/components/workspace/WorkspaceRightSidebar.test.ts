@@ -1,6 +1,6 @@
+import { startTestTelemetry } from "../../testing/telemetry.js";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
-import { makeGeneratedClient } from "../../testing/generated-client.js";
 import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { makeAppRuntime, type OwnedAppRuntime } from "../../app/runtime.js";
@@ -16,9 +16,10 @@ import type { WorkspaceDiffGitState } from "./workspace-diff-default.js";
 const coreActions = vi.fn(async (_body: unknown, _options?: unknown) => ({ status: "queued" }));
 let runtime: OwnedAppRuntime;
 
-beforeEach(() => {
+beforeEach(async () => {
   coreActions.mockClear();
-  runtime = makeAppRuntime(makeGeneratedClient({ SystemService: { captureTelemetryEvent: coreActions } }));
+  runtime = makeAppRuntime();
+  await startTestTelemetry(runtime, coreActions).ready;
 });
 
 vi.mock("../kata/KataLinksPanel.svelte", async () => ({

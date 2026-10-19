@@ -1,15 +1,13 @@
 import { initMarkdownImageViewer } from "@kenn-io/kit-ui";
-import { startAppOpenedReporting } from "@kenn-io/kit-ui/utils/app-opened";
 import { initMarkdownMermaidRendering } from "@kenn-io/kit-ui/utils/markdown-mermaid";
 import { Cause, Effect, Exit, Fiber } from "effect";
 import type { Cause as CauseType } from "effect/Cause";
 import { mount, unmount } from "svelte";
 import App from "../../App.svelte";
-import { getCaptureTelemetryEventUrl } from "../api/generated/system/system.js";
-import { orvalRequest } from "../api/runtime.js";
 import { pushModalFrame } from "../stores/keyboard/modal-stack.svelte.js";
 import type { OwnedAppRuntime } from "./runtime.js";
 import { startSessionDurationReporting } from "./session-duration.js";
+import { startRuntimeTelemetry } from "./telemetry.js";
 
 function renderApplicationFailure(target: HTMLElement): void {
   const alert = target.ownerDocument.createElement("section");
@@ -51,34 +49,30 @@ const observeMarkdownMermaidRendering = (target: HTMLElement) =>
     (controller) => Effect.sync(() => controller.disconnect()),
   ).pipe(Effect.andThen(Effect.never));
 
-const reportAppOpens = Effect.acquireRelease(
-  Effect.sync(() => {
-    const stopOpens = startAppOpenedReporting({
-      route: getCaptureTelemetryEventUrl(),
-      surface: "web",
-      storageKey: "kit-ui.app-opened.web",
-      post: (route, event) =>
-        orvalRequest(route, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(event),
-        }),
-    });
-    const stopSessions = startSessionDurationReporting((duration) => {
-      void orvalRequest(getCaptureTelemetryEventUrl(), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ event: "session_ended", properties: { surface: "web", duration_bucket: duration } }),
-        keepalive: true,
-      }).catch(() => undefined);
-    });
-    return () => {
-      stopOpens();
-      stopSessions();
-    };
-  }),
-  (stop) => Effect.sync(stop),
-).pipe(Effect.andThen(Effect.never));
+const reportAppOpens = (runtime: OwnedAppRuntime) =>
+  Effect.acquireRelease(
+    Effect.sync(() => {
+      const reporter = startRuntimeTelemetry(runtime);
+      let sessions: ReturnType<typeof startSessionDurationReporting> | undefined;
+      const unsubscribe = reporter.onQuietChange((quiet) => {
+        if (quiet) sessions?.pause();
+        else if (sessions) sessions.resume();
+        else
+          sessions = startSessionDurationReporting((duration) => {
+            reporter.reportVisit(
+              { event: "session_ended", properties: { surface: "web", duration_bucket: duration } },
+              { keepalive: true },
+            );
+          });
+      });
+      return () => {
+        reporter.stop();
+        unsubscribe();
+        sessions?.stop();
+      };
+    }),
+    (stop) => Effect.sync(stop),
+  ).pipe(Effect.andThen(Effect.never));
 
 export function mountApplication(
   target: HTMLElement,
@@ -95,7 +89,7 @@ export function mountApplication(
     safeContext: {},
     onFailure: () => {},
   });
-  const appOpens = runtime.runCommand(Effect.scoped(reportAppOpens), {
+  const appOpens = runtime.runCommand(Effect.scoped(reportAppOpens(runtime)), {
     operation: "report app opens",
     safeContext: {},
     onFailure: () => {},

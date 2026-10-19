@@ -1,3 +1,4 @@
+import { startTestTelemetry } from "../../testing/telemetry.js";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -98,7 +99,7 @@ const identity = {
 const workspaceRef = { id: "ws-a", status: "ready" };
 
 describe("MobileWorkspaceTerminal", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     coreActions.mockClear();
     for (const mock of Object.values(mocks.runtimeClient)) mock.mockReset();
     mocks.runtimeClient.getWorkspace.mockResolvedValue(workspace);
@@ -108,12 +109,12 @@ describe("MobileWorkspaceTerminal", () => {
     events.subscribeWorkspaceEvents.mockReset().mockReturnValue(() => {});
     runtimeState.appRuntime = makeAppRuntime(
       makeGeneratedClient({
-        SystemService: { captureTelemetryEvent: coreActions },
         WorkspacesService: mocks.runtimeClient,
         FleetService: mocks.runtimeClient,
       }),
     );
     localStorage.clear();
+    await startTestTelemetry(runtimeState.appRuntime, coreActions).ready;
     quickActionWorkspaces.clear();
     quickActionLaunches.clear();
     resetWorkspaceHostForTest();

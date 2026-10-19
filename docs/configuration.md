@@ -701,6 +701,10 @@ Disable telemetry with:
 TELEMETRY_ENABLED=0 kenn-forge daemon start
 ```
 
+Once the daemon reports telemetry as disabled, the web UI stops sending events.
+If you turn telemetry back on, the web UI resumes on the next UTC day, even if
+you reload the page sooner.
+
 ## Container startup
 
 Build a local image from the repository root:

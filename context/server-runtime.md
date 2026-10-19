@@ -9,6 +9,12 @@
 - Screen telemetry uses Kit's durable claims per installation and UTC day;
   preserve existing claims during upgrades
   (`internal/telemetry/daily.go::initializeDailyClaims`).
+- Browser screens, visits, and core actions share kit-ui's daily permission gate;
+  quiet pauses visit timing until a later UTC day checks permission again;
+  preserve accrued time, and expire pending core actions with their UTC day.
+  Stored core action claims keep only each key's last UTC day and are cleared on
+  a `disabled` reply, like kit-ui's screen claims
+  (`frontend/src/lib/app/telemetry.ts::startRuntimeTelemetry`).
 - Core action telemetry uses the same Kit daily claims: `pr_viewed` per provider
   and `workspace_opened` per workspace type, once per installation and UTC day.
   Both require `surface: web`. PR detail must be on screen in a visible browser

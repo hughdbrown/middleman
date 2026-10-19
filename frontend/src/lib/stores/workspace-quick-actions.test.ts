@@ -1,3 +1,4 @@
+import { startTestTelemetry } from "../testing/telemetry.js";
 import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { makeAppRuntime, type OwnedAppRuntime } from "../app/runtime.js";
@@ -27,7 +28,7 @@ describe("quick-action launch serialization", () => {
   const launchDevboxHandoff = vi.fn();
   const telemetry = vi.fn(async () => ({ status: "queued" }));
 
-  beforeEach(() => {
+  beforeEach(async () => {
     quickActionLaunches.clear();
     quickActionWorkspaces.clear();
     launchHandoff.mockReset();
@@ -37,9 +38,9 @@ describe("quick-action launch serialization", () => {
       makeGeneratedClient({
         WorkspacesService: { launchWorkspaceAgentHandoff: launchHandoff },
         DevboxesService: { launchDevboxHandoff },
-        SystemService: { captureTelemetryEvent: telemetry },
       }),
     );
+    await startTestTelemetry(runtime, telemetry).ready;
   });
 
   afterEach(async () => {

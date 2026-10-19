@@ -1,3 +1,4 @@
+import { startTestTelemetry } from "../../testing/telemetry.js";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { Effect } from "effect";
 import { flushSync, tick } from "svelte";
@@ -222,7 +223,6 @@ vi.mock("../../api/generated-api.js", async (importOriginal) => {
     return result;
   };
   const client = makeGeneratedClient({
-    SystemService: { captureTelemetryEvent: coreActions },
     WorkspacesService: {
       listWorkspaceTargets: mocks.listWorkspaceTargets,
       getWorkspaceRuntime: ({ id }: { id: string }, params?: { viewing?: boolean }) => {
@@ -725,7 +725,7 @@ function fakeDataTransfer(): DataTransfer {
 }
 
 describe("WorkspaceTerminalView", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     coreActions.mockClear();
     mocks.mockOpen.mockImplementation((container: HTMLElement) => {
       const screen = document.createElement("div");
@@ -738,6 +738,7 @@ describe("WorkspaceTerminalView", () => {
     mocks.runtime = makeAppRuntime();
     delete window.__BASE_PATH__;
     localStorage.clear();
+    await startTestTelemetry(mocks.runtime, coreActions).ready;
     resetSessionHostForTest();
     resetPaneLayoutStoresForTest();
     resetWorkspaceHostForTest();

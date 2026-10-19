@@ -1,3 +1,4 @@
+import { startTestTelemetry } from "../../testing/telemetry.js";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { Effect } from "effect";
 import type { ComponentProps } from "svelte";
@@ -985,10 +986,6 @@ describe("IssueDetail inline workspace handoff", () => {
     const apiClient = {
       GET: vi.fn(),
       POST: vi.fn(async (path: string, options?: Record<string, unknown>) => {
-        if (path === "/telemetry/events") {
-          telemetry(options?.body);
-          return { data: { status: "queued" } };
-        }
         posts.push({ path, options });
         if (path.endsWith("/workspace")) {
           creates += 1;
@@ -1004,6 +1001,7 @@ describe("IssueDetail inline workspace handoff", () => {
       }),
     };
     renderIssueDetail(issueDetail(), undefined, { inlineWorkspace: controller, quickActions: [triage] }, apiClient);
+    startTestTelemetry(issueRuntime!, (event) => telemetry(event));
 
     await fireEvent.click(screen.getByRole("button", { name: "Quick actions" }));
     await fireEvent.click(screen.getByRole("menuitem", { name: /Triage/ }));
