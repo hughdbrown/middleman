@@ -122,10 +122,7 @@ func listActivityWithQueryer(
 		}
 	}
 	if opts.AllowedRepoIDs != nil {
-		cond := activityRepoIDCondition(opts.AllowedRepoIDs, &args)
-		if cond == "" {
-			cond = "0 = 1"
-		}
+		cond := repoIDCondition("repo_id", opts.AllowedRepoIDs, &args)
 		whereClauses = append(whereClauses, cond)
 	}
 
@@ -618,10 +615,7 @@ func listActivitySubjectsWithQueryer(
 		}
 	}
 	if opts.AllowedRepoIDs != nil {
-		cond := activityRepoIDCondition(opts.AllowedRepoIDs, &args)
-		if cond == "" {
-			cond = "0 = 1"
-		}
+		cond := repoIDCondition("repo_id", opts.AllowedRepoIDs, &args)
 		whereClauses = append(whereClauses, cond)
 	}
 	if len(opts.ItemTypes) > 0 {
@@ -815,10 +809,7 @@ func (d *DB) ListActivityAuthors(
 		}
 	}
 	if opts.AllowedRepoIDs != nil {
-		cond := activityRepoIDCondition(opts.AllowedRepoIDs, &args)
-		if cond == "" {
-			cond = "0 = 1"
-		}
+		cond := repoIDCondition("repo_id", opts.AllowedRepoIDs, &args)
 		whereClauses = append(whereClauses, cond)
 	}
 	if opts.Since != nil {
@@ -989,24 +980,28 @@ func activityRepoFilterCondition(filters []RepoFilter, args *[]any) string {
 	return "(" + strings.Join(groups, " OR ") + ")"
 }
 
-func activityRepoIDCondition(repoIDs []int64, args *[]any) string {
-	placeholders := make([]string, 0, len(repoIDs))
-	seen := make(map[int64]struct{}, len(repoIDs))
+// repoIDCondition binds the repository IDs as one JSON array so a large
+// tracked set cannot exceed SQLite's bound-variable limit.
+func repoIDCondition(column string, repoIDs []int64, args *[]any) string {
+	if repoIDs == nil {
+		return ""
+	}
+	ids := make([]byte, 0, len(repoIDs)*8+2)
+	ids = append(ids, '[')
 	for _, repoID := range repoIDs {
 		if repoID <= 0 {
 			continue
 		}
-		if _, ok := seen[repoID]; ok {
-			continue
+		if len(ids) > 1 {
+			ids = append(ids, ',')
 		}
-		seen[repoID] = struct{}{}
-		placeholders = append(placeholders, "?")
-		*args = append(*args, repoID)
+		ids = strconv.AppendInt(ids, repoID, 10)
 	}
-	if len(placeholders) == 0 {
-		return ""
+	if len(ids) == 1 {
+		return "0 = 1"
 	}
-	return "repo_id IN (" + strings.Join(placeholders, ",") + ")"
+	*args = append(*args, string(append(ids, ']')))
+	return column + " IN (SELECT value FROM json_each(?))"
 }
 
 // activityNotificationRepoFilterCondition scopes the notification union to

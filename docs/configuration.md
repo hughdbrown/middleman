@@ -669,6 +669,9 @@ open about once a day per browser, which screens were opened (each counted once
 per installation per UTC day), `pr_viewed`, `workspace_opened`, version, commit,
 OS and architecture, and an anonymous install ID. The browser reports app opens
 to the daemon, never to the analytics service.
+Once per installation, the daemon reports `setup_finished` with no properties
+the first time Forge has a ready workspace or a pull request or issue it can
+show. Installations that already had work when they upgraded are not reported.
 At startup and daily while running, the daemon reports the number of tracked
 repositories as `repo_count`: `0-5`, `6-20`, `21-100`, or `over-100`.
 Earlier events retain exact numeric values; newer events use string ranges.
