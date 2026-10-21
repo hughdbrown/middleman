@@ -391,4 +391,62 @@ describe("app store composition", () => {
 
     await vi.waitFor(() => expect(composition.stores.sync.getProviderAvailable()).toBe(false));
   });
+
+  it("keeps a data change successful when only the worklist summaries read fails", async () => {
+    const failures: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      createMockApiFetch([
+        (request) =>
+          request.url.pathname === "/api/v1/worklists"
+            ? new Response(JSON.stringify({ title: "Not Found", status: 404, code: "notFound" }), {
+                status: 404,
+                headers: { "content-type": "application/problem+json" },
+              })
+            : null,
+      ]).fetch,
+    );
+    const composition = createAppStores({
+      runtime,
+      getPage: () => "pulls",
+      onError: (message) => failures.push(message),
+    });
+    runtime.runCommand(composition.stores.events.streamEffect, {
+      operation: "test provider events",
+      safeContext: {},
+      onFailure: () => {},
+    });
+    await vi.waitFor(() => expect(eventSources).toHaveLength(1));
+
+    emit(eventSources[0]!, "data_changed", {});
+
+    await vi.waitFor(() => expect(composition.stores.worklists.getSummariesError()).not.toBeNull());
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(failures).toEqual([]);
+  });
+
+  it("raises the hub banner when opening a worklist cannot reach the hub", async () => {
+    vi.stubGlobal(
+      "fetch",
+      createMockApiFetch([
+        (request) =>
+          request.url.pathname === "/api/v1/worklists/7"
+            ? new Response(JSON.stringify({ title: "Hub unavailable", status: 503, code: "hubUnavailable" }), {
+                status: 503,
+                headers: { "content-type": "application/problem+json" },
+              })
+            : null,
+      ]).fetch,
+    );
+    const composition = createAppStores({ runtime, getPage: () => "worklists" });
+
+    await runtime.runCommand(composition.stores.worklists.openEffect(7), {
+      operation: "test open worklist",
+      safeContext: {},
+      onFailure: () => {},
+    }).exit;
+
+    expect(composition.stores.sync.getProviderAvailable()).toBe(false);
+    expect(composition.stores.worklists.getDetailError()?.kind).toBe("failed");
+  });
 });

@@ -34,7 +34,7 @@ Recommended flow:
 6. Prefer cached evidence over assumptions, and report stale cache signals or
    uncertainty.
 7. Avoid provider writes. MCP mutations are limited to Kenn Forge-local workflow
-   state and an explicitly requested local workspace/agent handoff.
+   state, worklists, and an explicitly requested local workspace/agent handoff.
 8. Set workflow state only when the reason is clear. Include `expected_status`
    when marking an item so a stale agent run does not overwrite humans or other
    agents. Use `force: true` only for a deliberate unconditional local
@@ -75,6 +75,33 @@ Repository-wide PR scans:
   `bitbucket_repository_uuid` for Bitbucket Cloud), `owner`, `name`, and
   `number`. Passing the entire returned item, including title or state, fails
   input validation.
+
+Worklists:
+
+- When asked for a queue of PRs and issues to work through, write it with
+  `kenn_forge_put_worklist`. Items go in rank order. Put readiness in
+  `section`, importance from 1 to 10 in `score`, the reason in `note`, and
+  what to check before acting in `caveat`.
+- Include a `recipe`: the criteria in plain text and the searches you ran.
+  Forge stores and shows it but never evaluates it.
+- Every item must be a PR or issue Forge has synced. Copy identities from
+  Forge reads; one unknown item fails the whole write.
+- To refresh a list, read it with `kenn_forge_get_worklist`, rerun its
+  recipe's searches, reconcile the full candidate set, and put it again with
+  the same `worklist_id`. Freshness only tracks state, commits, comments, CI,
+  and review decision, so treat `changed` and `gone` as where to look first:
+  labels, assignees, draft status, or titles can change on a `fresh` item, and
+  new matches appear only in the searches. A put replaces the items and resets
+  what Forge recorded for each. To make another list like it, put its recipe
+  without a `worklist_id`.
+- The maintainer marks items handled as they work through a list; reads report
+  `handled_at` per item, and `handled_count` and `remaining_count` (items
+  neither handled nor gone) per list. A mark stays on an item that remains on
+  a replaced list. You cannot mark items. Call
+  `kenn_forge_clear_worklist_marks` only when the maintainer asks to clear
+  the marks.
+- Changes since an item was written are informational; they never certify
+  review status or permission to merge.
 
 Example guidance flow:
 
@@ -118,8 +145,9 @@ scripts execute after `window.app` is connected. Use
 External imports and direct network requests are unavailable.
 
 Apps may read repositories, bulk PR contexts, item contexts, activity, search,
-review candidates, stacks, and workflow lists. They may not change workflow
-state, merge PRs, launch agents, read local workspace sessions, or write diffs.
+review candidates, stacks, workflow lists, and worklists. They may not change
+workflow state, write, dismiss, or clear worklists, merge PRs, launch agents, read
+local workspace sessions, or write diffs.
 Use the schemas from those tools rather than guessing field names. Discover
 stable repository IDs with `kenn_forge_list_repos` and preserve pagination.
 Refresh means rereading the cache. Show freshness and missing evidence; cached

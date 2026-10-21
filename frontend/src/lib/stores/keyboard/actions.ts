@@ -50,6 +50,7 @@ function hasSidebarShortcutTarget(ctx: Context): boolean {
     case "pulls":
       return ctx.route.view === "list";
     case "issues":
+    case "worklists":
     case "workspaces":
     case "terminal":
       return true;
@@ -280,6 +281,8 @@ function paneSurfaceFor(ctx: Context): PaneSurfaceKey | null {
       return "issues";
     case "activity":
       return "activity";
+    case "worklists":
+      return "worklists";
     default:
       return null;
   }

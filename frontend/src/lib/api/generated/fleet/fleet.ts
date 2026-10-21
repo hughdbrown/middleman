@@ -50,6 +50,7 @@ import type {
   EnrollmentToken,
   EnsureFleetProjectWorktreeRuntimeShellDefaultOne,
   EnsureFleetProjectWorktreeRuntimeShellPathParameters,
+  FederationClearWorklistMarksPathParameters,
   FederationDiffDescriptorRequest,
   FederationIdentityOutputBody,
   FederationSetWorkflowStateRequest,
@@ -58,6 +59,7 @@ import type {
   FederationWorkflowMutation,
   FederationWorkflowPage,
   FederationWorkflowQuery,
+  FederationWorklistPut,
   FederationWorkspaceProviderStateRequest,
   FederationWorkspaceProviderStateResponse,
   GetFleetHostRuntimeSessionAttachSpecDefaultOne,
@@ -179,6 +181,8 @@ import type {
   WatchFleetWorkspaceDiffDefaultOne,
   WatchFleetWorkspaceDiffParams,
   WatchFleetWorkspaceDiffPathParameters,
+  WorklistMarksCleared,
+  WorklistPutResult,
   WorkspaceLaunchRequest,
   WorkspaceLaunchSpec,
   WorkspaceTargetsResponse,
@@ -625,6 +629,48 @@ export const federationListWorkflowStates = async (
     method: "POST",
     headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
     body: JSON.stringify(federationWorkflowQuery),
+  });
+};
+
+export const getFederationPutWorklistUrl = () => {
+  return `/federation/provider/worklist`;
+};
+
+/**
+ * @summary Put hub worklist for a Forge spoke
+ */
+export const federationPutWorklist = async (
+  federationWorklistPut: NonReadonly<FederationWorklistPut>,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorklistPutResult> => {
+  const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Array.isArray(h)) return Object.fromEntries(h);
+    return h;
+  };
+  return orvalFetch<WorklistPutResult>(getFederationPutWorklistUrl(), {
+    ...options,
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(federationWorklistPut),
+  });
+};
+
+export const getFederationClearWorklistMarksUrl = ({ id }: FederationClearWorklistMarksPathParameters) => {
+  return `/federation/provider/worklist/${encodeURIComponent(String(id))}/clear-marks`;
+};
+
+/**
+ * @summary Clear hub worklist handled marks for a Forge spoke
+ */
+export const federationClearWorklistMarks = async (
+  { id }: FederationClearWorklistMarksPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorklistMarksCleared> => {
+  return orvalFetch<WorklistMarksCleared>(getFederationClearWorklistMarksUrl({ id }), {
+    ...options,
+    method: "POST",
   });
 };
 

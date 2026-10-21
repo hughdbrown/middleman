@@ -98,6 +98,16 @@
   items through workflow reads or writes
   (`internal/server/mcp_backend.go::mcpBackend.ListWorkflowStates`,
   `internal/server/mcp_backend.go::mcpBackend.SetWorkflowState`).
+- Worklists are hub-owned like workflow state. MCP is the only author: put
+  replaces a whole list and dismiss hides it; there is no item-level edit.
+  Handled marks belong to the maintainer, who sets them over HTTP; MCP can
+  only clear every mark on a list, when the maintainer asks. Generated apps
+  may read worklists but never put, dismiss, or clear them
+  (`internal/mcpserver/tools_worklists.go::Server.registerWorklistTools`,
+  `internal/mcpserver/apps.go::CallAppTool`).
+- Worklist puts validate locally before any backend call and record the ACP
+  workspace bound to the request; invalid input returns `validationError`
+  with `details.field` (`internal/mcpserver/tools_worklists.go::Server.putWorklist`).
 - Candidate output defaults to 25 and caps at 100. Apply candidate `item_types`
   to Activity before its 5,000-row internal safety window
   (`internal/mcpserver/tools_candidates.go::Server.findReviewCandidates`,

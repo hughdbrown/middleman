@@ -25,6 +25,11 @@ type fakeBackend struct {
 	getPullStackFn               func(context.Context, ItemIdentity) (Stack, error)
 	listWorkflowStatesFn         func(context.Context, WorkflowQuery) (WorkflowPage, error)
 	setWorkflowStateFn           func(context.Context, ItemIdentity, WorkflowUpdate) (WorkflowMutation, error)
+	putWorklistFn                func(context.Context, WorklistPut) (WorklistPutResult, error)
+	getWorklistFn                func(context.Context, int64) (Worklist, error)
+	listWorklistsFn              func(context.Context, bool) ([]WorklistSummary, error)
+	dismissWorklistFn            func(context.Context, int64) (WorklistDismissal, error)
+	clearWorklistMarksFn         func(context.Context, int64) (WorklistMarksCleared, error)
 	listLaunchTargetsFn          func(context.Context) ([]LaunchTarget, error)
 	preferredWorkspaceAgentFn    func(context.Context, time.Time, []string) (string, bool, error)
 	listWorkspaceAgentSessionsFn func(context.Context, string) ([]WorkspaceAgentSession, error)
@@ -37,6 +42,41 @@ type fakeBackend struct {
 	submitAgentMessageFn         func(context.Context, AgentMessageRequest) (AgentMessageResult, error)
 	submitInitialMessageFn       func(context.Context, InitialMessageRequest) (InitialMessageStatus, error)
 	getInitialMessageFn          func(context.Context, string, string) (InitialMessageStatus, error)
+}
+
+func (b *fakeBackend) PutWorklist(ctx context.Context, put WorklistPut) (WorklistPutResult, error) {
+	if b.putWorklistFn != nil {
+		return b.putWorklistFn(ctx, put)
+	}
+	return WorklistPutResult{}, nil
+}
+
+func (b *fakeBackend) GetWorklist(ctx context.Context, id int64) (Worklist, error) {
+	if b.getWorklistFn != nil {
+		return b.getWorklistFn(ctx, id)
+	}
+	return Worklist{}, nil
+}
+
+func (b *fakeBackend) ListWorklists(ctx context.Context, includeDismissed bool) ([]WorklistSummary, error) {
+	if b.listWorklistsFn != nil {
+		return b.listWorklistsFn(ctx, includeDismissed)
+	}
+	return nil, nil
+}
+
+func (b *fakeBackend) DismissWorklist(ctx context.Context, id int64) (WorklistDismissal, error) {
+	if b.dismissWorklistFn != nil {
+		return b.dismissWorklistFn(ctx, id)
+	}
+	return WorklistDismissal{}, nil
+}
+
+func (b *fakeBackend) ClearWorklistMarks(ctx context.Context, id int64) (WorklistMarksCleared, error) {
+	if b.clearWorklistMarksFn != nil {
+		return b.clearWorklistMarksFn(ctx, id)
+	}
+	return WorklistMarksCleared{}, nil
 }
 
 func (b *fakeBackend) ListRepositories(ctx context.Context) ([]RepositorySummary, error) {
