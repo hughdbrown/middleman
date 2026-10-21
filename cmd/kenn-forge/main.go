@@ -846,6 +846,7 @@ func runWithTelemetry(parent context.Context, opts serve.Options, newReporter fu
 		Version:         version,
 		Commit:          commit,
 	})
+	wireSyncFailed(syncer, telemetryReporter)
 	if telemetryReporter.Enabled() {
 		repoCount := func() int {
 			if syncer == nil {

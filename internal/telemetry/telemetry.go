@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +52,26 @@ func RepoCountBucket(count int) string {
 
 var ErrUnsupportedEvent = errors.New("unsupported telemetry event")
 
+const (
+	SyncSourceMergeRequests = "merge_requests"
+	SyncSourceIssues        = "issues"
+	SyncSourceChecks        = "checks"
+	SyncReasonRateLimited   = "rate_limited"
+	SyncReasonAuth          = "auth"
+	SyncReasonNotFound      = "not_found"
+	SyncReasonOther         = "other"
+)
+
+var syncSources = []string{SyncSourceMergeRequests, SyncSourceIssues, SyncSourceChecks}
+
+// SyncSources returns the sources reported by full sync passes.
+func SyncSources() []string { return slices.Clone(syncSources) }
+
+var syncReasons = []string{SyncReasonRateLimited, SyncReasonAuth, SyncReasonNotFound, SyncReasonOther}
+
+// SyncReasons returns failure reasons in descending priority order.
+func SyncReasons() []string { return slices.Clone(syncReasons) }
+
 var screenNames = []string{
 	"activity", "actions", "repos", "repo-browser", "pulls", "issues", "docs",
 	"workspaces", "terminal", "workspace-item", "settings", "project-intake",
@@ -66,13 +87,28 @@ func SessionDuration(value any) (any, bool) {
 }
 
 var requiredProperties = map[string]map[string]bool{
+	"sync_failed":      {"sync_source": true, "reason": true},
 	"screen_viewed":    {"screen": true},
 	"session_ended":    {"duration_bucket": true},
 	"pr_viewed":        {"provider": true, "surface": true},
 	"workspace_opened": {"item_type": true, "surface": true},
 }
 
+func stringValuesOrOther(values ...string) posthog.PropertyFilter {
+	filter := posthog.AllowStringValues(values...)
+	return func(value any) (any, bool) {
+		if allowed, ok := filter(value); ok {
+			return allowed, true
+		}
+		return "other", true
+	}
+}
+
 var allowedEvents = map[string]map[string]posthog.PropertyFilter{
+	"sync_failed": {
+		"sync_source": posthog.AllowStringValues(syncSources...),
+		"reason":      stringValuesOrOther(syncReasons...),
+	},
 	"setup_finished": {},
 	"pr_viewed": {
 		"provider": posthog.AllowStringValues("github", "gitlab", "forgejo", "gitea", "bitbucket"),
@@ -264,7 +300,7 @@ func (r *Reporter) Report(ctx context.Context, event string, properties map[stri
 }
 
 func sourceForEvent(event string) string {
-	if event == "daemon_active" || event == "setup_finished" {
+	if event == "daemon_active" || event == "sync_failed" || event == "setup_finished" {
 		return "daemon"
 	}
 	return "backend"
