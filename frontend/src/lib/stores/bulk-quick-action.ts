@@ -1,6 +1,8 @@
 import { Effect } from "effect";
 import type { QuickAction } from "../api/types.js";
 import type { AppRuntime } from "../app/runtime.js";
+import { documentVisible } from "../browser/document-visible.svelte.js";
+import { reportOutcome } from "../app/telemetry.js";
 import { executeGeneratedApiRequest, type GeneratedApi } from "../api/generated-api.js";
 import { providerHostRouteParams, providerRouteParams, providerUsesHostRoute } from "../api/provider-routes.js";
 import { repositoryKeyFromWire, repositoryKeyToWire } from "../api/repository-key.js";
@@ -189,13 +191,18 @@ export function runQuickActionOnItems(
         Effect.sync(() => {
           const { message, tone } = summary(action, outcomes);
           showFlash(message, { tone });
+          if (documentVisible() && outcomes.some(({ outcome }) => outcome.type === "failed"))
+            reportOutcome(runtime, { event: "error_shown", kind: "workspace_opened" });
         }),
       ),
     ),
     {
       operation: "run quick action on items",
       safeContext: { count: targets.length, agent: action.agent },
-      onFailure: () => showFlash(`"${action.label}" could not start.`, { tone: "danger" }),
+      onFailure: () => {
+        showFlash(`"${action.label}" could not start.`, { tone: "danger" });
+        if (documentVisible()) reportOutcome(runtime, { event: "error_shown", kind: "workspace_opened" });
+      },
     },
   );
 }

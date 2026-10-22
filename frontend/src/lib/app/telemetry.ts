@@ -8,6 +8,7 @@ import { getCaptureTelemetryEventUrl } from "../api/generated/system/system.js";
 import { orvalRequest } from "../api/runtime.js";
 import type { WorkspaceDetail } from "../components/terminal/workspace-detail.js";
 import { canonicalProvider } from "../api/provider-routes.js";
+import { documentVisible } from "../browser/document-visible.svelte.js";
 import type { AppRuntime } from "./runtime.js";
 import type { Page, Route } from "../stores/router.svelte.js";
 
@@ -68,6 +69,8 @@ export const PR_PROVIDERS = ["github", "gitlab", "forgejo", "gitea", "bitbucket"
 type CoreAction =
   | { event: "pr_viewed"; properties: { provider: (typeof PR_PROVIDERS)[number] } }
   | { event: "workspace_opened"; properties: { item_type: WorkspaceDetail["item_type"] } };
+
+export type Outcome = { event: "search_empty" } | { event: "error_shown"; kind: CoreAction["event"] };
 
 const today = () => new Date().toISOString().slice(0, 10);
 const coreKey = (action: VisitEvent) =>
@@ -169,6 +172,7 @@ const reporters = new WeakMap<
   {
     reportScreen: (screen: ScreenName) => void;
     reportAction: (action: CoreAction) => void;
+    reportOutcome: (outcome: Outcome) => void;
   }
 >();
 
@@ -177,7 +181,9 @@ export function startRuntimeTelemetry(
   options: Partial<Pick<BrowserTelemetryOptions, "storageKey" | "post">> = {},
 ) {
   const reportedDay = new Map<string, string>();
-  const pending = new Map<string, { action: CoreAction; day: string }>();
+  const pending = new Map<string | VisitEvent, { action: VisitEvent; day: string }>();
+  let retry: ReturnType<typeof setTimeout> | undefined;
+  let quiet = true;
   const storageKey = options.storageKey ?? "kit-ui.app-opened.web";
   const stored = actionClaims(storageKey);
   const post = options.post ?? postReceipt;
@@ -189,9 +195,9 @@ export function startRuntimeTelemetry(
     post: async (route, event, visitOptions) => {
       const key = coreKey(event);
       const day = today();
+      pending.delete(key ?? event);
       if (key) {
         reportedDay.set(key, day);
-        pending.delete(key);
       }
       const release = () => {
         if (key && reportedDay.get(key) === day) reportedDay.delete(key);
@@ -203,8 +209,10 @@ export function startRuntimeTelemetry(
         // Actions dropped during backoff resend once the gate has applied this receipt.
         return observeReceipt(response, (data) => {
           const status = replyStatus(data);
-          if (status === "disabled") stored.forget();
-          else if (key && (status === "queued" || status === "skipped")) stored.add(key, day);
+          if (status === "disabled") {
+            stored.forget();
+            pending.clear();
+          } else if (key && (status === "queued" || status === "skipped")) stored.add(key, day);
           setTimeout(flush, 0);
         });
       } catch (error) {
@@ -215,30 +223,47 @@ export function startRuntimeTelemetry(
   });
   // Pending actions stay queued until posted; the post wrapper removes them.
   const claimed = (key: string) => reportedDay.get(key) === today() || stored.has(key, today());
-  const send = (action: CoreAction) => {
-    if (claimed(coreKey(action)!)) return void pending.delete(coreKey(action)!);
-    reporter.reportVisit({ event: action.event, properties: { ...action.properties, surface: "web" } });
+  const send = (action: VisitEvent) => {
+    const key = coreKey(action);
+    if (key && claimed(key)) return void pending.delete(key);
+    reporter.reportVisit(action);
   };
   const flush = () => {
+    clearTimeout(retry);
+    retry = undefined;
     for (const [key, { action, day }] of pending) {
       if (day === today()) send(action);
       else pending.delete(key);
     }
+    // Kit drops visits during backoff and only wakes its own pending daily events.
+    if (!quiet && pending.size > 0) retry = setTimeout(flush, 1_000);
   };
   const unsubscribe = reporter.onQuietChange((value) => {
+    quiet = value;
+    if (quiet) clearTimeout(retry);
     if (!value) flush();
   });
   reporters.set(runtime, {
     reportScreen: (screen) => reporter.reportScreen(screen),
+    reportOutcome: (outcome) => {
+      const visit: VisitEvent = {
+        event: outcome.event,
+        properties: { surface: "web", ...(outcome.event === "error_shown" ? { kind: outcome.kind } : {}) },
+      };
+      pending.set(visit, { action: visit, day: today() });
+      flush();
+    },
     reportAction: (action) => {
-      pending.set(coreKey(action)!, { action, day: today() });
-      send(action);
+      const visit = { event: action.event, properties: { ...action.properties, surface: "web" } };
+      pending.set(coreKey(action)!, { action: visit, day: today() });
+      send(visit);
     },
   });
   return {
     ...reporter,
     stop: () => {
       reporters.delete(runtime);
+      clearTimeout(retry);
       pending.clear();
       unsubscribe();
       reporter.stop();
@@ -261,4 +286,29 @@ export function reportPRViewed(runtime: AppRuntime, rawProvider: string): void {
 
 export function reportWorkspaceOpened(runtime: AppRuntime, itemType: WorkspaceDetail["item_type"]): void {
   reportCoreAction(runtime, { event: "workspace_opened", properties: { item_type: itemType } });
+}
+
+export function reportOutcome(runtime: AppRuntime, outcome: Outcome): void {
+  reporters.get(runtime)?.reportOutcome(outcome);
+}
+
+export function reportWorkspaceOpenError(runtime: AppRuntime): void {
+  if (documentVisible()) reportOutcome(runtime, { event: "error_shown", kind: "workspace_opened" });
+}
+
+export function searchEmptyReporter(runtime: AppRuntime) {
+  let attempt: { lastQuery?: string } = {};
+  return {
+    textChanged: () => {
+      attempt = {};
+    },
+    submission: (query: string | undefined) => {
+      const submitted = attempt;
+      return () => {
+        if (query === undefined || query === submitted.lastQuery) return;
+        submitted.lastQuery = query;
+        reportOutcome(runtime, { event: "search_empty" });
+      };
+    },
+  };
 }

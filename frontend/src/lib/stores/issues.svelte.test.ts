@@ -1,3 +1,6 @@
+import { makeGeneratedClient } from "../testing/generated-client.js";
+import { GeneratedProblemResponse } from "../api/runtime.js";
+import { startTestTelemetry } from "../testing/telemetry.js";
 import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { OwnedAppRuntime } from "../app/runtime.js";
@@ -1109,4 +1112,25 @@ describe("createIssuesStore", () => {
     expect(store.getIssueDetail()?.issue.State).toBe("open");
     expect(onFailure).toHaveBeenCalledWith(expect.stringContaining("review"));
   });
+});
+
+it("counts submitted empty issue searches while excluding previews and hidden bots", async () => {
+  const get = vi.fn().mockResolvedValue([]);
+  const store = createIssuesStore({ client: makeGeneratedClient({ IssuesService: { listIssues: get } }) });
+  const sent = vi.fn();
+  await startTestTelemetry(runtime!, sent).ready;
+  const search = async (query: string, submitted = true) => {
+    store.setIssueSearchQuery(query);
+    store.loadIssues(undefined, { submitted });
+    await vi.waitFor(() => expect(store.isIssuesLoading()).toBe(false));
+  };
+  await search("preview", false);
+  expect(sent).not.toHaveBeenCalled();
+  await search("missing");
+  expect(sent).toHaveBeenCalledExactlyOnceWith({ event: "search_empty", properties: { surface: "web" } }, {});
+  store.hydrateDefaults({ hide_bots: true });
+  get.mockResolvedValueOnce([issue(2, "automation[bot]")]);
+  await search("only bots");
+  expect(store.getIssues()).toEqual([]);
+  expect(sent).toHaveBeenCalledTimes(1);
 });

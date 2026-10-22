@@ -123,6 +123,7 @@
 
 {#if tabKey === "conversation"}
   <PullDetail
+    {visible}
     owner={pr.owner}
     name={pr.name}
     number={pr.number}
@@ -146,6 +147,7 @@
        leak across pull requests. -->
   {#key scrollKey}
     <DiffFilesLayout
+      reportErrors={true}
       owner={pr.owner}
       name={pr.name}
       number={pr.number}

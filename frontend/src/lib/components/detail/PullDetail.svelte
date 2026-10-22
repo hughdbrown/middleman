@@ -14,6 +14,7 @@
   import { retryIdempotentRead } from "../../api/retry-policy.js";
   import type { AppExecution } from "../../app/runtime.js";
   import { getAppRuntime } from "../../app/runtime-context.js";
+  import { reportWorkspaceOpenError } from "../../app/telemetry.js";
   import { nextAnimationFrame } from "../../browser/animation-frame.js";
   import { transientClipboardFeedback } from "../../browser/clipboard-feedback.js";
   import type {
@@ -35,6 +36,8 @@
     getNavigate,
   } from "../../context.js";
   import MarkdownHtml from "../shared/MarkdownHtml.svelte";
+  import { providerItemKey } from "../../stores/provider-key.js";
+  import ErrorShown from "../shared/ErrorShown.svelte";
   import WorkflowDispatchDialog from "../actions/WorkflowDispatchDialog.svelte";
   import type { WorkflowDispatchRequest } from "../actions/WorkflowDispatchForm.svelte";
   import { workflowDispatchPresentation } from "../actions/workflow-dispatch-presentation.js";
@@ -247,6 +250,7 @@
   }
 
   interface Props {
+    visible?: boolean;
     owner: string;
     name: string;
     number: number;
@@ -272,6 +276,7 @@
   }
 
   const {
+    visible = true,
     owner,
     name,
     number,
@@ -1906,12 +1911,12 @@
       },
       onFailure: (failure) => {
         if (responseIsStale()) return;
-        showFlash(
+        const message =
           failure._tag === "ApiProblemError"
             ? failure.problem.detail ?? failure.problem.title ?? "failed to create workspace"
-            : "Could not reach Kenn Forge",
-          { tone: "danger" },
-        );
+            : "Could not reach Kenn Forge";
+        showFlash(message, { tone: "danger" });
+        if (launchTargetKey || quickAction) reportWorkspaceOpenError(runtime);
       },
     });
   }
@@ -2210,6 +2215,10 @@
 
 <svelte:window onkeydown={onActionMenuKeydown} />
 <svelte:document onmousedown={onDocumentMousedown} />
+
+{#if !detailStore.isDetailLoading() && detailStore.getDetailError() !== null && (detailStore.getDetail() === null || detailMismatch)}
+  <ErrorShown kind="pr_viewed" scope={`${providerItemKey({ provider, platformHost: platformHost ?? "", owner, name, number })}:detail`} shown={visible} />
+{/if}
 
 {#if detailStore.isDetailLoading() && (detailStore.getDetail() === null || (detailMismatch && hideStaleWhileLoading))}
   <div class="state-center"><p class="state-msg">Loading…</p></div>

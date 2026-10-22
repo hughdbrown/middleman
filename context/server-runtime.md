@@ -45,6 +45,16 @@
   quick action launches in it; embedded display and clicks inside it send
   nothing, so new entry points need no telemetry hooks. Visibility changes
   reevaluate the daily count after midnight.
+- Browser `search_empty` counts distinct submitted queries with empty server results,
+  resetting when text changes (`frontend/src/lib/app/telemetry.ts::searchEmptyReporter`).
+- `error_shown` counts a failed core action when its error comes on screen, once
+  until that error unmounts; retry starts another attempt
+  (`frontend/src/lib/components/shared/ErrorShown.svelte`).
+- Launch flashes count only when the document is visible at failure time;
+  telemetry preserves their existing presentation
+  (`frontend/src/lib/stores/workspace-quick-actions.ts::runWorkspaceQuickAction`).
+- Outcomes wait through permission checks and backoff;
+  posted failures aren't replayed (`frontend/src/lib/app/telemetry.ts::startRuntimeTelemetry`).
 - Add screen names to both the daemon allowlist and the SPA list; the daemon rejects
   unknown screens
   (`frontend/src/lib/app/telemetry.ts::SCREEN_NAMES`).

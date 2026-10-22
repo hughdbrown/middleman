@@ -6,6 +6,7 @@ import { makeGeneratedClient } from "../testing/generated-client.js";
 import {
   startRuntimeTelemetry,
   reportPRViewed,
+  reportOutcome,
   reportScreen,
   reportWorkspaceOpened,
   visibleScreen,
@@ -207,7 +208,84 @@ describe("browser telemetry", () => {
     );
   });
 
-  it("retains a core action through screen backoff and sends it after the gate's retry succeeds", async () => {
+  it.each(["queued", "disabled"])("holds outcomes until the permission receipt is %s", async (status) => {
+    const receipt = Promise.withResolvers<Response>();
+    const { sent, runtime, quiet } = setup(() => receipt.promise);
+    reportOutcome(runtime, { event: "search_empty" });
+    reportOutcome(runtime, { event: "error_shown", kind: "pr_viewed" });
+    if (status === "queued") {
+      for (let i = 0; i < 32; i++) reportOutcome(runtime, { event: "search_empty" });
+    }
+    await vi.waitFor(() => expect(sent.map((event) => event.event)).toEqual(["app_opened"]));
+    receipt.resolve(Response.json({ status }, { status: 202 }));
+    if (status === "queued") {
+      await vi.waitFor(() =>
+        expect(sent.map((event) => event.event)).toEqual([
+          "app_opened",
+          "search_empty",
+          "error_shown",
+          ...Array(32).fill("search_empty"),
+        ]),
+      );
+    } else {
+      await vi.waitFor(() => expect(quiet).toHaveBeenLastCalledWith(true));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(sent.map((event) => event.event)).toEqual(["app_opened"]);
+    }
+  });
+
+  it("labels shown errors with the failed core action", async () => {
+    const { sent, runtime, quiet } = setup();
+    await vi.waitFor(() => expect(quiet).toHaveBeenLastCalledWith(false));
+    reportOutcome(runtime, { event: "error_shown", kind: "pr_viewed" });
+    reportOutcome(runtime, { event: "error_shown", kind: "workspace_opened" });
+    await vi.waitFor(() =>
+      expect(sent.filter((event) => event.event === "error_shown")).toEqual([
+        { event: "error_shown", properties: { surface: "web", kind: "pr_viewed" } },
+        { event: "error_shown", properties: { surface: "web", kind: "workspace_opened" } },
+      ]),
+    );
+  });
+
+  it("keeps core actions waiting for a receipt instead of arming their own backoff retry", async () => {
+    vi.useFakeTimers({ toFake: ["performance", "setTimeout", "clearTimeout"] });
+    let failing = false;
+    const { sent, runtime } = setup(async () =>
+      failing ? new Response(null, { status: 500 }) : Response.json({ status: "queued" }, { status: 202 }),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    failing = true;
+    reportPRViewed(runtime, "github");
+    await vi.advanceTimersByTimeAsync(0);
+    failing = false;
+    reportWorkspaceOpened(runtime, "adhoc");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sent.map((event) => event.event)).toEqual(["app_opened", "pr_viewed"]);
+  });
+
+  it("wakes outcomes queued during backoff after all daily events are claimed", async () => {
+    vi.useFakeTimers({ toFake: ["performance", "setTimeout", "clearTimeout"] });
+    let failing = false;
+    const { sent, runtime, reporter } = setup(async () =>
+      failing ? new Response(null, { status: 500 }) : Response.json({ status: "queued" }, { status: 202 }),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    reporter.reportScreen("docs");
+    await vi.advanceTimersByTimeAsync(0);
+    failing = true;
+    reportOutcome(runtime, { event: "error_shown", kind: "workspace_opened" });
+    await vi.advanceTimersByTimeAsync(0);
+    failing = false;
+    reportOutcome(runtime, { event: "search_empty" });
+    await vi.advanceTimersByTimeAsync(999);
+    expect(sent.map((event) => event.event)).toEqual(["app_opened", "screen_viewed", "error_shown"]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent.map((event) => event.event)).toEqual(["app_opened", "screen_viewed", "error_shown", "search_empty"]);
+    await vi.advanceTimersByTimeAsync(32_000);
+    expect(sent).toHaveLength(4);
+  });
+
+  it("retains pr_viewed through screen backoff until the gate retry succeeds", async () => {
     vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
     vi.setSystemTime(new Date("2026-10-17T12:00:00Z"));
     let failing = false;

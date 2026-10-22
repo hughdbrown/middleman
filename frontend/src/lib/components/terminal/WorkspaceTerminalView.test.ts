@@ -1,3 +1,5 @@
+import { showFlash as kitShowFlash } from "@kenn-io/kit-ui";
+import { dismissFlash } from "../../stores/flash.svelte.js";
 import { startTestTelemetry } from "../../testing/telemetry.js";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { Effect } from "effect";
@@ -274,9 +276,10 @@ vi.mock("../../api/workspace-runtime.js", () => ({
   workspaceTmuxWebSocketPath: (workspaceId: string) => `/ws/v1/workspaces/${workspaceId}/terminal`,
 }));
 
-vi.mock("../../stores/flash.svelte.js", () => ({
-  showFlash: mocks.showFlash,
-}));
+vi.mock("../../stores/flash.svelte.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../stores/flash.svelte.js")>();
+  return { ...actual, showFlash: mocks.showFlash.mockImplementation(actual.showFlash) };
+});
 
 vi.mock("../detail/PullDetail.svelte", async () => ({
   default: (await import("../../views/PRListViewTestPullDetail.svelte")).default,
@@ -757,7 +760,7 @@ describe("WorkspaceTerminalView", () => {
     mocks.renameWorkspaceSession.mockReset();
     mocks.selectWorkspace.mockReset();
     mocks.selectWorkspace.mockReturnValue(() => undefined);
-    mocks.showFlash.mockReset();
+    mocks.showFlash.mockReset().mockImplementation(kitShowFlash);
     mocks.renameWorkspaceSession.mockImplementation(
       async (_workspaceId: string, sessionKey: string, label: string) => ({
         ...(sessionKey === duplicateAgentSession.key ? duplicateAgentSession : runningSession),
@@ -826,6 +829,7 @@ describe("WorkspaceTerminalView", () => {
 
   afterEach(async () => {
     cleanup();
+    dismissFlash();
     await Effect.runPromise(mocks.runtime.disposeEffect);
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -1329,12 +1333,14 @@ describe("WorkspaceTerminalView", () => {
         return;
       }
       await waitFor(() =>
-        expect(coreActions.mock.calls[0]?.[0]).toMatchObject({
-          event: "workspace_opened",
-          properties: { item_type: "pull_request" },
-        }),
+        expect(coreActions).toHaveBeenCalledWith(
+          { event: "workspace_opened", properties: { item_type: "pull_request", surface: "web" } },
+          {},
+        ),
       );
-      expect(coreActions).toHaveBeenCalledTimes(1);
+      expect(
+        coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "workspace_opened"),
+      ).toHaveLength(1);
     },
   );
 
@@ -2276,6 +2282,31 @@ describe("WorkspaceTerminalView", () => {
     },
   );
 
+  it.each([
+    [true, false],
+    [true, true],
+    [false, false],
+  ])("counts runtime failures for embedded=%s, launch=%s", async (embedded, launch) => {
+    if (embedded) {
+      claimForPrs();
+      noteWorkspacePaneRendered("prs");
+    }
+    if (launch) queueWorkspaceLaunch("ws-1", "codex", undefined);
+    mocks.getWorkspaceRuntime.mockRejectedValue(new Error("runtime unavailable"));
+    render(WorkspaceTerminalView, { props: { workspaceId: "ws-1", paneSurface: embedded ? "prs" : undefined } });
+    await screen.findByText("runtime unavailable");
+    const errors = () =>
+      coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "error_shown");
+    if (!embedded || launch)
+      await waitFor(() =>
+        expect(errors()).toEqual([
+          [{ event: "error_shown", properties: { surface: "web", kind: "workspace_opened" } }, {}],
+        ]),
+      );
+    else expect(errors()).toEqual([]);
+    expect(mocks.launchWorkspaceSession).not.toHaveBeenCalled();
+  });
+
   it("renders matching workspace details when runtime loading fails", async () => {
     window.__BASE_PATH__ = window.location.origin;
     localStorage.setItem("kenn-forge-workspace-sidebar-open", "true");
@@ -2585,6 +2616,9 @@ describe("WorkspaceTerminalView", () => {
     );
     await rerender({ workspaceId: "ws-1" });
     await screen.findByText("Workspace removed");
+    expect(
+      coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "error_shown"),
+    ).toHaveLength(0);
     expect(screen.queryByRole("tab", { name: /Helper/ })).toBeNull();
 
     await rerender({ workspaceId: "ws-2" });
@@ -5058,6 +5092,75 @@ describe("WorkspaceTerminalView", () => {
     });
   });
 
+  it.each([false, true])("counts setup failures again after retry, embedded=%s", async (embedded) => {
+    if (embedded) {
+      claimForPrs();
+      noteWorkspacePaneRendered("prs");
+      queueWorkspaceLaunch("ws-1", "codex", undefined);
+    }
+    const events = installEventSourceRecorder();
+    capturePollingIntervals([]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: Request | URL | string) => {
+        const path = new URL(input instanceof Request ? input.url : String(input), "http://localhost").pathname;
+        if (path.endsWith("/workspaces/ws-1/retry")) return Response.json({ ...workspaceResponse, status: "creating" });
+        if (path.endsWith("/workspaces/ws-1")) return Response.json({ ...workspaceResponse, status: "error" });
+        return Response.json({ workspaces: [] });
+      }),
+    );
+    render(WorkspaceTerminalView, {
+      props: { workspaceId: "ws-1", ...(embedded ? { paneSurface: "prs" as const } : {}) },
+    });
+    await waitFor(() =>
+      expect(
+        coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "error_shown"),
+      ).toHaveLength(1),
+    );
+    await fireEvent.click(screen.getByRole("button", { name: "Retry", exact: true }));
+    await screen.findByText("Setting up workspace...");
+    latestWorkspaceEventListeners(events).workspace_status?.(
+      new MessageEvent("workspace_status", {
+        data: JSON.stringify({ id: "ws-1", status: "error" }),
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "error_shown"),
+      ).toHaveLength(2),
+    );
+  });
+
+  it.each([false, true])("counts failed workspace reads again on retry, embedded=%s", async (embedded) => {
+    if (embedded) {
+      claimForPrs();
+      noteWorkspacePaneRendered("prs");
+      queueWorkspaceLaunch("ws-1", "codex", undefined);
+    }
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: Request | URL | string) => {
+        const url = input instanceof Request ? input.url : String(input);
+        return new URL(url, "http://localhost").pathname.endsWith("/workspaces/ws-1")
+          ? Response.json({ code: "forbidden", title: "Read denied", status: 403 }, { status: 403 })
+          : Response.json({ workspaces: [] });
+      }),
+    );
+    render(WorkspaceTerminalView, {
+      props: { workspaceId: "ws-1", ...(embedded ? { paneSurface: "prs" as const } : {}) },
+    });
+    await screen.findByText("Read denied");
+    await waitFor(() =>
+      expect(coreActions).toHaveBeenCalledExactlyOnceWith(
+        { event: "error_shown", properties: { surface: "web", kind: "workspace_opened" } },
+        {},
+      ),
+    );
+    await fireEvent.click(screen.getByRole("button", { name: "Retry", exact: true }));
+    await screen.findByText("Read denied");
+    await waitFor(() => expect(coreActions).toHaveBeenCalledTimes(2));
+  });
+
   it("consumes unavailable explicit intent and flashes its reason", async () => {
     queueWorkspaceLaunch("ws-1", "codex", undefined);
     mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithCodexTarget(false));
@@ -5067,6 +5170,12 @@ describe("WorkspaceTerminalView", () => {
     expect(mocks.showFlash).toHaveBeenCalledWith(expect.stringContaining("Codex is not configured"), {
       tone: "danger",
     });
+    await waitFor(() =>
+      expect(coreActions).toHaveBeenCalledWith(
+        { event: "error_shown", properties: { surface: "web", kind: "workspace_opened" } },
+        {},
+      ),
+    );
     expect(discardWorkspaceLaunch("ws-1", undefined)).toBeNull();
   });
 
