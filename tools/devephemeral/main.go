@@ -49,6 +49,7 @@ type ephemeralOptions struct {
 	backendPort      int
 	frontendPort     int
 	mcpPort          int
+	mcpPortSet       bool
 	freshDB          bool
 }
 
@@ -119,7 +120,7 @@ func run(ctx context.Context, args []string) error {
 	stop := fs.Bool("stop", false, "stop an ephemeral dev stack using its status JSON")
 	backendPort := fs.Int("backend-port", 0, "backend port (0 selects a free port)")
 	frontendPort := fs.Int("frontend-port", 0, "frontend port (0 selects a free port)")
-	mcpPort := fs.Int("mcp-port", 0, "MCP listener port when the source config enables MCP (0 selects a free port)")
+	mcpPort := fs.Int("mcp-port", 0, "dedicated MCP listener port (0 selects a free port); without this flag, a source using the default shares the backend port")
 	freshDB := fs.Bool("fresh-db", false, "start with an empty ephemeral database instead of copying the source database")
 	syncEnabled := fs.Bool("sync", false, "enable provider synchronization")
 	if err := fs.Parse(args); err != nil {
@@ -155,11 +156,13 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("resolve frontend port: %w", err)
 	}
-	resolvedMCPPort, err := resolvePort(*mcpPort)
-	if err != nil {
-		return fmt.Errorf("resolve mcp port: %w", err)
-	}
-	if err := requireDistinctPorts(resolvedBackendPort, resolvedFrontendPort, resolvedMCPPort); err != nil {
+	mcpPortSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "mcp-port" {
+			mcpPortSet = true
+		}
+	})
+	if err := requireDistinctPorts(resolvedBackendPort, resolvedFrontendPort, 0); err != nil {
 		return err
 	}
 
@@ -196,7 +199,8 @@ func run(ctx context.Context, args []string) error {
 		workDir:          resolvedWorkDir,
 		backendPort:      resolvedBackendPort,
 		frontendPort:     resolvedFrontendPort,
-		mcpPort:          resolvedMCPPort,
+		mcpPort:          *mcpPort,
+		mcpPortSet:       mcpPortSet,
 		freshDB:          *freshDB,
 	})
 	if err != nil {
@@ -315,18 +319,20 @@ func prepareEphemeralConfig(opts ephemeralOptions) (ephemeralRun, error) {
 	cfg.Port = opts.backendPort
 	cfg.DataDir = dataDir
 	cfg.TrustReverseProxy = false
-	// The source config's MCP port belongs to the developer's live daemon, so
-	// the ephemeral backend must never inherit it. The launcher resolves a free
-	// port; a zero here keeps the config's implicit backend+1.
 	mcpPort := 0
-	mcpURL := ""
-	if cfg.MCP.Enabled {
-		cfg.MCP.Port = opts.mcpPort
-		mcpPort = cfg.MCPPort()
-		mcpURL, err = serverURL(cfg.Host, mcpPort, "/")
-		if err != nil {
-			return ephemeralRun{}, err
+	if cfg.MCPEnabled() {
+		if opts.mcpPortSet || cfg.MCP.Enabled != nil {
+			// A dedicated source listener belongs to the live daemon; choose a new port.
+			cfg.MCP.Port, err = resolvePort(opts.mcpPort)
+			if err != nil {
+				return ephemeralRun{}, fmt.Errorf("resolve mcp port: %w", err)
+			}
+			if err := requireDistinctPorts(opts.backendPort, opts.frontendPort, cfg.MCP.Port); err != nil {
+				return ephemeralRun{}, err
+			}
+			cfg.MCP.Enabled = new(true)
 		}
+		mcpPort = cfg.MCPPort()
 	}
 
 	configPath := filepath.Join(opts.workDir, "config.toml")
@@ -350,7 +356,7 @@ func prepareEphemeralConfig(opts ephemeralOptions) (ephemeralRun, error) {
 		logDir:       logDir,
 		backendURL:   backendURL,
 		frontendURL:  frontendURL,
-		mcpURL:       mcpURL,
+		mcpURL:       cfg.MCPURL(),
 		backendPort:  opts.backendPort,
 		frontendPort: opts.frontendPort,
 		mcpPort:      mcpPort,

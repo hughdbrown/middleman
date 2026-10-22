@@ -295,21 +295,21 @@ func TestBindDaemonListenersOwnsOptionalMCPPortAndClosesPrimaryOnFailure(t *test
 		wantMCPPort int
 		wantErr     string
 	}{
-		{name: "disabled"},
+		{name: "disabled", mcp: config.MCP{Enabled: new(false)}},
 		{
-			name: "default next port", mcp: config.MCP{Enabled: true},
+			name: "default next port", mcp: config.MCP{Enabled: new(true)},
 			wantMCPPort: defaultMCPPort,
 		},
 		{
-			name: "explicit port", mcp: config.MCP{Enabled: true, Port: explicitMCPPort},
+			name: "explicit port", mcp: config.MCP{Enabled: new(true), Port: explicitMCPPort},
 			wantMCPPort: explicitMCPPort,
 		},
 		{
-			name: "occupied port", mcp: config.MCP{Enabled: true, Port: explicitMCPPort},
+			name: "occupied port", mcp: config.MCP{Enabled: new(true), Port: explicitMCPPort},
 			occupiedMCP: true, wantErr: "MCP",
 		},
 		// The main listener serves /mcp itself instead of a colliding bind.
-		{name: "backend port", mcp: config.MCP{Enabled: true, Port: primaryPort}},
+		{name: "backend port", mcp: config.MCP{Enabled: new(true), Port: primaryPort}},
 	}
 
 	for _, tt := range tests {
