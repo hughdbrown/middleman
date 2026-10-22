@@ -47,7 +47,9 @@ Interactive surfaces must agree on which item is selected.
   and pasted provider item URLs on the rendering repository's host all render as
   `item-ref` anchors that resolve through the shared click handler, with the
   provider URL kept as the untracked-repo fallback
-  (`frontend/src/lib/utils/item-reference.ts::parseProviderItemURL`).
+  (`frontend/src/lib/utils/item-reference.ts::parseProviderItemURL`). Agent chat
+  has no rendering repository, so its links accept any configured or public provider
+  host (`frontend/src/lib/components/acp/ChatMessageView.svelte::decorate`).
 - `item-ref` hrefs carry the configured base path so modifier clicks, new tabs,
   and copied links work; plain clicks route from the anchor's data attributes,
   never its href, so the prefix is applied once
@@ -55,7 +57,9 @@ Interactive surfaces must agree on which item is selected.
 - Explicit link targets other than `_self` retain native browser navigation, including widget links.
 - Untracked provider links retain native browser navigation; decide from the loaded
   repository catalog before cancelling the click, not by opening a popup after a
-  lookup (`frontend/src/lib/utils/itemRefHandler.ts::initItemRefHandler`).
+  lookup. Modifier clicks, middle clicks, and the context menu also get the
+  provider URL for an untracked item, since its Forge route has nothing to show
+  (`frontend/src/lib/utils/itemRefHandler.ts::initItemRefHandler`).
 - Modified terminal links open in the client browser, including provider item URLs;
   keep opening synchronous with the gesture, without a daemon lookup
   (`frontend/src/lib/components/terminal/XtermTerminalPane.svelte::openTerminalLink`).

@@ -356,6 +356,50 @@ test("ACP workspace streams, approves tools, and reconnects on desktop and phone
     } finally {
       await phone.close();
     }
+    // A provider link the agent writes opens the item in Forge, even from
+    // another repository; other links open a browser tab, a modifier click
+    // opens the Forge item in one, and an untracked item opens at the provider.
+    await chat.getByRole("textbox", { name: "Message agent" }).fill("Link a pull request");
+    await chat.getByRole("button", { name: "Send", exact: true }).click();
+    const conversation = chat.getByRole("log", { name: "Conversation" });
+    const prLink = conversation.getByRole("link", { name: "the tools PR" });
+    await expect(prLink).toBeVisible();
+    const guideURL = "https://example.com/guide";
+    await page
+      .context()
+      .route(guideURL, (route) => route.fulfill({ contentType: "text/html", body: "Guide destination" }));
+    const guidePopup = page.waitForEvent("popup");
+    await conversation.getByRole("link", { name: "the guide" }).click();
+    const guide = await guidePopup;
+    await expect(guide).toHaveURL(guideURL);
+    await guide.close();
+    // Inside a workspace, an item link opens beside the chat and becomes a target.
+    await prLink.click();
+    await expect(page.getByRole("heading", { name: "Add CLI flag parser" })).toBeVisible();
+    await expect(page).toHaveURL(`${origin}/terminal/${workspace.id}`);
+    await expect
+      .poll(async () => JSON.stringify(await (await api.get(`/api/v1/workspaces/${workspace.id}/targets`)).json()))
+      .toContain('"title":"Add CLI flag parser"');
+    const modifiedTab = page.context().waitForEvent("page");
+    await prLink.click({ modifiers: ["ControlOrMeta"] });
+    const modified = await modifiedTab;
+    await expect(modified).toHaveURL(`${origin}/pulls/github/acme/tools/1`);
+    await modified.close();
+    // Playwright reports no URL for this cross-origin tab, so the routed
+    // request is the evidence of where it went.
+    const upstreamURL = "https://github.com/example-org/library/issues/3";
+    const upstreamRequested = new Promise<void>((resolve) => {
+      void page.context().route(upstreamURL, (route) => {
+        resolve();
+        return route.fulfill({ contentType: "text/html", body: "Upstream destination" });
+      });
+    });
+    const upstreamTab = page.context().waitForEvent("page");
+    await conversation.getByRole("link", { name: "an upstream issue" }).click({ button: "middle" });
+    const upstream = await upstreamTab;
+    await upstreamRequested;
+    await expect(page).toHaveURL(`${origin}/terminal/${workspace.id}`);
+    await upstream.close();
     await chat.getByRole("textbox", { name: "Message agent" }).fill("exit");
     await chat.getByRole("button", { name: "Send", exact: true }).click();
     await expect(page.getByRole("tab", { name: /Workspace Chat/ })).toHaveCount(0);
