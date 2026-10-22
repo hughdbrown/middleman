@@ -21,12 +21,12 @@ afterEach(async () => {
   await resetKeyboardModuleState();
 });
 
-it("adds the Worklists tab when an agent writes a list and opens its first item", async () => {
+it("opens an agent's new list from the Worklists tab", async () => {
   await page.viewport(1400, 900);
   const server: WorklistServer = { lists: [], requests: [] };
   mounted = await mountBrowserApp("/", { overrides: [worklistRoutes(server)] });
   await expect.element(page.getByRole("button", { name: "Activity", exact: true })).toBeVisible();
-  expect(document.querySelector(".app-top-bar")?.textContent).not.toContain("Worklists");
+  await page.getByRole("button", { name: "Worklists", exact: true }).click();
 
   server.lists = [worklistResponse(5, "Review queue")];
   emitBrowserEventSource("worklists_changed", { worklist_id: 5 });
