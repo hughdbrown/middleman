@@ -67,3 +67,26 @@ test("keeps the detail pane and rows usable when notes and the recipe are long",
   await expect(rail.getByRole("button", { name: "Add browser regression coverage" })).toBeInViewport();
   await expect(rail.getByRole("button", { name: "Theme toggle does not stick" })).toBeInViewport();
 });
+
+async function openWithKennLinks(page: Page, link: string): Promise<void> {
+  await page.setViewportSize({ width: 1400, height: 700 });
+  await page.addInitScript(() => {
+    localStorage.setItem("kenn-forge-sidebar-width", "200");
+    // What an app embedding Forge sets.
+    window.__KENN_EMBEDDED_KENN_LINKS__ = true;
+  });
+  const server: WorklistServer = { lists: [worklistResponse(5, "Review queue")], requests: [] };
+  await mockApi(page);
+  await routeWorklists(page, server);
+  await page.route("**/api/v1/worklists/5/link", (route) => route.fulfill({ json: { link } }));
+  await page.goto("/worklists/5");
+}
+
+test("fits Copy link in the rail header at its narrowest", async ({ page }) => {
+  await openWithKennLinks(page, "kenn://kenn-forge/worklists/import#v1.abc");
+
+  await expect(page.getByRole("button", { name: "Copy link" })).toBeInViewport({ ratio: 1 });
+  await expect(page.getByRole("button", { name: "Dismiss" })).toBeInViewport({ ratio: 1 });
+  const header = page.locator(".worklist-title-row");
+  expect(await header.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+});
