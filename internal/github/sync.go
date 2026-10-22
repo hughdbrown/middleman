@@ -878,6 +878,9 @@ type Syncer struct {
 	// onMergeQueueChanged fires for each pull request whose merge queue
 	// membership, position, or state changed.
 	onMergeQueueChanged func(context.Context, int64, int)
+	// onMergeRequestTerminal fires after an accepted snapshot records a merge
+	// request merged or closed.
+	onMergeRequestTerminal func(context.Context, int64, int)
 	// mergeQueueMethods caches, per repository and branch, the merge queue's
 	// merge method and when it was read.
 	mergeQueueMethods sync.Map
@@ -1699,6 +1702,9 @@ func (s *Syncer) CommitMergeRequestParentSnapshot(
 	s.reclassifyWorkspaceHeadRepoTrust(
 		ctx, repo, mr.RepoID, mr.Number,
 	)
+	if mr.State != db.MergeRequestStateOpen && s.onMergeRequestTerminal != nil {
+		s.onMergeRequestTerminal(ctx, mr.RepoID, mr.Number)
+	}
 	return mrID, revision, accepted, err
 }
 
@@ -2073,6 +2079,16 @@ func (s *Syncer) SetOnMergeQueueChanged(
 	fn func(context.Context, int64, int),
 ) {
 	s.onMergeQueueChanged = fn
+}
+
+// SetOnMergeRequestTerminal registers a callback invoked after an accepted
+// provider snapshot records a merge request merged or closed. RunOnce can
+// process repositories in parallel, so the callback must be concurrency-safe
+// and must not block. Register it before Start or RunOnce.
+func (s *Syncer) SetOnMergeRequestTerminal(
+	fn func(context.Context, int64, int),
+) {
+	s.onMergeRequestTerminal = fn
 }
 
 // SetParallelism sets the maximum number of repos synced
