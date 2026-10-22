@@ -5202,26 +5202,42 @@ func (m *Manager) killTmuxSession(
 
 // userLoginShell resolves the current user's login shell from
 // the OS user database (passwd), falling back to $SHELL, then
-// /bin/sh.
+// /bin/sh. It skips a shell that is no longer executable: $SHELL is
+// fixed when the daemon starts, and a base terminal launched with a
+// shell removed since (as a system profile switch can do) exits at
+// once and takes its tmux session with it.
 func userLoginShell() string {
+	var passwdShell string
 	if u, err := user.Current(); err == nil && u.Username != "" {
-		if shell := lookupPasswdShell(u.Username); shell != "" {
-			return shell
-		}
+		passwdShell = lookupPasswdShell(u.Username)
 	}
-	if sh := os.Getenv("SHELL"); sh != "" {
-		return sh
+	for _, shell := range []string{passwdShell, os.Getenv("SHELL")} {
+		if shell == "" {
+			continue
+		}
+		path, err := exec.LookPath(shell)
+		if err == nil {
+			return path
+		}
+		slog.Warn("skip unusable login shell for base terminal", "shell", shell, "err", err)
 	}
 	return "/bin/sh"
 }
 
 func lookupPasswdShell(username string) string {
-	cmd := procutil.Command("getent", "passwd", username)
-	out, err := procutil.Output(
-		context.Background(), cmd, "shell lookup subprocess capacity",
-	)
-	if err == nil {
-		return shellFromPasswdLine(string(out))
+	// getent covers Linux; macOS has no getent and keeps users out of
+	// /etc/passwd, but its id -P prints the passwd line.
+	for _, args := range [][]string{
+		{"getent", "passwd", username},
+		{"id", "-P", username},
+	} {
+		cmd := procutil.Command(args[0], args[1:]...)
+		out, err := procutil.Output(
+			context.Background(), cmd, "shell lookup subprocess capacity",
+		)
+		if err == nil {
+			return shellFromPasswdLine(string(out))
+		}
 	}
 	// Fallback: read /etc/passwd directly with exact field match
 	// (no grep — avoids regex injection from metacharacters in
