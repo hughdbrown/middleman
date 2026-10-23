@@ -648,6 +648,7 @@ type pendingSyncRun struct {
 	priorityRepos       []RepoRef
 	onlyRepos           []RepoRef
 	bypassRepos         []RepoRef
+	startupRetryRepos   []RepoRef
 }
 
 const (
@@ -833,8 +834,9 @@ type Syncer struct {
 	parallelism              atomic.Int32
 	runMu                    sync.Mutex
 	running                  atomic.Bool
-	exclusiveRun             bool            // guarded by runMu
-	pendingRun               *pendingSyncRun // guarded by runMu
+	exclusiveRun             bool                 // guarded by runMu
+	pendingRun               *pendingSyncRun      // guarded by runMu
+	startupRepoSyncTimes     map[string]time.Time // one-shot credential completions, guarded by runMu
 	providerWorkMu           sync.Mutex
 	providerWork             map[string]map[archive.WorkPriority]int
 	// archiveDeniedHosts records provider hosts whose live work denied or
@@ -3129,7 +3131,13 @@ func (s *Syncer) Start(ctx context.Context) {
 	go func() {
 		defer s.wg.Done()
 		defer startCancel()
-		s.RunOnce(startMerged)
+		oldest, retry := s.liveRepoSyncTimes(startMerged)
+		s.runMu.Lock()
+		s.startupRepoSyncTimes = oldest
+		s.runMu.Unlock()
+		if s.AutomaticSyncEnabled() {
+			s.runOnceWithSlot(startMerged, false, nil, nil, retry, false)
+		}
 		if archiveReady != nil {
 			close(archiveReady)
 			s.WakeArchive()
@@ -3173,6 +3181,46 @@ func (s *Syncer) Start(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// liveRepoSyncTimes reads the oldest good completion per credential for tracked
+// live repositories, and collects failed and never-synced repositories.
+func (s *Syncer) liveRepoSyncTimes(ctx context.Context) (map[string]time.Time, []RepoRef) {
+	if s.db == nil {
+		return nil, nil
+	}
+	oldest := make(map[string]time.Time)
+	var retry []RepoRef
+	now := time.Now().UTC()
+	for _, repo := range s.TrackedRepos() {
+		if repo.Archived {
+			continue
+		}
+		stored, err := s.db.GetRepoByIdentity(ctx, platformdb.DBRepoIdentity(platformRepoRef(repo)))
+		if err != nil {
+			slog.Warn("get repository sync time", "repo", repo, "err", err)
+			continue
+		}
+		var last time.Time
+		if stored != nil && stored.LastSyncCompletedAt != nil {
+			last = *stored.LastSyncCompletedAt
+		}
+		if last.IsZero() || stored != nil && stored.LastSyncError != "" {
+			retry = append(retry, repo)
+			continue
+		}
+		if last.After(now) {
+			continue
+		}
+		key, err := s.bucketKeyForRepo(repo, false)
+		if err != nil || s.rateTrackers[key] == nil {
+			continue
+		}
+		if previous, ok := oldest[key]; !ok || last.Before(previous) {
+			oldest[key] = last
+		}
+	}
+	return oldest, retry
 }
 
 func (s *Syncer) runArchiveLoop(ctx context.Context, ready <-chan struct{}) {
@@ -4516,12 +4564,15 @@ func (s *Syncer) runOnceWithSlot(
 		}
 		return
 	}
+	s.runMu.Lock()
 	if !slotClaimed {
-		s.runMu.Lock()
 		if s.running.Load() {
 			if bypassNextSyncAfter || onlyRepos == nil && s.exclusiveRun {
 				s.coalescePendingRunLocked(
 					bypassNextSyncAfter, priorityRepos, onlyRepos,
+				)
+				s.pendingRun.startupRetryRepos = appendUniqueRepoRefs(
+					s.pendingRun.startupRetryRepos, bypassRepos,
 				)
 			}
 			s.runMu.Unlock()
@@ -4529,8 +4580,14 @@ func (s *Syncer) runOnceWithSlot(
 		}
 		s.running.Store(true)
 		s.exclusiveRun = onlyRepos != nil
-		s.runMu.Unlock()
 	}
+	for key, last := range s.startupRepoSyncTimes {
+		if _, exists := s.nextSyncAfter[key]; !exists && s.rateTrackers[key] != nil {
+			s.nextSyncAfter[key] = last.Add(s.interval)
+		}
+	}
+	s.startupRepoSyncTimes = nil
+	s.runMu.Unlock()
 	var terminalStatus *SyncStatus
 	defer func() {
 		// Serialize the terminal snapshot with slot release. A new run may
@@ -4545,6 +4602,7 @@ func (s *Syncer) runOnceWithSlot(
 		pending := s.pendingRun
 		s.pendingRun = nil
 		if pending != nil && !s.AutomaticSyncEnabled() && !pending.bypassNextSyncAfter {
+			pending.startupRetryRepos = nil
 			if len(pending.bypassRepos) == 0 {
 				pending = nil
 			} else {
@@ -4582,7 +4640,7 @@ func (s *Syncer) runOnceWithSlot(
 			pending.bypassNextSyncAfter,
 			pending.priorityRepos,
 			only,
-			pending.bypassRepos,
+			appendUniqueRepoRefs(pending.bypassRepos, pending.startupRetryRepos),
 		)
 		if !launched {
 			s.releaseRunSlotWithStatus(terminalStatus)
