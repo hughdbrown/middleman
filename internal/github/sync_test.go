@@ -18990,6 +18990,9 @@ func TestPersistGitHubCommentsRollsBackRecoveryWrites(t *testing.T) {
 		require.NotNil(mr)
 		oldID := int64(11)
 		require.NoError(database.UpsertMREvents(t.Context(), []db.MREvent{{MergeRequestID: mr.ID, PlatformID: &oldID, EventType: "issue_comment", CreatedAt: now, DedupeKey: "old"}}))
+		mr, err = database.GetMergeRequestByRepoIDAndNumber(t.Context(), repoID, 1)
+		require.NoError(err)
+		require.NotNil(mr)
 		_, err = database.WriteDB().ExecContext(t.Context(), `CREATE TRIGGER reject_github_pr_comment_count BEFORE UPDATE OF comment_count ON forge_merge_requests BEGIN SELECT RAISE(ABORT, 'reject count'); END`)
 		require.NoError(err)
 
@@ -19026,6 +19029,9 @@ func TestPersistGitHubCommentsRollsBackRecoveryWrites(t *testing.T) {
 		require.NotNil(issue)
 		oldID := int64(21)
 		require.NoError(database.UpsertIssueEvents(t.Context(), []db.IssueEvent{{IssueID: issue.ID, PlatformID: &oldID, EventType: "issue_comment", CreatedAt: now, DedupeKey: "old"}}))
+		issue, err = database.GetIssueByRepoIDAndNumber(t.Context(), repoID, 2)
+		require.NoError(err)
+		require.NotNil(issue)
 		_, err = database.WriteDB().ExecContext(t.Context(), `CREATE TRIGGER reject_github_issue_comment_count BEFORE UPDATE OF comment_count ON forge_issues BEGIN SELECT RAISE(ABORT, 'reject count'); END`)
 		require.NoError(err)
 
