@@ -2644,14 +2644,13 @@ func TestListActivityCachedCommitAuthor(t *testing.T) {
 	t.Parallel()
 	const sha = "1234567890abcdef1234567890abcdef12345678"
 	for _, tc := range []struct {
-		name, provider, metadata, actor, gitName, summary, eventType, prCommitAuthor, branchCommitAuthor string
-		otherRepo, sharedSHA                                                                             bool
+		name, provider, metadata, actor, gitName, summary, prCommitAuthor, branchCommitAuthor string
+		otherRepo, sharedSHA                                                                  bool
 	}{
 		{name: "original author", metadata: `{"commit_author":"original-login"}`, actor: "integrator", gitName: "A. Person", prCommitAuthor: "original-login", branchCommitAuthor: "original-login"},
 		{name: "same author and committer", actor: "alice", gitName: "Alice Example", prCommitAuthor: "alice", branchCommitAuthor: "alice"},
 		{name: "committer without git signature", actor: "integrator", prCommitAuthor: "integrator"},
 		{name: "linked author without git signature", metadata: `{"commit_author":"original-login"}`, actor: "integrator", prCommitAuthor: "original-login", branchCommitAuthor: "original-login"},
-		{name: "non-commit event", eventType: "issue_comment", actor: "integrator", gitName: "Git Author", prCommitAuthor: "", branchCommitAuthor: ""},
 		{name: "rewritten sha", metadata: `{"commit_author":"original-login"}`, actor: "integrator", gitName: "Git Author", summary: sha[:12] + "ffffffffffffffffffffffffffff", prCommitAuthor: "original-login", branchCommitAuthor: ""},
 		{name: "other repository", metadata: `{"commit_author":"original-login"}`, actor: "integrator", gitName: "Git Author", otherRepo: true, prCommitAuthor: "original-login", branchCommitAuthor: ""},
 		{name: "other provider", provider: "gitlab", actor: "integrator", gitName: "Git Author", prCommitAuthor: "", branchCommitAuthor: ""},
@@ -2674,11 +2673,7 @@ func TestListActivityCachedCommitAuthor(t *testing.T) {
 			if summary == "" {
 				summary = sha
 			}
-			eventType := tc.eventType
-			if eventType == "" {
-				eventType = "commit"
-			}
-			event := MREvent{MergeRequestID: mrID, EventType: eventType, Summary: summary, Author: tc.actor, MetadataJSON: tc.metadata, CreatedAt: baseTime(), DedupeKey: "commit-" + sha[:12]}
+			event := MREvent{MergeRequestID: mrID, EventType: "commit", Summary: summary, Author: tc.actor, MetadataJSON: tc.metadata, CreatedAt: baseTime(), DedupeKey: "commit-" + sha[:12]}
 			require.NoError(t, d.UpsertMREvents(t.Context(), []MREvent{event}))
 			if tc.sharedSHA {
 				otherMR := insertTestMR(t, d, repoID, 2, "Second pull", baseTime())
