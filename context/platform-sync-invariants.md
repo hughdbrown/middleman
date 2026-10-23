@@ -578,8 +578,8 @@ Rendered markdown plays video only where the provider itself plays it:
 | Bitbucket | None | Removed |
 
 Markdown without a repository keeps raw `<video>` tags. Every player gets
-`controls`, `preload="none"`, and no `autoplay`, and fills the content width
-in a fixed 16:9 frame so first play never resizes it
+`preload="none"` and no `autoplay`, and fills the content width in a fixed
+16:9 frame so first play never resizes it
 (`frontend/src/lib/utils/markdown.ts::normalizeMarkdownVideos`,
 `frontend/src/app.css`). A player that cannot load becomes a short notice
 linking to the original attachment; without preload, that happens only after
@@ -592,6 +592,22 @@ rewrites it, or says "Video". Frame content stays phrasing-level: a block
 element such as `<details>` splits the paragraph an inline GitLab video sits
 in when `{@html}` parses it again
 (`frontend/src/lib/utils/markdown-video-toggle.ts::initMarkdownVideoToggle`).
+
+After rendering, kit-ui's `VideoPlayer` replaces each `<video>` in its frame,
+with the same sources
+(`frontend/src/lib/utils/markdown-video-player.ts::initMarkdownVideoPlayers`).
+The browser's built-in controls cannot take an extra button, so the player
+draws its own bar: its expand control, beside full screen, opens kit-ui's
+`MediaViewer`, and full screen stays for readers who want the whole screen.
+Players join the page gallery with images and diagrams:
+
+- Opening pauses every inline player in the gallery; a player resumes only
+  if the viewer closes while showing it playing, and always takes back the
+  viewer's position.
+- A collapsed player hides its bar, expand control included, and collapsing
+  pauses it. The error notice replaces the whole player.
+- A re-render replaces the markup; the old players are unmounted and the new
+  `<video>` elements get players of their own.
 
 - GitHub and GitLab declare `read_markdown_media`; their video loads through
   `GET .../markdown-media?source=` on default and host routes with the
