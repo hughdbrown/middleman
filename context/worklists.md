@@ -197,6 +197,9 @@ stateDiagram-v2
   (`internal/server/worklistapi/import.go::Handler.importableRepos`). A link
   with no usable item and no earlier worklist creates nothing; the page shows
   why.
+- MCP imports a link, URL, or bare fragment on the hub through the import
+  page's service, so validation, dedupe, skips, and counts match
+  (`internal/server/worklistapi/import.go::Handler.ImportService`).
 
 ## UI
 
