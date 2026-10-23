@@ -15,9 +15,10 @@
   import PlayIcon from "@lucide/svelte/icons/play";
   import SearchIcon from "@lucide/svelte/icons/search";
   import { onDestroy, tick, untrack } from "svelte";
-  import { getRoute, navigate } from "../../stores/router.svelte.ts";
+  import { getRoute, getURLChangeCount, navigate } from "../../stores/router.svelte.ts";
   import { resolvedPlatformHost } from "../../api/provider-routes.js";
   import { initItemRefHandler } from "../../utils/itemRefHandler.js";
+  import { navigateToURL } from "../../utils/pageNavigation.js";
   import { isNarrow } from "../../stores/container.svelte.js";
   import WorkspaceListSidebar from "./WorkspaceListSidebar.svelte";
   import SessionTerminalSlot from "./SessionTerminalSlot.svelte";
@@ -2390,12 +2391,21 @@
       const id = workspaceId;
       const hostKey = workspaceHostKey;
       const selectionGeneration = ++itemSelectionGeneration;
-      appRuntime.runCommand(visitWorkspaceTargetReference(id, hostKey, reference, (item) => {
+      const urlChangesAtClick = getURLChangeCount();
+      appRuntime.runCommand(visitWorkspaceTargetReference(id, hostKey, reference, (resolution) => {
         if (selectionGeneration !== itemSelectionGeneration || !isCurrentWorkspace(id, hostKey)) return;
-        showWorkspaceItem(item.itemType, {
-          ...item,
-          platformHost: resolvedPlatformHost(item.provider, item.platformHost),
-        });
+        if (resolution.kind === "item") {
+          const { item } = resolution;
+          showWorkspaceItem(item.itemType, {
+            ...item,
+            platformHost: resolvedPlatformHost(item.provider, item.platformHost),
+          });
+          return;
+        }
+        // A parked view keeps its workspace, so also require an unchanged URL.
+        if (getURLChangeCount() !== urlChangesAtClick) return;
+        if (resolution.kind === "providerPage") navigateToURL(resolution.url);
+        else showFlash(resolution.message, { tone: "danger" });
       }).pipe(Effect.tap(() => Effect.sync(() => {
         if (isCurrentWorkspace(id, hostKey)) targetsRefreshToken += 1;
       }))), {

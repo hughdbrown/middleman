@@ -60,6 +60,18 @@ Interactive surfaces must agree on which item is selected.
   lookup. Modifier clicks, middle clicks, and the context menu also get the
   provider URL for an untracked item, since its Forge route has nothing to show
   (`frontend/src/lib/utils/itemRefHandler.ts::initItemRefHandler`).
+- A tracked-repository link whose item Forge cannot resolve (404) leaves for the
+  reference's http(s) provider URL in the current tab; the click was already
+  cancelled and a new tab opened after the lookup would be popup-blocked. Keep the
+  not-found flash only when the reference has no valid provider URL, and the
+  failure flash for other errors. The resolver returns the outcome, and a caller
+  acts on it only while the click is current: the router saw no URL change since
+  the click, even one back to the same URL, and the caller's own selection is
+  unchanged. A replaceState write that keeps the URL is not a change. A workspace
+  view opens a late item on its selection check alone, but leaves or flashes only
+  with an unchanged URL too, because a parked view keeps its workspace
+  (`frontend/src/lib/utils/itemRefHandler.ts::resolveItemReferenceEffect`,
+  `frontend/src/lib/stores/router.svelte.ts::getURLChangeCount`).
 - Modified terminal links open in the client browser, including provider item URLs;
   keep opening synchronous with the gesture, without a daemon lookup
   (`frontend/src/lib/components/terminal/XtermTerminalPane.svelte::openTerminalLink`).
