@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/cenkalti/backoff/v7"
 	gh "github.com/google/go-github/v93/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -59,7 +61,15 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	code := m.Run()
-	if err := os.RemoveAll(runtimeDir); err != nil {
+	// Windows can briefly keep daemon executables locked after process exit.
+	_, err = backoff.Retry(context.Background(), func() (struct{}, error) {
+		err := os.RemoveAll(runtimeDir)
+		if err != nil && (runtime.GOOS != "windows" || !errors.Is(err, os.ErrPermission)) {
+			return struct{}{}, backoff.Permanent(err)
+		}
+		return struct{}{}, err
+	}, backoff.WithBackOff(backoff.NewConstantBackOff(10*time.Millisecond)), backoff.WithMaxElapsedTime(2*time.Second))
+	if err != nil {
 		panic(err)
 	}
 	os.Exit(code)
