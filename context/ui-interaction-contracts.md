@@ -83,6 +83,8 @@ Interactive surfaces must agree on which item is selected.
 - Repository-scoped detail reads must track identity values, not route-object references;
   unchanged feed refreshes must retain loaded actions
   (`frontend/src/lib/components/detail/PullDetail.svelte::mergeSettingsIdentity`).
+- Remembered repository merge settings keep controls visible across navigation, but cannot enable merging before revalidation
+  (`frontend/src/lib/components/detail/PullDetail.svelte::mergeSettingsIdentity`).
 - Recent detail snapshots cannot authorize provider writes before revalidation; matching cached items allow local comment drafts.
   Preserve the original workspace lifecycle tick; settled mutations invalidate saved views so hidden optimistic state
   cannot survive rollback (`frontend/src/lib/stores/detail.svelte.ts::submitDetailMutation`).
@@ -510,6 +512,9 @@ Persisted controls must state their scope clearly.
 - Restored Activity selections recover and retain verified repository identity from feed rows
   before loading details, so cached PRs/issues render while the backend is pending; unknown
   identity must not reuse a mutable route's cache (`frontend/src/lib/views/ActivityFeedView.svelte::activeDrawer`).
+- Activity agent badges retain five-second polling through workspace reads, without reloading the feed;
+  agent hooks do not emit workspace status events, and delta polls do not refresh existing rows
+  (`frontend/src/lib/stores/activity.svelte.ts::refreshAgentStatusEffect`).
 - Activity project changes immediately project a recent matching or broader repository snapshot,
   only within the same remaining filters. Cached rows are previews; every project change still
   revalidates cursor and paging authority (`frontend/src/lib/stores/activity.svelte.ts::restoreRepositoryActivity`).
