@@ -296,9 +296,9 @@ func TestMCPStartupHandlerStaysUnavailableUntilFullServerSwap(t *testing.T) {
 }
 
 func TestBindDaemonListenersOwnsOptionalMCPPortAndClosesPrimaryOnFailure(t *testing.T) {
-	primaryPort, defaultMCPPort := reserveAdjacentPorts(t)
+	primaryPort := reserveFreePort(t)
 	explicitMCPPort := reserveFreePort(t)
-	for explicitMCPPort == primaryPort || explicitMCPPort == defaultMCPPort {
+	for explicitMCPPort == primaryPort {
 		explicitMCPPort = reserveFreePort(t)
 	}
 
@@ -310,10 +310,8 @@ func TestBindDaemonListenersOwnsOptionalMCPPortAndClosesPrimaryOnFailure(t *test
 		wantErr     string
 	}{
 		{name: "disabled", mcp: config.MCP{Enabled: new(false)}},
-		{
-			name: "default next port", mcp: config.MCP{Enabled: new(true)},
-			wantMCPPort: defaultMCPPort,
-		},
+		// A blank port shares the main listener rather than binding another.
+		{name: "default port", mcp: config.MCP{Enabled: new(true)}},
 		{
 			name: "explicit port", mcp: config.MCP{Enabled: new(true), Port: explicitMCPPort},
 			wantMCPPort: explicitMCPPort,

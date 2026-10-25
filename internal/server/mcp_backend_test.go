@@ -128,7 +128,7 @@ func TestDaemonPingPublishesMCPURL(t *testing.T) {
 		buildInfo: BuildInfo{Version: "test"},
 	})
 
-	output, err := srv.daemonPing(t.Context(), &struct{}{})
+	output, err := srv.daemonPing(t.Context(), &daemonPingInput{})
 
 	require.NoError(t, err)
 	assert.Equal(t, "http://127.0.0.1:8092/mcp", output.Body.MCPURL)
